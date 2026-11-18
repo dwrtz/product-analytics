@@ -62,3 +62,32 @@ Work in this order. Finish each check before the next task.
 16. **E2E and screenshots.** `npm run e2e` (now with replay, survey and
     experiment checks); `scripts/demo-02.mjs` and `scripts/shots-02.mjs`.
 17. **Upgrade a deployment.** `design.md` "Upgrading 0.1 → 0.2".
+
+0.3 (after 1-17):
+
+18. **Actions (R19).** `shared/elements.ts` (chain parser, selectors),
+    `shared/actions.ts`, SQL step compiler plus shard JS pre-pass,
+    `ActionsNode` in trends, funnels, retention and experiments; Actions
+    screens. Check: selector and action tests.
+19. **Cohorts (R20).** `worker/cohorts.ts`, tables, calculation (save,
+    hourly cron, on demand), static input, cohort filters everywhere,
+    cohort flag conditions; Cohort screens. Check: cohort tests.
+20. **Streaming funnels and paged surveys (R26).** Two-pass funnels in
+    person batches; survey results by cursor. Check: batch size 3 equals
+    one pass.
+21. **SQL (R22).** `worker/sqlquery.ts`, `/sql`, HogQLQuery; SQL screen.
+    Check: SQL tests.
+22. **Local evaluation and continuity (R23, R24).** Definitions endpoints
+    with ETag; hash key overrides from `$anon_distinct_id`. Check:
+    continuity test, HTTP 401/304 tests, posthog-node in the e2e.
+23. **Survey targeting (R25).** Hidden targeting flags, conditions,
+    iterations, partial merge; editor and results. Check: survey tests.
+24. **Replay settings and heatmaps (R21, R26).** D1 `0003_v03.sql`,
+    remote config mapping, paged snapshots, console/network panels,
+    heatmap and scroll APIs and screen. Check: the tests, then
+    `conform03/` against `wrangler dev`.
+25. **E2E and screenshots.** `npm run e2e` (49 checks);
+    `scripts/shots-03.mjs`.
+26. **Upgrade a deployment.** Apply `0003_v03.sql`, deploy (adds the
+    hourly cron). Existing data needs no migration.
+

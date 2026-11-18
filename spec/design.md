@@ -144,9 +144,9 @@ keeps `wrangler dev` and the tests working with no account.
 
 **Limits.** 10 GB and about 5-10 M events per project per month; a query
 holds its grouped rows in the head (about 100 bytes per (bucket, distinct
-id) pair for trends and per matching event for funnels), so funnels over
-tens of millions of matching events in one range should be split; Durable
-Object RPC messages are limited to 32 MiB per shard response.
+id) pair for trends). Funnels and experiments stream (0.3, "Streaming
+funnels"): they never hold more than one batch of 100,000 event rows.
+Durable Object RPC messages are limited to 32 MiB per shard response.
 
 ## Cloudflare config (`wrangler.example.jsonc`)
 
@@ -167,7 +167,7 @@ Object RPC messages are limited to 32 MiB per shard response.
   },
   "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
   "vars": { "SITE_URL": "http://localhost:8787", "ALLOWED_EMAILS": "", "DEFAULT_RETENTION_DAYS": "0" },
-  "triggers": { "crons": ["17 3 * * *"] },
+  "triggers": { "crons": ["17 3 * * *", "41 * * * *"] },
   "observability": { "enabled": true }
 }
 ```
@@ -184,7 +184,9 @@ committed. Vars:
 | `REPLAY_RETENTION_DAYS` | Days to keep session recordings (default 30); never longer than the project's event retention when that is set. `0` keeps them as long as events. |
 | `SHARD_PERIOD` | `month` (default) or `day`; read once per project. For tests. |
 
-There are no secrets.
+Crons: `17 3 * * *` purges by retention; `41 * * * *` (0.3) recalculates
+dynamic cohorts. An optional `COLD_STREAM` binding (a Basin stream, see
+"Cold tier") is used when present. There are no secrets.
 
 ## Deploy
 
@@ -208,7 +210,8 @@ domain is used):
 7. Open `SITE_URL`, sign up, create a project, paste the snippet into a
    site, and check events arrive in Activity.
 
-Upgrades: `npm run deploy`; new D1 migrations with step 4. The Durable
+Upgrades: `npm run deploy`; new D1 migrations with step 4 (0.3 adds
+`migrations/0003_v03.sql`, two additive columns on `projects`). The Durable
 Objects create and upgrade their own tables on start (`CREATE ... IF NOT
 EXISTS`), so a new store schema version adds statements there.
 
@@ -242,6 +245,9 @@ CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
   autocapture_opt_out INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
 -- migrations/0002_replay.sql
 ALTER TABLE projects ADD COLUMN session_recording INTEGER NOT NULL DEFAULT 0;
+-- migrations/0003_v03.sql
+ALTER TABLE projects ADD COLUMN replay_config TEXT;              -- JSON replay settings, null = defaults
+ALTER TABLE projects ADD COLUMN heatmaps INTEGER NOT NULL DEFAULT 0;
 ```
 
 - Passwords: PBKDF2-SHA256, 100,000 iterations, 16-byte random salt,
@@ -297,6 +303,20 @@ CREATE TABLE surveys (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT 
   questions TEXT NOT NULL, appearance TEXT NOT NULL, conditions TEXT, linked_flag_key TEXT,
   enable_partial_responses INTEGER NOT NULL DEFAULT 0, start_date INTEGER, end_date INTEGER,
   archived INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+-- 0.3
+CREATE TABLE actions (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+  steps TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE cohorts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+  is_static INTEGER NOT NULL DEFAULT 0, filters TEXT, count INTEGER, last_calculated_at INTEGER,
+  deleted INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE cohort_people (cohort_id INTEGER NOT NULL, person_id INTEGER NOT NULL, PRIMARY KEY (cohort_id, person_id));
+CREATE INDEX cohort_people_person ON cohort_people (person_id);
+CREATE TABLE flag_hash_key_overrides (distinct_id TEXT NOT NULL, flag_key TEXT NOT NULL, hash_key TEXT NOT NULL,
+  PRIMARY KEY (distinct_id, flag_key));
+-- columns added with ALTER TABLE when missing (checked through pragma_table_info on start):
+--   feature_flags.ensure_experience_continuity INTEGER NOT NULL DEFAULT 0, feature_flags.internal TEXT (survey id),
+--   surveys.targeting_flag_filters TEXT, targeting_flag_key TEXT, internal_targeting_flag_key TEXT,
+--   iteration_count INTEGER, iteration_frequency_days INTEGER, schedule TEXT
 ```
 
 R2 (`REPLAY`): `replay/<project id>/<session id>/<first ts, 15 digits>-<8 hex>`
@@ -438,7 +458,7 @@ must send `Origin` equal to `SITE_URL` (403 `bad_origin`).
 | `/api/personal_api_keys` | GET, POST | POST `{label}` → `{key}` once |
 | `/api/personal_api_keys/:id` | DELETE | |
 | `/api/projects` | GET, POST | POST `{name, timezone}` (IANA, checked) |
-| `/api/projects/:id` | GET, PATCH, DELETE | PATCH `{name, timezone, retention_days, anonymize_ips, autocapture_opt_out, session_recording}`; DELETE removes the store, its shards and recordings |
+| `/api/projects/:id` | GET, PATCH, DELETE | PATCH `{name, timezone, retention_days, anonymize_ips, autocapture_opt_out, session_recording, heatmaps, replay_config}`; DELETE removes the store, its shards and recordings |
 | `/api/projects/:id/reset_token` | POST | new `phc_` token; the old one stops working |
 | `/api/projects/:id/query` | POST | `{query}`; 400 `invalid_query` |
 | `/api/projects/:id/events` | GET | `event`, `cursor`, `limit`, `person_id`, `distinct_id`, `properties` (JSON) |
@@ -457,13 +477,25 @@ must send `Origin` equal to `SITE_URL` (403 `bad_origin`).
 | `/api/projects/:id/feature_flags/:id` | GET, PATCH, DELETE | each change bumps `version` |
 | `/api/projects/:id/session_recordings` | GET | `person_id`, `distinct_id`, `before` (ms, cursor), `limit` (≤200); `{results, next}`; each `{id, distinct_id, start_time, end_time, recording_duration (s), click_count, keypress_count, console_error_count, start_url, size, chunks, person}` |
 | `/api/projects/:id/session_recordings/:session` | GET, DELETE | DELETE removes the metadata and the R2 chunks |
-| `/api/projects/:id/session_recordings/:session/snapshots` | GET | `{snapshots: [rrweb events]}`, decompressed, time order (up to 64 MB of JSON) |
+| `/api/projects/:id/session_recordings/:session/snapshots` | GET | `{snapshots: [rrweb events]}`, decompressed, time order; with `?paged=1` or `?cursor=<next>`: about 16 MB per page, `{snapshots, next}` (no total cap) |
+| `/api/projects/:id/sql` | POST | `{query}` → `{columns, types, results, hasMore, limit, offset}`; 400 `invalid_query` ("SQL") |
+| `/api/projects/:id/heatmaps` | GET | `type`, `date_from`, `date_to`, `url_exact` or `url_pattern`, `viewport_width_min/max`, `aggregation` → `{results: [{pointer_relative_x, pointer_target_fixed, client_y, count}]}` |
+| `/api/projects/:id/heatmaps/urls` | GET | pages with heatmap data, most first |
+| `/api/projects/:id/scroll_depth` | GET | `pathname` or `url_exact`, dates → `{pageviews, results: [{percentage, count, share}]}` |
+| `/api/projects/:id/actions` | GET, POST | `{name, description, steps}` ("Actions") |
+| `/api/projects/:id/actions/:id` | GET, PATCH, DELETE | |
+| `/api/projects/:id/cohorts` | GET, POST | `{name, description, is_static, filters}`; static: `csv`, `distinct_ids`, `emails` or `person_ids` (JSON) or a `text/csv` body |
+| `/api/projects/:id/cohorts/:id` | GET, PATCH, DELETE | GET has `count`, `last_calculated_at` |
+| `/api/projects/:id/cohorts/:id/calculate` | POST | recalculates now |
+| `/api/projects/:id/cohorts/:id/persons` | GET, POST | members (`cursor`); POST adds to a static cohort (same inputs) |
+| `/api/projects/:id/cohorts/:id/persons/:uuid` | DELETE | removes from a static cohort |
+| `/api/projects/:id/feature_flags/local_evaluation` | GET | flag definitions for API users (`protocol.md` 15) |
 | `/api/projects/:id/experiments` | GET, POST | POST `{name, description, feature_flag_key, variants?, metrics, filters?}`; creates the flag (off) when missing |
 | `/api/projects/:id/experiments/:id` | GET, PATCH, DELETE | PATCH fields, or `{action: "launch"|"stop"}`; DELETE keeps the flag |
 | `/api/projects/:id/experiments/:id/results` | GET | Experiments |
 | `/api/projects/:id/surveys` | GET, POST | Surveys |
 | `/api/projects/:id/surveys/:id` | GET, PATCH, DELETE | PATCH fields, or `{action: "launch"|"stop"|"resume"}` |
-| `/api/projects/:id/surveys/:id/results` | GET | Surveys |
+| `/api/projects/:id/surveys/:id/results` | GET | Surveys; `?iteration=n` |
 
 Other Worker routes: the SDK routes of `protocol.md`, `/_health`
 (`{"ok":true}`), `/app.js`, `/app.css`, `/player.js`, `/player.css`, and every other GET path returns
@@ -472,9 +504,9 @@ the app shell (history routing). All app responses carry
 
 ## Screens
 
-Left nav: app name, project switcher, Dashboards, Insights, Events,
-Persons, Session replay, Feature flags, Experiments, Surveys, Settings,
-Account. Mobile (≤760 px): the
+Left nav: app name, project switcher, Dashboards, Insights, SQL, Events,
+Actions, Persons, Cohorts, Session replay, Heatmaps, Feature flags,
+Experiments, Surveys, Settings, Account. Mobile (≤760 px): the
 nav becomes a wrapping top bar; tables scroll sideways.
 
 - **Sign in / Sign up** (`/login`, `/signup`): sign-up hidden when
@@ -529,6 +561,44 @@ nav becomes a wrapping top bar; tables scroll sideways.
   and a new-project form, delete project (type the name to confirm).
 - **Account** (`/account`): signed-in email, personal API keys (create,
   shown once; revoke), sign out.
+- 0.3 screens and changes:
+  - **SQL** (`/sql`): query box with examples, Run (Ctrl/⌘+Enter), row
+    count and time, result table; the last query is kept per project for
+    the browser session.
+  - **Actions** (`/actions`, `/new`, `/:id`): list with a summary of each
+    step; editor with name, description and OR-ed match blocks (autocapture
+    with CSS selector, text, href and URL; page view with URL; custom event;
+    each with event property filters) and, once saved, a 30-day trend.
+  - **Cohorts** (`/cohorts`, `/new`, `/:id`): list (type, persons, last
+    calculated); editor: dynamic criteria as OR groups of AND rows (person
+    property, performed event, performed action, in cohort; each with
+    "not"; behaviour with once / N times and a window), or static upload
+    (file or pasted CSV); members table, "Recalculate now", remove person
+    (static), delete.
+  - **Heatmaps** (`/heatmaps`): page (with a list of pages that have
+    data; `*` wildcards), type (clicks, rage clicks, dead clicks, mouse
+    moves, scroll depth), total or unique visitors, dates, width (375 to
+    1920) and background (live page in a sandboxed frame, a recording's
+    first full snapshot, or none); the canvas overlay colours points from
+    blue to red; scroll depth as horizontal bars.
+  - **Recording**: snapshots load page by page; Console (level, offset,
+    text) and Network (offset, method, status, URL, duration) panels from
+    the plugin events, rows jump the player; canvas replay when the
+    recording has canvas data.
+  - **Settings**: "Collect heatmaps" switch and a Session replay form
+    (sample rate %, minimum duration, linked flag and variant, console,
+    network requests / headers / bodies, canvas with fps and quality, URL
+    triggers, URL blocklist, event triggers, trigger matching, masking).
+  - **Survey editor**: partial responses; "Who sees it" (person and cohort
+    filters, rollout %, linked flag and variant); display conditions (URL
+    with match type, CSS selector, devices, wait period, triggering and
+    cancel events, triggering action); schedule (once or always; repeat N
+    times every D days). **Survey results**: completed / partial /
+    abandoned and an iteration picker.
+  - **Flag editor**: person or cohort conditions; "Persist the flag value
+    across authentication steps". **Insight editor** and experiment
+    metrics: each series or step is an event or an action; filters can be
+    cohort in / not in.
 
 ## Tests
 
@@ -566,13 +636,32 @@ nav becomes a wrapping top bar; tables scroll sideways.
   decompressed, password not present), survey results, experiment
   exposures and conversions, and the web app's screens including the
   replay player.
+- 0.3 e2e additions: heatmaps on and console/network capture in the
+  project; continuity on the experiment flag (the identified visitor must
+  count once); a partial-responses survey; the customer page is served as
+  `e2e-site.test` (Chromium host-resolver rule) so posthog-js's network
+  recorder runs; checks actions (selector + text, URL) in trends and
+  funnels, behavioural and CSV cohorts as insight filters, SQL (and a
+  rejected write), heatmap clicks, scroll depth, console and network
+  plugin events, posthog-node local evaluation with a personal key, and
+  the Actions, Cohort, SQL, Heatmaps and Recording console screens.
+- `tests/v03.test.ts`: selectors and chains, action matching (SQL and JS
+  conditions), cohorts (property, behavioural, multiple, negation,
+  nested, static input), streamed funnels against one pass, SQL (grouping,
+  person columns, rejects), continuity, survey targeting flags /
+  iterations / partial merge, heatmap and scroll aggregation, and HTTP
+  local evaluation (401, ETag 304), replay config mapping, SQL route and
+  paged snapshots.
 - Demo: `scripts/demo-setup.mjs <site> <email> <password>` makes the
   "Acme Store" project with 58 days of seeded data, five insights, a
   dashboard and two flags; `scripts/shots.mjs` takes the screenshots.
   `scripts/demo-02.mjs <site> <email> <password> <project>` adds three
   real recordings, an experiment with 640 seeded exposures and an NPS
   survey with seeded answers; `scripts/shots-02.mjs` takes the 0.2
-  screenshots.
+  screenshots. `scripts/shots-03.mjs <site> <email> <password> <project>
+  <dir>` runs 12 posthog-js visitors on a store page (heatmaps, scroll,
+  console and network capture), adds actions, cohorts, a cohort flag and a
+  targeted survey, and takes the 0.3 screenshots.
 
 ## Session replay (`replay.ts`)
 
@@ -658,8 +747,8 @@ to be best" across more than two variants directly. No PostHog code or
   reads `url`, `urlMatchType`, `selector`, `events`, `deviceTypes`).
 - Status: draft (no `start_date`), running (`start_date`, no `end_date`),
   complete (`end_date`). `/api/surveys` lists running, unarchived surveys.
-- Results read the survey's events from every shard (up to 50,000 per
-  event name per shard): shown and dismissed (events, distinct persons);
+- Results read the survey's events from every shard, 5,000 at a time by
+  cursor (no total limit; 0.3): shown and dismissed (events, distinct persons);
   responses = `survey sent` events, the latest per `$survey_submission_id`
   (else per event); completed = those without `$survey_completed: false`;
   response rate = persons who responded / persons shown. Per question the
@@ -670,7 +759,7 @@ to be best" across more than two variants directly. No PostHog code or
   selection; answers outside the list are added). Open and link: the latest
   100 answers with person and time.
 
-## Limits (0.2)
+## Limits (0.3)
 
 - 10 GB per project per month (one shard); `retention_days` bounds the
   total. The head (persons, flags, metadata) has its own 10 GB.
@@ -678,10 +767,153 @@ to be best" across more than two variants directly. No PostHog code or
   budget; see "Event shards" for memory guidance.
 - The token cache can serve a reset or deleted token, or an old
   recording/survey setting, for up to 30 seconds in other isolates.
-- Recording chunks are one per request; the snapshots endpoint returns up
-  to 64 MB of JSON per recording.
-- Flags hash the distinct id, so a visitor's variant can change at
-  identify (no experience continuity); such a person is excluded from the
-  experiment.
-- No local flag evaluation (`/api/feature_flag/local_evaluation`), cohorts,
-  actions, HogQL, heatmaps, data warehouse or exports.
+- Recording chunks are one per request; snapshots are served in pages of
+  about 16 MB (no total cap). The one-shot snapshots route still stops at
+  64 MB; the player uses pages.
+- Flags without experience continuity hash the distinct id, so a
+  visitor's variant can change at identify; such a person is excluded from
+  an experiment. Experiment flags have continuity on by default.
+- SQL: 10,000 result rows, 200,000 rows or groups per shard, 200,000
+  persons scanned for person conditions, 25 s. Times are UTC; `LIKE` is
+  case-insensitive; person conditions skip events without a person.
+- Heatmap "unique visitors" adds per-shard distinct counts, so a visitor
+  seen in two months counts twice.
+- Cohort membership of behavioural cohorts is as of the last calculation
+  (at most an hour old, or on demand); property-only cohorts are live.
+- No data warehouse, exports or cold tier (see "Cold tier").
+
+## Actions (`shared/actions.ts`, `shared/elements.ts`)
+
+- A step is `{event?, url?, url_matching?: exact|contains|regex, selector?,
+  text?, text_matching?, href?, href_matching?, properties?: [event
+  property filters]}`; at least one field. Person-property filters belong
+  in cohorts, not actions (400).
+- `event`, exact or contains `url` (on `$current_url`), exact or contains
+  `text` (on `$el_text`) and property filters compile into the shard SQL.
+  Selectors, `href` and regex conditions are evaluated in JavaScript in
+  the shard (a pre-pass over candidate events that keeps matching ids),
+  so no regex or selector text reaches SQL.
+- `$elements_chain` is parsed as posthog-js writes it (`tag.class1.class2:
+  attr="value"attr2="…";parent…`, first element = the clicked one).
+  Selectors support tag, `#id`, `.class`, `[attr]`, `[attr="v"]`,
+  `:nth-child(n)`, descendant (space) and child (`>`) combinators, and
+  commas; anything else is a 400 when the action is saved. `href` matches
+  the first element in the chain that has one.
+
+## Cohorts (`worker/cohorts.ts`)
+
+- Filters are PostHog's PropertyGroup: `{properties: {type: OR|AND,
+  values: [groups or criteria]}}`, at most 6 levels and 50 values a
+  group. Criteria: `person` (any person filter), `behavioral`
+  (`performed_event` = at least once, `performed_event_multiple` with
+  `operator` gte/lte/exact/gt/lt and `operator_value`; `event_type`
+  events or actions; `time_value` with `time_interval`
+  day/week/month/year; optional `event_filters`), and `cohort` (another
+  cohort's membership; cycles are a 400). Any criterion can be negated.
+- Calculation: for each behavioural criterion, one count per distinct id
+  from every shard in its window, summed per person; then each person is
+  evaluated and `cohort_people` is replaced in one transaction. On save,
+  hourly (cron) and on demand; flags and filters read the stored members.
+- Static cohorts take CSV (first column, or a `distinct_id`, `email` or
+  `person_id`/`id` column), lists of distinct ids, emails or person uuids;
+  entries that match no person are skipped (no persons are created); the
+  response says how many were added.
+- Filters `{type: "cohort", value, operator: in|not_in}` resolve to the
+  member person set in the head (a person filter), so they work in every
+  insight kind, experiment metrics, flags (via `/flags`) and survey
+  targeting. Property-only cohorts are evaluated from person properties
+  directly (live) and are sent to posthog-node for local evaluation.
+
+## SQL (`worker/sqlquery.ts`)
+
+- A hand-written lexer and parser produce an AST for one `SELECT … FROM
+  events|persons [WHERE] [GROUP BY] [HAVING] [ORDER BY] [LIMIT] [OFFSET]`.
+  Identifiers are resolved against a fixed column map (`event`,
+  `distinct_id`, `timestamp`, `uuid`, `properties.x` / `properties['x']`,
+  `person_id`, `person.properties.x`; for persons `id`, `created_at`,
+  `properties.x`, `is_identified`), functions against a whitelist
+  (`now`, `today`, `toDate`, `toDateTime`, `toStartOfHour/Day/Week/Month`,
+  `toIntervalMinute/Hour/Day/Week/Month`, `toString`, `toInt`, `toFloat`,
+  `lower`, `upper`, `length`, `substring`, `trim`, `position`,
+  `startsWith`, `endsWith`, `concat`, `coalesce`, `ifNull`, `if`, `round`,
+  `floor`, `ceil`, `abs`, `greatest`, `least`). Values are always bound
+  parameters.
+- Event queries: the time range is read from `timestamp` conditions to
+  pick shards; each shard runs the compiled SQLite (rows, or partial
+  aggregates per group: counts, sums, min/max, distinct value lists for
+  `uniq`), and the head merges groups, applies `HAVING`, `ORDER BY`,
+  `LIMIT`. Person conditions become a distinct-id list from the head;
+  grouping or `count(DISTINCT person_id)` by person resolves distinct ids
+  in the head.
+- Also served as `/query` `{kind: "HogQLQuery" | "SQLQuery", query}`.
+
+## Heatmaps (`worker/heatmaps.ts`)
+
+- Shards expand `$heatmap_data` with `json_each` for `$$heatmap` events in
+  range, keep points of the requested `type` and URL (exact, or `LIKE` from
+  `*`), and group by `round(100 × x / $viewport_width)`, `y / 16`,
+  `target_fixed`; the head adds counts (and per-shard distinct ids for
+  unique visitors). `$$heatmap` events are hidden from Events queries
+  unless named.
+- Scroll depth groups page views (`$pageview` and `$pageleave` carrying
+  `$prev_pageview_max_scroll_percentage`, filtered by
+  `$prev_pageview_pathname`) into 5 % buckets and reports "at least"
+  shares.
+- The UI draws a blurred circle per point on a canvas the size of the page
+  at the chosen width, colours it by intensity and lays it over the
+  background, scaled to fit.
+
+## Flags: local evaluation and continuity
+
+- `flagDefinitions(send_cohorts)` returns every flag (hidden survey flags
+  included, because posthog-js and posthog-node look them up) and the
+  property-only cohorts they reference, closed over nested cohorts, in
+  flag-filter form. Responses carry a SHA-1 ETag.
+- `/flags` evaluation gets a context: the person's cohort memberships (on
+  demand) and hash key overrides for continuity flags (`protocol.md` 16).
+
+## Survey targeting (`worker/surveys.ts`)
+
+- Saving a survey with `targeting_flag_filters` creates or updates the
+  hidden flag `survey-targeting-<first 12 hex of the id>`; the internal
+  flag `<same>-custom` exists for every survey whose schedule is not
+  `always`.
+  Both carry `internal = <survey id>`, are omitted from the flag list
+  unless `include_internal=1`, and are deleted with the survey. Iteration
+  changes rewrite the internal flag's property keys at most once a minute.
+- `conditions` are validated (URL regexes compile; device types are
+  Desktop, Mobile, Tablet; wait period 0-3650) and action triggers are
+  served with their steps.
+- Results merge `survey sent` events per `$survey_submission_id` (latest
+  non-empty answer per question), count completed vs partial, read
+  `survey abandoned`, and group by `$survey_iteration`.
+
+## Replay settings (`worker/replay.ts`)
+
+- `replay_config` is validated (sample rate 0-1, minimum duration up to an
+  hour, regexes compile, at most 50 triggers, canvas fps 0-12, quality
+  0-1) and mapped to posthog-js's fields (`protocol.md` 18). Network timing
+  also turns on `capturePerformance.network_timing`.
+
+## Streaming funnels (`worker/query.ts`)
+
+- Pass 1: every shard returns `[distinct_id, matching events]` for the
+  funnel's step events. If the total is at most 100,000 the funnel runs in
+  one pass. Otherwise distinct ids are grouped by person (so a person
+  never spans batches) and packed into batches of at most 100,000 rows;
+  pass 2 runs the funnel for each batch (shards filter by the batch's
+  distinct ids) and sums the per-step counts, conversion times and
+  breakdowns. Experiments use the same path.
+
+## Cold tier (Basin; not enabled)
+
+- Plan: export events past a hot window to an R2 Iceberg table through a
+  Basin pipeline and query old ranges with Basin SQL. The queue consumer
+  already sends `{project_id, uuid, event, distinct_id, timestamp,
+  properties}` to an optional `COLD_STREAM` binding when one is
+  configured, so a Basin stream can be attached without code changes.
+- Not enabled in the reference deploy: a Basin Catalog sink needs an R2
+  catalog token with R2 admin read/write, an R2 sink needs R2 S3
+  credentials, and querying needs an API token with Basin SQL, Catalog and
+  R2 read; none of these come from the deploy token. Until then events stay
+  in shards and `retention_days` bounds them.

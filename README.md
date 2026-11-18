@@ -3,12 +3,14 @@
 Self-hosted product analytics on Cloudflare Workers that the PostHog SDKs
 send to unchanged. Point the usual posthog-js snippet (or posthog-node) at
 your instance and you get events, identified people, groups, trends,
-funnels, retention, dashboards, feature flags, session replay,
-experiments and surveys. Events live in SQLite Durable Objects sharded by
+funnels, retention, dashboards, feature flags (also evaluated locally by
+posthog-node), session replay with console and network logs, heatmaps and
+scroll depth, actions, cohorts, a read-only SQL editor, experiments and
+targeted surveys. Events live in SQLite Durable Objects sharded by
 month, so a project is not limited to 10 GB and every count stays exact.
 
 **Spec:** [spekkr.com/dwrtz/product-analytics](https://spekkr.com/dwrtz/product-analytics/)
-(version 0.2.0, also in [`spec/`](spec/)). This repo is the reference
+(version 0.3.0, also in [`spec/`](spec/)). This repo is the reference
 implementation of that spec.
 
 This is not PostHog and contains no PostHog code. The wire format was
@@ -20,6 +22,8 @@ reconstructed from PostHog's MIT-licensed sources and recorded SDK traffic
 ![Dashboard](shots/dashboard.png)
 
 ![Session replay](shots/replay-player.png)
+
+![Heatmap](shots03/heatmap-clicks.png)
 
 ## What works
 
@@ -55,6 +59,20 @@ reconstructed from PostHog's MIT-licensed sources and recorded SDK traffic
 - **Web app**: dashboards, insight editor, events explorer, persons,
   session replay, feature flags, experiments, surveys, project settings
   with the install snippet, personal API keys. Works on a phone.
+
+- **0.3**: actions (CSS selector, text, href, URL matchers) as series,
+  funnel steps and cohort criteria; static (CSV) and dynamic cohorts
+  (properties, behaviour, other cohorts) as filters in insights, flags,
+  surveys and experiments; click, rage-click, dead-click and mouse-move
+  heatmaps and scroll depth over the live page or a recording snapshot;
+  `POST /api/projects/:id/sql` and an SQL screen (read-only, project
+  scoped, across shards, with limits); posthog-node local evaluation
+  (`/flags/definitions`, `/api/feature_flag/local_evaluation`); experience
+  continuity via `$anon_distinct_id`; survey targeting (cohorts, URL,
+  selector, devices, wait period, actions), iterations and partial
+  responses; replay sampling, minimum duration, linked flag, URL/event
+  triggers, network/console/canvas capture and paged playback (no 64 MB
+  cap); funnels and survey results without row limits.
 
 Full, normative detail: [`spec/protocol.md`](spec/protocol.md), with worked
 examples in [`spec/test-vectors.json`](spec/test-vectors.json).
@@ -106,7 +124,8 @@ and R2, and a zone for the hostname.
 6. `npm run deploy`, open the site, sign up, create a project and paste the
    snippet into your site.
 
-No secrets are needed. Upgrading from 0.1: create the R2 bucket, run step
+No secrets are needed. Upgrading from 0.2: run step 4 again (migration
+0003) and `npm run deploy` (adds the hourly cohort cron). Upgrading from 0.1: create the R2 bucket, run step
 4 again (migration 0002) and `npm run deploy`; existing events stay where
 they are and new ones go to monthly shards.
 
@@ -124,22 +143,26 @@ Settings shows the full snippet for your instance. With posthog-node:
 
 ## Test status
 
-- `npm test`: 103/103 pass.
+- `npm test`: 119/119 pass.
 - `npm run typecheck`: passes.
-- `npm run e2e`: 32/32 checks pass (posthog-js snippet on a separate
+- `npm run e2e`: 49/49 checks pass (0.3 adds actions, cohorts, SQL,
+  heatmaps, scroll depth, console/network capture, continuity, partial
+  survey responses, posthog-node local evaluation and their screens; earlier: (posthog-js snippet on a separate
   origin, posthog-node capture, identify, alias and flags; stored events,
   merged persons, trend, funnel and retention numbers; a real recording
   with the password absent; a survey answered in the posthog-js popover;
   experiment exposure; UI including the replay player).
 - REA conformance captures of real posthog-js against this build: 0.1
-  16/16 and 0.2 (recorder, surveys, exposure) 22/22 SDK requests succeed.
+  16/16, 0.2 (recorder, surveys, exposure) 22/22 and 0.3 (heatmaps,
+  console/network/canvas, continuity, partial surveys) 30/30 SDK requests
+  succeed.
 
-## Not in 0.2
+## Not in 0.3
 
-Cohorts, actions, HogQL, heatmaps, local flag evaluation, data warehouse
-and exports; replay triggers, sampling and network capture; survey
-targeting flags and iterations; experiment experience continuity (a
-visitor's variant can change at identify).
+Data warehouse and exports; the Basin cold tier (an optional
+`COLD_STREAM` hook exists, but Basin needs credentials beyond a deploy
+token); full HogQL (joins, subqueries); lifecycle, stickiness and paths;
+toolbar and element clickmaps; web experiments and product tours.
 
 ## License
 

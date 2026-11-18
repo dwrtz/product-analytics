@@ -19,6 +19,7 @@ point to the PostHog MIT source the rule was read from (commit and paths in
 | `/static/<file>`, `/static/<version>/<file>` | GET | the snippet and lazy-loaded SDK bundles | 9 |
 | `/s`, `/i/v0/s` | POST | posthog-js session recorder snapshots (observed: `/s/`) | 11 |
 | `/api/surveys` | GET | posthog-js surveys (`?token=`) | 12 |
+| `/flags/definitions`, `/api/feature_flag/local_evaluation` | GET | posthog-node local evaluation (personal API key) | 15 |
 | `/api/web_experiments`, `/api/early_access_features` | any | out-of-scope products | 9 |
 | any of the above | OPTIONS | CORS preflight: 204 | 1 |
 
@@ -320,7 +321,10 @@ observed working with posthog-js 1.450.1):
 ```
 
 The `/flags` response with `config=true` (and `/decide`) carries the same
-two fields.
+two fields. 0.3: the project's replay settings fill these fields (18);
+`heatmaps` and `captureDeadClicks` are the project's heatmaps setting (14);
+`capturePerformance` is `{"network_timing": true, "web_vitals": false}`
+when network capture is on (18), else `false`.
 
 `/static/<file>` serves the posthog-js `dist/*.js` files of the version the
 build installed (plus its licence), with CORS and a one-hour cache;
@@ -451,3 +455,135 @@ again if its value changes), with `$feature_flag` (the key),
 (observed). posthog-node's `getFeatureFlag` / `evaluateFlags().getFlag`
 sends the same event from the server. Experiments use the first such
 event per person as the exposure (design.md "Experiments").
+
+## 14. Heatmaps [posthog-js packages/browser/src/heatmaps.ts; observed]
+
+With `heatmaps: true` in remote config, posthog-js (observed 1.450.1)
+buffers pointer data and sends it about every 5 s, and on page leave, as a
+normal event on the capture path (section 1):
+
+```json
+{ "event": "$$heatmap", "properties": {
+    "$heatmap_data": { "<page url>": [ { "x": 312, "y": 188, "target_fixed": false, "type": "click" } ] },
+    "$viewport_width": 1280, "$viewport_height": 760, "$current_url": "<page url>", "$pathname": "/", … } }
+```
+
+- `type` is `click`, `rageclick` (3 clicks within 1 s and 30 px),
+  `deadclick` (from the lazily loaded `dead-clicks-autocapture.js` when
+  `captureDeadClicks` is on) or `mousemove`.
+- `x`, `y` are CSS pixels; the page scroll is already added to `y` unless
+  `target_fixed` (the target is in a fixed-position element).
+- The instance aggregates `x / $viewport_width` (0-1, 1 % steps) and `y` in
+  16 px rows per `type`, URL and viewport width range.
+
+Scroll depth needs no heatmap setting: `$pageleave` (and the next
+`$pageview` in single-page apps) carries `$prev_pageview_pathname`,
+`$prev_pageview_last_scroll`, `$prev_pageview_last_scroll_percentage`,
+`$prev_pageview_max_scroll`, `$prev_pageview_max_scroll_percentage`,
+`$prev_pageview_last_content(_percentage)` and
+`$prev_pageview_max_content(_percentage)`; percentages are 0-1.
+
+## 15. Local flag evaluation [posthog-node src/extensions/feature-flags; observed with posthog-node 6.0.3]
+
+With a personal API key posthog-node polls (default every 30 s):
+
+```
+GET /flags/definitions?token=<phc_…>&send_cohorts
+Authorization: Bearer <phx_…>
+If-None-Match: "<etag of the last 200>"
+```
+
+(older SDKs call `/api/feature_flag/local_evaluation?token=…&send_cohorts`;
+both are served, and `/api/projects/:id/feature_flags/local_evaluation` for
+API users). No or a bad personal key is 401 `{"type":
+"authentication_error", …}`; an unknown token 401. 200:
+
+```json
+{ "flags": [ { "id": 1, "team_id": null, "key": "new-cart", "name": "…", "active": true, "deleted": false,
+               "ensure_experience_continuity": false, "version": 3,
+               "filters": { "aggregation_group_type_index": null, "groups": [ … ], "multivariate": null, "payloads": {} } } ],
+  "group_type_mapping": { "0": "company" },
+  "cohorts": { "7": { "type": "OR", "values": [ { "type": "AND", "values": [
+      { "key": "plan", "type": "person", "value": ["pro"], "operator": "exact" } ] } ] } } }
+```
+
+with an `ETag` (SHA-1 of the body) and 304 for a matching
+`If-None-Match`. `cohorts` (only with `send_cohorts`) holds the
+property-only cohorts flags reference, in flag-property form. Flags that
+reference a behavioural or static cohort name a cohort id missing from
+`cohorts`, and flags with `ensure_experience_continuity` are flagged by the
+SDK itself; posthog-node then evaluates those through `/flags` (section 8).
+Locally evaluated `$feature_flag_called` events carry `locally_evaluated:
+true` and `$feature_flag_reason: "Evaluated locally"`.
+
+## 16. Experience continuity [posthog-js; rust/feature-flags hash key overrides]
+
+After `identify()`, posthog-js's next `/flags` body carries
+`"$anon_distinct_id": "<previous anonymous id>"` once (observed). For each
+active flag with `ensure_experience_continuity`, the instance stores a hash
+key override `(distinct_id, flag_key) → hash_key = $anon_distinct_id` for
+both the new and the anonymous distinct id, unless one exists. Evaluating
+such a flag for any distinct id of a person uses the override's hash key
+in place of the distinct id in the rollout and variant hashes (section 8).
+Overrides follow person merges and are deleted with the person.
+
+## 17. Survey targeting, iterations and partial responses [posthog-js packages/browser/src/extensions/surveys; observed]
+
+`GET /api/surveys/?token=` (section 12) adds per survey:
+
+```json
+{ "linked_flag_key": "new-cart", "targeting_flag_key": "survey-targeting-9cadf132b610",
+  "internal_targeting_flag_key": "survey-targeting-9cadf132b610-custom",
+  "feature_flag_keys": [ { "key": "flag", "value": "new-cart" }, { "key": "targeting_flag", "value": "…" },
+                         { "key": "internal_targeting_flag", "value": "…-custom" } ],
+  "conditions": { "url": "/pricing", "urlMatchType": "icontains", "selector": "#cta",
+                  "deviceTypes": ["Desktop"], "deviceTypesMatchType": "exact", "seenSurveyWaitPeriodInDays": 14,
+                  "linkedFlagVariant": "test", "events": { "values": [ { "name": "opened_pricing" } ], "repeatedActivation": false },
+                  "cancelEvents": { "values": [ { "name": "closed_cart" } ] },
+                  "actions": { "values": [ { "id": 3, "name": "Added to cart", "steps": [ … ] } ] } },
+  "current_iteration": 2, "current_iteration_start_date": "…", "schedule": "recurring",
+  "enable_partial_responses": true }
+```
+
+- posthog-js checks the three flags itself through `/flags`, so the
+  instance keeps them as real flags, hidden from the flag list: the
+  targeting flag has the survey's `targeting_flag_filters`; the internal
+  flag matches persons where `$survey_dismissed/<id>[/<iteration>]` and
+  `$survey_responded/<id>[/<iteration>]` are not set (posthog-js sets
+  them with `$set` on dismiss and send). `urlMatchType` is one of `exact`,
+  `is_not`, `icontains`, `not_icontains`, `regex`, `not_regex`.
+- Iterations: `current_iteration = min(iteration_count, floor((now -
+  start_date) / iteration_frequency_days) + 1)`; posthog-js adds
+  `$survey_iteration` and `$survey_iteration_start_date` to survey events.
+- Partial responses: posthog-js sends one `survey sent` per answered
+  question with the same `$survey_submission_id`, cumulative
+  `$survey_response_<question id>` values, `$survey_completed: false`
+  until the last; closing early sends `survey abandoned` with
+  `$survey_partially_completed: true`.
+
+## 18. Replay settings [posthog-js packages/browser-common/src/types/remote-config.ts; observed]
+
+The `sessionRecording` object of section 9, filled from the project's
+replay settings:
+
+| setting | field |
+|---|---|
+| sample rate 0-1 | `sampleRate` as a two-decimal string ("0.25"), `null` = all |
+| minimum duration | `minimumDurationMilliseconds` |
+| linked flag | `linkedFlag`: `"key"` or `{"flag": "key", "variant": "v"}` |
+| console logs | `consoleLogRecordingEnabled` |
+| network headers / bodies | `networkPayloadCapture: {"recordHeaders", "recordBody"}` |
+| network timing | top-level `capturePerformance: {"network_timing": true, …}` |
+| URL triggers / blocklist | `urlTriggers` / `urlBlocklist`: `[{"url": "<regex>", "matching": "regex"}]` |
+| event triggers | `eventTriggers: ["<event>"]`, `triggerMatchType: "any" | "all"` |
+| masking | `masking: {"maskAllInputs", "maskTextSelector", "blockSelector"}` |
+| canvas | `recordCanvas: true`, `canvasFps`, `canvasQuality` ("0.4") |
+
+Resulting rrweb events (observed): console as type 6 `{"plugin":
+"rrweb/console@1", "payload": {"level", "trace": [], "payload": [<JSON
+strings>]}}`; network as type 6 `{"plugin": "rrweb/network@1", "payload":
+{"requests": [PerformanceResourceTiming fields + "method", "status",
+headers and bodies when enabled]}}`; posthog-js turns the network recorder
+off when the page's host is `localhost` or `127.0.0.1`. Canvas as type 3
+source 9 (canvas mutation) with base64 webp image data; the player needs
+canvas replay turned on.

@@ -16,6 +16,8 @@ export interface Env {
   SHARD_PERIOD?: string;
   /** Days to keep session recordings (default 30); 0 keeps them as long as the project's events. */
   REPLAY_RETENTION_DAYS?: string;
+  /** Optional Basin Pipelines stream (cold tier, design.md "Cold tier"); every ingested event is also sent here. */
+  COLD_STREAM?: { send(records: unknown[]): Promise<void> };
 }
 /** One queue message: events for one project, already normalized by the capture endpoint. */
 export type IngestMsg = { pid: number; events?: NormEvent[]; replay?: import('./replay').ReplayMeta[] };
@@ -23,7 +25,7 @@ export type NormEvent = {
   uuid: string; event: string; distinct_id: string; ts: number; properties: Record<string, unknown>;
   set?: Record<string, unknown>; set_once?: Record<string, unknown>; unset?: string[]; person: boolean; received_at: number;
 };
-export interface ProjectRow { id: number; name: string; api_token: string; timezone: string; retention_days: number; anonymize_ips: number; autocapture_opt_out: number; session_recording?: number; created_at: string }
+export interface ProjectRow { id: number; name: string; api_token: string; timezone: string; retention_days: number; anonymize_ips: number; autocapture_opt_out: number; session_recording?: number; replay_config?: string | null; heatmaps?: number; created_at: string }
 export interface UserRow { id: number; email: string; name: string; pw_hash: string; pw_salt: string; created_at: string }
 
 export class HttpError extends Error {

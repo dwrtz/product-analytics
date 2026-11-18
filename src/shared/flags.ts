@@ -3,7 +3,9 @@ export type PropFilter = { key: string; value?: unknown; operator?: string; type
 export type FlagCondition = { properties?: PropFilter[]; rollout_percentage?: number | null; variant?: string | null };
 export type FlagVariant = { key: string; name?: string; rollout_percentage: number };
 export type FlagFilters = { groups?: FlagCondition[]; multivariate?: { variants: FlagVariant[] } | null; payloads?: Record<string, string> };
-export type FlagDef = { id: number; key: string; name?: string; active: boolean; version: number; filters: FlagFilters };
+export type FlagDef = { id: number; key: string; name?: string; active: boolean; version: number; filters: FlagFilters; ensure_experience_continuity?: boolean };
+/** Evaluation context: the hash key override (experience continuity) and cohort membership. */
+export type FlagCtx = { hashKey?: string | null; inCohort?: (id: number) => boolean };
 export type FlagResult = { key: string; enabled: boolean; variant: string | null; reason: { code: string; condition_index: number | null; description: string }; metadata: { id: number; version: number; description: string | null; payload: string | null } };
 
 const LONG_SCALE = 0xfffffffffffffff;
@@ -48,22 +50,25 @@ export function matchProperty(f: PropFilter, props: Record<string, unknown>): bo
 }
 
 /** Evaluates one active flag for a distinct id and a merged person property bag. */
-export async function evaluateFlag(flag: FlagDef, distinctId: string, props: Record<string, unknown>): Promise<FlagResult> {
+export async function evaluateFlag(flag: FlagDef, distinctId: string, props: Record<string, unknown>, ctx: FlagCtx = {}): Promise<FlagResult> {
+  // With experience continuity the person's first-seen distinct id (the hash key override) is hashed instead.
+  const hashId = flag.ensure_experience_continuity && ctx.hashKey ? ctx.hashKey : distinctId;
+  const match = (p: PropFilter) => p.type === 'cohort' ? (() => { const r = !!ctx.inCohort?.(Number(p.value)); return p.operator === 'not_in' || (p as any).negation ? !r : r; })() : matchProperty(p, props);
   const meta = (variant: string | null, enabled: boolean) => ({ id: flag.id, version: flag.version, description: flag.name ?? null, payload: enabled ? flag.filters.payloads?.[variant ?? 'true'] ?? null : null });
   const groups = flag.filters.groups?.length ? flag.filters.groups : [{ properties: [], rollout_percentage: 0 }];
   const variants = flag.filters.multivariate?.variants ?? [];
   let best: { code: string; i: number | null } = { code: 'no_condition_match', i: null };
   for (let i = 0; i < groups.length; i++) {
     const g = groups[i];
-    if (!(g.properties ?? []).every(p => matchProperty(p, props))) continue;
+    if (!(g.properties ?? []).every(match)) continue;
     const pct = g.rollout_percentage ?? 100;
-    const inRollout = pct >= 100 ? true : distinctId === '' ? true : (await flagHash(flag.key + '.', distinctId, '')) <= pct / 100;
+    const inRollout = pct >= 100 ? true : hashId === '' ? true : (await flagHash(flag.key + '.', hashId, '')) <= pct / 100;
     if (!inRollout) { best = { code: 'out_of_rollout_bound', i }; continue; }
     let variant: string | null = null;
     if (variants.length) {
       if (g.variant && variants.some(v => v.key === g.variant)) variant = g.variant;
       else {
-        const h = await flagHash(flag.key + '.', distinctId, 'variant'); let c = 0;
+        const h = await flagHash(flag.key + '.', hashId, 'variant'); let c = 0;
         for (const v of variants) { c += v.rollout_percentage / 100; if (h < c) { variant = v.key; break; } }
       }
     }

@@ -3,6 +3,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env, NormEvent } from './env';
 import * as X from './eventsql';
+import { runShardSql, SqlShardSpec } from './sqlquery';
 
 export class EventShard extends DurableObject<Env> {
   sql: SqlStorage;
@@ -22,6 +23,10 @@ export class EventShard extends DurableObject<Env> {
   }
   async trend(s: X.TrendSpec) { return X.trendRows(this.sql, s); }
   async funnel(s: X.FunnelSpec) { return X.funnelRows(this.sql, s); }
+  async funnelCounts(s: X.FunnelSpec) { return X.funnelCountRows(this.sql, s); }
+  async sqlRows(s: SqlShardSpec) { return runShardSql(this.sql, s); }
+  async heatmap(s: X.HeatmapSpec) { return X.heatmapRows(this.sql, s); }
+  async scroll(s: { from: number; to: number; pathname?: string | null }) { return X.scrollRows(this.sql, s); }
   async periods(s: X.PeriodSpec) { return X.periodRows(this.sql, s); }
   async firsts(s: { node: X.NodeSpec; global?: X.PropertyFilter[]; before: number }) { return X.firstRows(this.sql, s); }
   async events(s: X.EventsSpec) { return X.eventRows(this.sql, s); }

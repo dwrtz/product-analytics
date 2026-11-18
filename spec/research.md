@@ -110,6 +110,50 @@ The same method was applied to the three new protocols with posthog-js
    with a full snapshot; the typed password absent), the survey's answers
    (NPS 100, the chosen option, the text) and one experiment exposure.
 
+### 0.3: heatmaps, replay capture options, continuity, partial surveys, local evaluation
+
+1. **Runtime capture against a recorder** (`recorder3/`, posthog-js
+   1.450.1 and posthog-node 6.0.3). The recorder's remote config turned on
+   heatmaps, dead clicks, console logs, network timing with headers and
+   bodies, and canvas recording; `/api/surveys` served a
+   partial-responses survey with targeting flags, conditions and an
+   iteration; `/flags` a multivariate flag. The scenario typed, fetched,
+   logged to the console, drew on a canvas, read flags, scrolled,
+   identified, answered two of three survey questions and navigated.
+   Two runs: on `localhost` (`ev_32496edb…`, summary `ev_8115b374…`, 0
+   failed) and on a non-localhost host so the network recorder runs
+   (`ev_4682126f…`, summary `ev_99fe82a5…`, 0 failed). posthog-node with a
+   personal key was recorded fetching definitions. Established (now
+   `protocol.md` 14-18): `$$heatmap` events and `$heatmap_data`; the
+   scroll properties on `$pageleave`; console, network and canvas rrweb
+   events and that posthog-js disables the network recorder on
+   localhost; `$anon_distinct_id` in the first `/flags` after identify;
+   the partial-response event sequence (`$survey_completed: false`,
+   cumulative answers, `survey abandoned`) and the `$survey_responded/<id>/
+   <iteration>` person properties; posthog-node's
+   `/flags/definitions?token=…&send_cohorts` with `Authorization: Bearer`
+   and `If-None-Match`.
+2. **Reference source** (MIT/Apache only): posthog-js
+   `packages/browser/src/heatmaps.ts`, `extensions/replay/`,
+   `extensions/surveys/`, `browser-common/src/types/remote-config.ts` and
+   `surveys.ts`; posthog-node `src/extensions/feature-flags/`;
+   `posthog-foss` `rust/feature-flags` (hash key overrides, cohort
+   properties) and public docs for cohorts, actions, heatmaps and the SQL
+   editor. Nothing under `ee/`.
+3. **Conformance** (`conform03/`): the same page and scenario against the
+   self-built server under `wrangler dev` (project with heatmaps, console,
+   network headers/bodies and canvas on; an experiment flag with
+   continuity; a partial-responses survey with targeting, conditions and
+   3 iterations): 30 transactions, 0 failed, every step completed
+   (`ev_9535baea…`, summary `ev_112dda4b…`). Afterwards the server held 15
+   heatmap points in 12 cells and one scroll-depth page view, a recording
+   with console and network plugin events and a canvas mutation, one
+   partial survey response merged from two `survey sent` events (two
+   answers, one abandoned, iteration 1), the hidden targeting and internal
+   flags, and one experiment exposure.
+4. **End to end** (`npm run e2e`, 49 checks) adds posthog-node local
+   evaluation against the instance, actions, cohorts, SQL and the screens.
+
 ## Evidence ledger
 
 Evidence files are kept with the reference build's working notes
@@ -125,6 +169,10 @@ Evidence files are kept with the reference build's working notes
 | `ev_64cbe291…` (summary `ev_e4b81384…`) | capture_browser_scenario | 0.2: posthog-js recorder, surveys and exposure against `recorder2` (port 8798), 0 failed |
 | `ev_db418df4…` (summary `ev_49b453af…`) | capture_browser_scenario | 0.2 conformance: the same scenario against the self-built server, 22 transactions, 0 failed |
 | `recorder2/recorded.jsonl` | recorder | raw 0.2 requests (`/s/` bodies, survey and exposure events) |
+| `ev_32496edb…` (summary `ev_8115b374…`) | capture_browser_scenario | 0.3: heatmaps, replay options, continuity, partial survey against `recorder3` on localhost, 0 failed |
+| `ev_4682126f…` (summary `ev_99fe82a5…`) | capture_browser_scenario | 0.3: the same on a non-localhost host (network recorder on), 0 failed |
+| `ev_9535baea…` (summary `ev_112dda4b…`) | capture_browser_scenario | 0.3 conformance against the self-built server, 30 transactions, 0 failed |
+| `recorder3/recorded.jsonl` | recorder | raw 0.3 requests (`$$heatmap`, plugin events, `/flags` with `$anon_distinct_id`, partial survey events, posthog-node definitions polling) |
 | `sdk-wire.recorded.jsonl` | recorder | raw posthog-js requests (headers, bodies) |
 | `node-sdk-wire.recorded.jsonl` | recorder | raw posthog-node 6.0.3 requests |
 
@@ -154,6 +202,12 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
 | Snapshot requests, field compression, masking (11) | `ev_64cbe291…`; posthog-js `packages/browser/src/extensions/replay/` |
 | Survey fetch, survey shape and events (12) | `ev_64cbe291…`; posthog-js `packages/browser-common/src/types/surveys.ts`, `packages/core/src/surveys/events.ts` |
 | Exposure event (13) | `ev_64cbe291…` |
+| Heatmap events, scroll properties (14) | `ev_32496edb…`; posthog-js `packages/browser/src/heatmaps.ts` and its scroll manager |
+| Local evaluation request and response (15) | `recorder3/recorded.jsonl` (posthog-node 6.0.3); posthog-node `src/extensions/feature-flags/feature-flags.ts` |
+| Hash key overrides (16) | `ev_32496edb…` (`$anon_distinct_id`); `rust/feature-flags/src/flags/flag_matching.rs` (hash key override lookup) |
+| Survey targeting flags, iterations, partial responses (17) | `ev_32496edb…`; posthog-js `extensions/surveys/`, `browser-common/src/types/surveys.ts` |
+| Replay settings, plugin and canvas events (18) | `ev_4682126f…`; posthog-js `browser-common/src/types/remote-config.ts`, `extensions/replay/` |
+| Cohort and action semantics | PostHog public docs (cohorts, actions); `rust/feature-flags/src/properties/` for cohort property filters; the selector subset is our own |
 | Experiment statistics | PostHog's public docs (posthog.com/docs/experiments/statistics-bayesian: flat prior, chance to win, 95% threshold, 50 exposures) for the user-facing rules; conjugate Beta/Gamma/Normal posteriors and Evan Miller's closed form for P(B > A) from standard references; no PostHog code |
 | Ordered funnel semantics | `funnel-udf/src/steps.rs` |
 | Funnel events limited to the date range | `products/product_analytics/backend/hogql_queries/funnels/funnel_event_query.py` |
@@ -173,8 +227,9 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
   default); flags do support it.
 - **Exact matching** is case-insensitive in flags (as PostHog's flag
   service) and case-sensitive in insight filters (as PostHog's queries).
-- **No local evaluation endpoint**, so posthog-node evaluates flags
-  remotely (it falls back on its own; observed).
+- **Local evaluation** sends only property-only cohorts; flags with
+  behavioural or static cohorts fall back to `/flags` (posthog-node does
+  this itself; observed). PostHog sends more cohort kinds; not needed.
 - **`/flags?v=4`** gets the v2-shaped answer; posthog-node 6 accepts it.
   The full v4 differences were not studied.
 - **Personless events** are counted for a person once their distinct id is
@@ -187,14 +242,16 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
   `/api/.../snapshots` format) was not copied and is not needed by the SDK.
 - **Experiments** use the first exposure per person and exclude persons
   seen in two variants; PostHog's exact exposure and metric query rules
-  (and its `ee/` code) were not read. Our flags hash the distinct id, so
-  a variant can change at identify without "experience continuity".
-- **Surveys:** targeting flags, iterations, partial-response merging
-  beyond the latest event per submission id, and the feedback widget's
-  server pieces are not implemented; posthog-js applies display
-  conditions itself.
-- Not studied: heatmaps, web analytics, the data warehouse, HogQL, replay
-  triggers and sampling, network and canvas capture.
+  (and its `ee/` code) were not read. Experience continuity follows the
+  MIT flags service's hash key override idea; experiment flags have it on.
+- **Surveys:** the feedback widget's server pieces and hosted surveys are
+  not implemented; posthog-js applies display conditions itself.
+- **SQL** is a subset with SQLite semantics (UTC times, case-insensitive
+  `LIKE`), not HogQL; queries that need joins are out of scope.
+- **Heatmap unique visitors** add per-month distinct counts.
+- **Cold tier** not enabled: Basin needs credentials the deploy token
+  does not have (`design.md`, "Cold tier").
+- Not studied: web analytics, the data warehouse, the toolbar.
 
 ## Licensing
 
@@ -238,3 +295,17 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
   reproducible; 95% probability to be best and 50 exposures per variant
   before a winner is named.
 - Surveys are white-label by default.
+
+## Choices made for 0.3
+
+- Actions and cohorts live in the head; selector, href and regex
+  conditions run in JavaScript inside the shards, so no user text becomes
+  SQL. Behavioural cohorts are precomputed (save, hourly, on demand);
+  property-only cohorts are live and go to posthog-node.
+- SQL is our own parser over a fixed column map, compiled per shard and
+  merged in the head, with hard limits; no pass-through SQL.
+- Funnels stream in person batches instead of loading all rows.
+- Heatmap backgrounds are the live page in a sandboxed frame or a
+  recording's first full snapshot; no server-side screenshots.
+- Basin cold tier: export hook only (needs operator-created Basin and R2
+  credentials).

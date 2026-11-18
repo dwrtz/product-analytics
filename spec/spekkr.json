@@ -2,23 +2,23 @@
   "spekkr": 1,
   "id": "dwrtz/product-analytics",
   "name": "Product Analytics",
-  "summary": "Self-hosted product analytics on Cloudflare for unmodified posthog-js: trends, funnels, flags, session replay, experiments, surveys.",
+  "summary": "Self-hosted product analytics on Cloudflare for posthog-js: insights, flags, replay, heatmaps, cohorts, SQL, experiments, surveys.",
   "kind": "web app",
   "keywords": [
     "product analytics",
     "posthog-js compatible",
     "session replay",
+    "heatmaps",
+    "cohorts",
+    "sql editor",
     "experiments",
     "surveys",
     "feature flags",
     "funnels",
-    "retention",
-    "dashboards",
     "self-hosted",
-    "cloudflare workers",
-    "durable objects"
+    "cloudflare workers"
   ],
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "id": "dwrtz",
     "name": "David Wurtz"
@@ -64,11 +64,11 @@
   "files": [
     {
       "path": "spec.md",
-      "about": "Requirements R1-R18 (0.2 adds event shards, session replay, experiments and surveys) with acceptance checks, scope and definition of done."
+      "about": "Requirements R1-R26 (0.2: event shards, replay, experiments, surveys; 0.3: actions, cohorts, heatmaps, SQL, local evaluation, continuity, survey targeting, replay settings, no row limits) with acceptance checks, scope and definition of done."
     },
     {
       "path": "protocol.md",
-      "about": "The normative SDK wire format: capture routes, body decoding, tokens, timestamps, v1 capture, persons and merges, feature flags, remote config, session recording snapshots, surveys, exposure events, error codes."
+      "about": "The normative SDK wire format: capture routes, body decoding, tokens, timestamps, v1 capture, persons and merges, feature flags, remote config, replay snapshots and settings, surveys and targeting, exposure, heatmaps, local evaluation, experience continuity, error codes."
     },
     {
       "path": "test-vectors.json",
@@ -76,7 +76,7 @@
     },
     {
       "path": "design.md",
-      "about": "Stack, storage and event-shard decisions, Cloudflare config, deploy and upgrade, data model, ingestion, query semantics, replay, experiment statistics, surveys, owner API, screens, tests and limits."
+      "about": "Stack, storage and event-shard decisions, Cloudflare config, deploy and upgrade, data model, ingestion, query semantics, actions, cohorts, SQL, heatmaps, streaming funnels, replay, experiment statistics, surveys, owner API, screens, tests, limits and the cold-tier plan."
     },
     {
       "path": "tasks.md",
@@ -84,7 +84,7 @@
     },
     {
       "path": "research.md",
-      "about": "How the protocol was established with REA (0.1 and 0.2 captures, conformance runs), evidence and obligation ledgers, unknowns, licensing and choices."
+      "about": "How the protocol was established with REA (0.1-0.3 captures and conformance runs), evidence and obligation ledgers, unknowns, licensing and choices."
     }
   ],
   "needs": {
@@ -107,6 +107,11 @@
   "lineage": {},
   "changelog": [
     {
+      "version": "0.3.0",
+      "date": "2026-11-18",
+      "note": "Actions (CSS selector, text, href, URL matchers), static and dynamic cohorts usable as filters in insights, flags, surveys and experiments, click/rage/dead-click/mouse-move heatmaps and scroll depth over the live page or a recording, a read-only SQL editor across shards, posthog-node local evaluation, experience continuity, survey targeting/iterations/partial responses, replay sampling/triggers/network/console/canvas settings with paged playback, and streaming funnels and surveys without row limits. Upgrades a 0.2 instance in place (D1 0003, hourly cron)."
+    },
+    {
       "version": "0.2.0",
       "date": "2026-11-18",
       "note": "Session replay (posthog-js recorder, R2 chunks, rrweb-player), experiments (multivariate flags, Bayesian results), surveys (posthog-js /api/surveys, results) and time-sharded event storage past 10 GB per project with exact counts. Upgrades a 0.1 instance in place."
@@ -127,15 +132,15 @@
       "shots/dashboard.png",
       "shots/trends.png",
       "shots/funnel.png",
-      "shots/retention.png",
-      "shots/replay-list.png",
       "shots/replay-player.png",
-      "shots/person-recordings.png",
       "shots/experiment-results.png",
-      "shots/experiment-new.png",
       "shots/survey-results.png",
-      "shots/survey-edit.png",
-      "shots/experiment-mobile.png"
+      "shots03/heatmap-clicks.png",
+      "shots03/cohort-edit.png",
+      "shots03/sql.png",
+      "shots03/replay-console-network.png",
+      "shots03/action-edit.png",
+      "shots03/survey-targeting.png"
     ]
   }
 }

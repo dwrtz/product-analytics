@@ -74,3 +74,29 @@ code.token { display: inline-block; word-break: break-all; background: var(--bg)
 .replay-link { display: inline-block; margin-right: 6px; font-size: 11px; color: var(--accent); }
 .cols.replay { grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr); } .player { min-height: 200px; } .player .rr-player { box-shadow: none !important; } .player .rr-player__frame { overflow: hidden; }
 [hidden] { display: none !important; }
+
+/* 0.3: SQL, heatmaps, replay devtools, cohorts */
+textarea.sql { width: 100%; font-size: 13px; min-height: 160px; }
+.scroll-x { overflow-x: auto; }
+.sql-result td { white-space: nowrap; max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+.heatmap-stage { overflow: hidden; }
+.heatmap-frame { position: relative; overflow: hidden; }
+.heatmap-inner { position: relative; }
+.heatmap-bg { position: absolute; inset: 0 auto auto 0; border: 0; background: #fff; pointer-events: none; }
+.heatmap-bg.blank { background: repeating-linear-gradient(45deg, #f6f7f9, #f6f7f9 12px, #eef0f3 12px, #eef0f3 24px); }
+.heatmap-bg.rec .replayer-wrapper { transform-origin: 0 0; }
+.heatmap-canvas { position: absolute; inset: 0 auto auto 0; pointer-events: none; }
+input.wide { min-width: 360px; }
+.devtools { margin-top: 12px; }
+.devtools summary { cursor: pointer; font-weight: 600; }
+.devlog { max-height: 260px; overflow: auto; }
+.devlog .url { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.clickable { cursor: pointer; }
+.clickable:hover { background: rgba(0,0,0,.03); }
+.tag.lvl-error { background: #fee2e2; color: #991b1b; }
+.tag.lvl-warn { background: #fef3c7; color: #92400e; }
+.row.criterion { flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0; }
+.node-picker { gap: 6px; }
+.heatmap-bg.rec .replayer-wrapper { position: absolute !important; left: 0 !important; top: 0 !important; transform: none !important; float: none; }
+.heatmap-bg.rec .replayer-mouse, .heatmap-bg.rec .replayer-mouse-tail { display: none !important; }
+.heatmap-bg.rec iframe { border: 0; background: #fff; }

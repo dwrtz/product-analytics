@@ -2,12 +2,14 @@
 import settings from '../../spekkr.inputs.json';
 
 const APP = settings.app_name;
-type Project = { id: number; name: string; api_token: string; timezone: string; retention_days: number; anonymize_ips: boolean; autocapture_opt_out: boolean; session_recording: boolean; created_at: string };
+type Project = { id: number; name: string; api_token: string; timezone: string; retention_days: number; anonymize_ips: boolean; autocapture_opt_out: boolean; session_recording: boolean; replay_config: any; heatmaps: boolean; created_at: string };
 type Me = { id: number; email: string; name: string };
 let me: Me | null = null;
 let projects: Project[] = [];
 let defs: { events: { name: string }[]; properties: { kind: string; name: string; type: string }[]; group_types: { idx: number; name: string }[] } | null = null;
 let defsFor = 0;
+let actionsList: { id: number; name: string; steps: any[] }[] = [];
+let cohortsList: { id: number; name: string; is_static: boolean; count: number | null }[] = [];
 
 // ---------- helpers ----------
 type Child = Node | string | number | null | undefined | false;
@@ -79,8 +81,8 @@ function shell(title: Child | Child[], actions: Child[], ...content: Child[]) {
       h('div', { class: 'brand' }, APP),
       h('div', { class: 'proj' }, picker),
       h('div', { class: 'side-links' },
-        item('/dashboards', 'Dashboards'), item('/insights', 'Insights'), item('/events', 'Events'), item('/persons', 'Persons'),
-        item('/replay', 'Session replay'), item('/feature_flags', 'Feature flags'), item('/experiments', 'Experiments'), item('/surveys', 'Surveys'), item('/settings', 'Settings'),
+        item('/dashboards', 'Dashboards'), item('/insights', 'Insights'), item('/sql', 'SQL'), item('/events', 'Events'), item('/actions', 'Actions'), item('/persons', 'Persons'), item('/cohorts', 'Cohorts'),
+        item('/replay', 'Session replay'), item('/heatmaps', 'Heatmaps'), item('/feature_flags', 'Feature flags'), item('/experiments', 'Experiments'), item('/surveys', 'Surveys'), item('/settings', 'Settings'),
         link('/account', 'Account', here === '/account' ? 'active' : ''))),
     h('main', {}, h('header', { class: 'top' }, h('h1', {}, title), h('div', { class: 'row' }, actions)), ...content)));
 }
@@ -119,32 +121,54 @@ function onboarding() {
 }
 
 // ---------- property filters ----------
-type PF = { key: string; value?: unknown; operator?: string; type?: 'event' | 'person' };
+type PF = { key: string; value?: unknown; operator?: string; type?: 'event' | 'person' | 'cohort' };
 const OPS: [string, string][] = [['exact', '='], ['is_not', '≠'], ['icontains', 'contains'], ['not_icontains', "doesn't contain"], ['gt', '>'], ['lt', '<'], ['is_set', 'is set'], ['is_not_set', 'is not set']];
 function propOptions(kind: 'event' | 'person') {
   const names = (defs?.properties ?? []).filter(p => p.kind === kind).map(p => p.name);
   return h('datalist', { id: `props-${kind}` }, names.map(n => h('option', { value: n })));
 }
-function filterEditor(list: PF[], onChange: () => void): HTMLElement {
+function filterEditor(list: PF[], onChange: () => void, kinds: ('event' | 'person' | 'cohort')[] = ['event', 'person', 'cohort'], fixed = false): HTMLElement {
   const box = h('div', { class: 'filters' });
   const draw = () => {
     box.replaceChildren(...list.map((f, i) => {
-      const type = h('select', { 'aria-label': 'Property type', onchange: (e: Event) => { f.type = (e.target as HTMLSelectElement).value as any; draw(); onChange(); } },
-        h('option', { value: 'event', selected: f.type !== 'person' }, 'Event'), h('option', { value: 'person', selected: f.type === 'person' }, 'Person'));
+      const type = h('select', { 'aria-label': 'Property type', onchange: (e: Event) => {
+        const t = (e.target as HTMLSelectElement).value as any; f.type = t;
+        if (t === 'cohort') { f.key = 'id'; f.operator = 'in'; f.value = cohortsList[0]?.id; } else if (f.key === 'id') { f.key = ''; f.operator = 'exact'; f.value = []; }
+        draw(); onChange(); } },
+        kinds.map(k => h('option', { value: k, selected: (f.type ?? 'event') === k }, k === 'event' ? 'Event' : k === 'person' ? 'Person' : 'Cohort')));
+      if (f.type === 'cohort') return h('div', { class: 'filter' }, type,
+        h('select', { 'aria-label': 'Cohort membership', onchange: (e: Event) => { f.operator = (e.target as HTMLSelectElement).value; onChange(); } }, opt('in', 'in', f.operator ?? 'in'), opt('not_in', 'not in', f.operator)),
+        h('select', { 'aria-label': 'Cohort', onchange: (e: Event) => { f.value = Number((e.target as HTMLSelectElement).value); onChange(); } }, cohortsList.length ? cohortsList.map(c => h('option', { value: c.id, selected: Number(f.value) === c.id }, c.name)) : h('option', { value: '' }, 'No cohorts yet')),
+        h('button', { class: 'link', type: 'button', 'aria-label': 'Remove filter', onclick: () => { list.splice(i, 1); draw(); onChange(); } }, '✕'));
       const key = h('input', { value: f.key, placeholder: 'property', list: `props-${f.type === 'person' ? 'person' : 'event'}`, 'aria-label': 'Property', onchange: (e: Event) => { f.key = (e.target as HTMLInputElement).value.trim(); onChange(); } });
       const op = h('select', { 'aria-label': 'Operator', onchange: (e: Event) => { f.operator = (e.target as HTMLSelectElement).value; draw(); onChange(); } }, OPS.map(([v, l]) => h('option', { value: v, selected: (f.operator ?? 'exact') === v }, l)));
       const needsValue = !['is_set', 'is_not_set'].includes(f.operator ?? 'exact');
       const val = needsValue ? h('input', { value: Array.isArray(f.value) ? f.value.join(', ') : (f.value ?? ''), placeholder: 'value', 'aria-label': 'Value', onchange: (e: Event) => {
         const v = (e.target as HTMLInputElement).value; f.value = ['exact', 'is_not'].includes(f.operator ?? 'exact') ? v.split(',').map(x => x.trim()).filter(Boolean) : v; onChange();
       } }) : null;
-      return h('div', { class: 'filter' }, type, key, op, val, h('button', { class: 'link', type: 'button', 'aria-label': 'Remove filter', onclick: () => { list.splice(i, 1); draw(); onChange(); } }, '✕'));
-    }), h('button', { class: 'link', type: 'button', onclick: () => { list.push({ key: '', operator: 'exact', type: 'event', value: [] }); draw(); } }, '+ Add filter'));
+      return h('div', { class: 'filter' }, fixed ? null : type, key, op, val, fixed ? null : h('button', { class: 'link', type: 'button', 'aria-label': 'Remove filter', onclick: () => { list.splice(i, 1); draw(); onChange(); } }, '✕'));
+    }), fixed ? '' : h('button', { class: 'link', type: 'button', onclick: () => { list.push({ key: '', operator: 'exact', type: kinds[0], value: [] }); draw(); } }, '+ Add filter'));
   };
   draw(); return box;
 }
-async function ensureDefs() {
-  if (defs && defsFor === pid) return;
-  defs = await api(P('/definitions').replace('/project/', '/api/projects/')); defsFor = pid;
+async function ensureDefs(force = false) {
+  if (defs && defsFor === pid && !force) return;
+  [defs, actionsList, cohortsList] = await Promise.all([api(P('/definitions').replace('/project/', '/api/projects/')), api<any[]>(`/api/projects/${pid}/actions`), api<any[]>(`/api/projects/${pid}/cohorts`)]); defsFor = pid;
+}
+/** Series/step picker: an event or a saved action (ActionsNode). */
+function nodePicker(n: any, onChange: () => void, allowAll: boolean): HTMLElement {
+  const wrap = h('span', { class: 'row node-picker' });
+  const draw = () => {
+    const isAction = n.kind === 'ActionsNode';
+    const kind = h('select', { 'aria-label': 'Event or action', onchange: (e: Event) => {
+      if ((e.target as HTMLSelectElement).value === 'action') { n.kind = 'ActionsNode'; n.id = actionsList[0]?.id; delete n.event; } else { n.kind = 'EventsNode'; delete n.id; n.event = allowAll ? null : '$pageview'; }
+      draw(); onChange(); } }, opt('event', 'Event', isAction ? '' : 'event'), opt('action', 'Action', isAction ? 'action' : ''));
+    const pick = isAction ? h('select', { 'aria-label': 'Action', onchange: (e: Event) => { n.id = Number((e.target as HTMLSelectElement).value); onChange(); } },
+      actionsList.length ? actionsList.map(a => h('option', { value: a.id, selected: n.id === a.id }, a.name)) : h('option', { value: '' }, 'No actions yet'))
+      : eventInput(n.event ?? null, v => { n.event = v; onChange(); }, allowAll);
+    wrap.replaceChildren(kind, pick);
+  };
+  draw(); return wrap;
 }
 const apiP = (p: string) => `/api/projects/${pid}${p}`;
 function eventInput(value: string | null, onChange: (v: string | null) => void, allowAll = true) {
@@ -154,11 +178,11 @@ function eventInput(value: string | null, onChange: (v: string | null) => void, 
 const eventList = () => h('datalist', { id: 'event-names' }, (defs?.events ?? []).map(e => h('option', { value: e.name }, eventLabel(e.name))));
 
 // ---------- charts ----------
-type Series = { action?: { id: string | null; custom_name: string | null; math: string; math_property?: string }; breakdown_label?: string; label: string; data: number[]; labels: string[]; count: number; aggregated_value?: number; breakdown_value?: unknown; compare_label?: string };
+type Series = { action?: { id: string | number | null; type?: string; name?: string; custom_name: string | null; math: string; math_property?: string }; breakdown_label?: string; label: string; data: number[]; labels: string[]; count: number; aggregated_value?: number; breakdown_value?: unknown; compare_label?: string };
 const MATH_SUFFIX: Record<string, string> = { dau: 'unique persons', unique_session: 'unique sessions', unique_group: 'unique groups', sum: 'sum', avg: 'average', min: 'min', max: 'max', median: 'median', p75: 'p75', p90: 'p90', p95: 'p95', p99: 'p99' };
 function seriesName(sr: Series) {
   if (!sr.action) return sr.label;
-  const base = sr.action.custom_name || eventLabel(sr.action.id);
+  const base = sr.action.custom_name || (sr.action.type === 'actions' ? sr.action.name ?? 'Action' : eventLabel(sr.action.id as string | null));
   const m = MATH_SUFFIX[sr.action.math]; const mp = sr.action.math_property ? ` of ${sr.action.math_property}` : '';
   return `${base}${m ? ` · ${m}${mp}` : ''}${sr.breakdown_label !== undefined ? ` · ${sr.breakdown_label}` : ''}`;
 }
@@ -316,7 +340,7 @@ async function insightPage(shortId: string | null) {
     const parts: Child[] = [];
     const seriesBox = (title: string, nodes: any[], withMath: boolean, min: number) => h('div', { class: 'series' }, h('h3', {}, title), nodes.map((n, i) => h('div', { class: 'serie' },
       h('span', { class: 'swatch num', style: `background:${color(q.kind === 'FunnelsQuery' ? 0 : i)}` }, String(i + 1)),
-      eventInput(n.event ?? null, v => { n.event = v; refresh(); }, q.kind === 'TrendsQuery'),
+      nodePicker(n, refresh, q.kind === 'TrendsQuery'),
       withMath ? h('select', { 'aria-label': 'Measure', onchange: (e: Event) => { n.math = (e.target as HTMLSelectElement).value; drawEditor(); refresh(); } }, MATH.map(([v, l]) => opt(v, l, n.math ?? 'total'))) : null,
       withMath && ['sum', 'avg', 'min', 'max', 'median', 'p90'].includes(n.math) ? h('input', { value: n.math_property ?? '', placeholder: 'numeric property', list: 'props-event', 'aria-label': 'Math property', onchange: (e: Event) => { n.math_property = (e.target as HTMLInputElement).value.trim(); refresh(); } }) : null,
       nodes.length > min ? h('button', { class: 'link', type: 'button', 'aria-label': 'Remove', onclick: () => { nodes.splice(i, 1); drawEditor(); refresh(); } }, '✕') : null)),
@@ -456,12 +480,13 @@ async function flagPage(id: number | null) {
   const key = h('input', { value: f.key, required: true, pattern: '[A-Za-z0-9_\\-]+', placeholder: 'new-checkout' }) as HTMLInputElement;
   const name = h('input', { value: f.name, placeholder: 'What it controls' }) as HTMLInputElement;
   const active = h('input', { type: 'checkbox', checked: f.active }) as HTMLInputElement;
+  const cont = h('input', { type: 'checkbox', checked: !!f.ensure_experience_continuity }) as HTMLInputElement;
   const groupsBox = h('div', {}); const variantsBox = h('div', {});
   const drawGroups = () => groupsBox.replaceChildren(...filters.groups.map((g: any, i: number) => {
     g.properties ??= [];
     return h('div', { class: 'card inner' }, h('div', { class: 'row' }, h('b', {}, `Condition set ${i + 1}`), h('button', { class: 'link', type: 'button', onclick: () => { filters.groups.splice(i, 1); drawGroups(); } }, 'Remove')),
       h('p', { class: 'muted small' }, 'Match persons where all of these are true (no filters matches everyone):'),
-      filterEditor(g.properties.map((p: PF) => { p.type ??= 'person'; return p; }) && g.properties, () => {}),
+      filterEditor(g.properties.map((p: PF) => { p.type ??= 'person'; return p; }) && g.properties, () => {}, ['person', 'cohort']),
       h('label', {}, 'Roll out to ', h('div', { class: 'row' }, h('input', { type: 'number', min: 0, max: 100, value: g.rollout_percentage ?? 100, class: 'narrow', onchange: (e: Event) => { g.rollout_percentage = Number((e.target as HTMLInputElement).value); } }), h('span', {}, '% of matching persons'))));
   }), h('button', { type: 'button', onclick: () => { filters.groups.push({ properties: [], rollout_percentage: 100 }); drawGroups(); } }, '+ Add condition set'));
   const drawVariants = () => {
@@ -478,12 +503,13 @@ async function flagPage(id: number | null) {
   drawGroups(); drawVariants();
   const err = errBox(); const btn = h('button', { class: 'primary', type: 'submit' }, id ? 'Save flag' : 'Create flag') as HTMLButtonElement;
   const form = h('form', {}, propOptions('person'),
-    h('div', { class: 'card' }, h('label', {}, 'Key', key, h('span', { class: 'muted small' }, 'Your code calls posthog.isFeatureEnabled(key).')), h('label', {}, 'Description', name), h('label', { class: 'switch' }, active, 'Enabled')),
+    h('div', { class: 'card' }, h('label', {}, 'Key', key, h('span', { class: 'muted small' }, 'Your code calls posthog.isFeatureEnabled(key).')), h('label', {}, 'Description', name), h('label', { class: 'switch' }, active, 'Enabled'),
+      h('label', { class: 'switch' }, cont, 'Persist the flag value across authentication steps (experience continuity)')),
     h('div', { class: 'card' }, h('h2', {}, 'Release conditions'), groupsBox),
     h('div', { class: 'card' }, h('h2', {}, 'Variants and payloads'), variantsBox), err, btn);
   form.addEventListener('submit', busy(btn, async () => {
     for (const g of filters.groups) g.properties = (g.properties ?? []).filter((p: PF) => p.key);
-    const body = { key: key.value.trim(), name: name.value.trim(), active: active.checked, filters };
+    const body = { key: key.value.trim(), name: name.value.trim(), active: active.checked, ensure_experience_continuity: cont.checked, filters };
     if (id) await api(apiP(`/feature_flags/${id}`), { method: 'PATCH', body }); else await api(apiP('/feature_flags'), { body });
     nav(P('/feature_flags'));
   }, err));
@@ -505,12 +531,14 @@ async function settingsPage() {
   const anon = h('input', { type: 'checkbox', checked: p.anonymize_ips }) as HTMLInputElement;
   const ac = h('input', { type: 'checkbox', checked: p.autocapture_opt_out }) as HTMLInputElement;
   const rec = h('input', { type: 'checkbox', checked: p.session_recording }) as HTMLInputElement;
+  const hm = h('input', { type: 'checkbox', checked: p.heatmaps }) as HTMLInputElement;
   const err = errBox(); const btn = h('button', { class: 'primary', type: 'submit' }, 'Save settings') as HTMLButtonElement;
   const form = h('form', { class: 'card' }, h('h2', {}, 'Project'), h('label', {}, 'Name', name), h('label', {}, 'Time zone', tz),
     h('label', {}, 'Keep events for (days, 0 = forever)', ret), h('label', { class: 'switch' }, anon, 'Discard client IP addresses'), h('label', { class: 'switch' }, ac, 'Turn off autocapture for all clients'),
-    h('label', { class: 'switch' }, rec, 'Record sessions (session replay; inputs are masked by posthog-js)'), err, btn);
+    h('label', { class: 'switch' }, rec, 'Record sessions (session replay; inputs are masked by posthog-js)'),
+    h('label', { class: 'switch' }, hm, 'Collect heatmaps (clicks, rage clicks, dead clicks, mouse moves and scroll depth)'), err, btn);
   form.addEventListener('submit', busy(btn, async () => {
-    const r = await api<Project>(apiP(''), { method: 'PATCH', body: { name: name.value, timezone: tz.value, retention_days: Number(ret.value), anonymize_ips: anon.checked, autocapture_opt_out: ac.checked, session_recording: rec.checked } });
+    const r = await api<Project>(apiP(''), { method: 'PATCH', body: { name: name.value, timezone: tz.value, retention_days: Number(ret.value), anonymize_ips: anon.checked, autocapture_opt_out: ac.checked, session_recording: rec.checked, heatmaps: hm.checked } });
     projects = projects.map(x => x.id === r.id ? r : x); btn.textContent = 'Saved'; setTimeout(() => settingsPage(), 800);
   }, err));
   shell('Settings', [],
@@ -519,7 +547,7 @@ async function settingsPage() {
       h('h3', {}, 'Project API key'), h('div', { class: 'row' }, h('code', { class: 'token' }, p.api_token), copy(p.api_token)),
       h('p', { class: 'muted small' }, 'This key is public: it can only send events and read flags.'),
       stats ? h('p', { class: 'small' }, h('b', {}, fmt(stats.events)), ' events · ', h('b', {}, fmt(stats.persons)), ' persons · last event ', ago(stats.last_event_at), ` · ${(stats.database_bytes / 1048576).toFixed(1)} MB stored`) : null),
-    form,
+    form, replaySettings(p),
     h('section', { class: 'card' }, h('h2', {}, 'Other projects'), h('ul', {}, projects.map(x => h('li', {}, link(`/project/${x.id}/settings`, x.name)))), newProjectForm(np => nav(`/project/${np.id}/settings`))),
     h('section', { class: 'card danger-zone' }, h('h2', {}, 'Danger zone'),
       h('div', { class: 'row' }, h('button', { onclick: async () => { if (!confirm('Reset the project API key? Sites using the old key stop sending events.')) return; const r = await api<Project>(apiP('/reset_token'), { body: {} }); projects = projects.map(x => x.id === r.id ? r : x); settingsPage(); } }, 'Reset project API key'),
@@ -593,11 +621,40 @@ async function replayPage(sid: string) {
     evBox.replaceChildren(ev.results.length ? h('ul', { class: 'timeline' }, [...ev.results].reverse().map((e: any) => h('li', {}, h('span', { class: 'muted small mono' }, secs(Math.max(0, Math.round((new Date(e.timestamp).getTime() - start) / 1000)))), ' ', h('b', {}, eventLabel(e.event)),
       e.properties.$pathname ? h('span', { class: 'muted small' }, ` ${e.properties.$pathname}`) : null))) : h('p', { class: 'muted' }, 'No events.'));
   }).catch(() => evBox.replaceChildren());
-  const [{ snapshots }, mod] = await Promise.all([api<any>(apiP(`/session_recordings/${encodeURIComponent(sid)}/snapshots`)), loadPlayer()]);
+  // Snapshots arrive in pages (about 16 MB each); later pages are appended to the running player.
+  const page = (cursor: string | null) => api<any>(apiP(`/session_recordings/${encodeURIComponent(sid)}/snapshots?paged=1${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`));
+  const [first, mod] = await Promise.all([page(null), loadPlayer()]);
+  const snapshots: any[] = first.snapshots;
   if (!snapshots.length || !snapshots.some((e: any) => e.type === 2)) { stage.replaceChildren(h('p', { class: 'muted empty' }, 'This recording has no full snapshot yet, so it cannot be played.')); return; }
   stage.replaceChildren();
   const width = Math.max(320, stage.clientWidth - 4);
-  new mod.default({ target: stage, props: { events: snapshots, width, height: Math.round(width * 0.6), autoPlay: false, showController: true, skipInactive: true } });
+  const hasCanvas = (evs: any[]) => evs.some(e => e.type === 3 && e.data?.source === 9);
+  const player = new mod.default({ target: stage, props: { events: snapshots, width, height: Math.round(width * 0.6), autoPlay: false, showController: true, skipInactive: true, UNSAFE_replayCanvas: hasCanvas(snapshots) } });
+  const t0 = snapshots[0].timestamp;
+  const consoleBox = h('div', { class: 'devlog' }), netBox = h('div', { class: 'devlog' });
+  const logs: any[] = [], reqs: any[] = [];
+  const collect = (evs: any[]) => {
+    for (const e of evs) {
+      if (e.type !== 6) continue;
+      if (e.data?.plugin === 'rrweb/console@1') logs.push({ t: e.timestamp, level: e.data.payload?.level ?? 'log', text: (e.data.payload?.payload ?? []).map((x: string) => { try { const v = JSON.parse(x); return typeof v === 'string' ? v : JSON.stringify(v); } catch { return x; } }).join(' ') });
+      if (e.data?.plugin === 'rrweb/network@1') for (const r of e.data.payload?.requests ?? []) reqs.push({ t: r.timestamp ?? e.timestamp, method: r.method ?? 'GET', status: r.status ?? r.responseStatus ?? '', url: r.name ?? r.url ?? '', ms: r.duration != null ? Math.round(r.duration) : null, type: r.initiatorType ?? '', size: r.transferSize ?? r.encodedBodySize ?? null });
+    }
+  };
+  const jump = (t: number) => { try { player.goto(Math.max(0, t - t0)); } catch { /* not ready */ } };
+  const drawPanels = () => {
+    consoleBox.replaceChildren(logs.length ? h('ul', { class: 'timeline' }, logs.slice(0, 1000).map(l => h('li', { class: `log-${l.level} clickable`, onclick: () => jump(l.t) }, h('span', { class: 'muted small mono' }, secs(Math.max(0, Math.round((l.t - t0) / 1000)))), ' ', h('span', { class: `tag lvl-${l.level}` }, l.level), ' ', h('span', { class: 'mono small' }, l.text.slice(0, 500))))) : h('p', { class: 'muted' }, 'No console logs captured.'));
+    netBox.replaceChildren(reqs.length ? h('table', { class: 'small' }, h('thead', {}, h('tr', {}, h('th', {}, 'At'), h('th', {}, 'Method'), h('th', {}, 'Status'), h('th', {}, 'URL'), h('th', {}, 'Time'))),
+      h('tbody', {}, reqs.slice(0, 1000).map(r => h('tr', { class: 'clickable', onclick: () => jump(r.t) }, h('td', { class: 'mono muted' }, secs(Math.max(0, Math.round((r.t - t0) / 1000)))), h('td', {}, r.method), h('td', { class: Number(r.status) >= 400 ? 'danger' : '' }, String(r.status)), h('td', { class: 'url mono' }, String(r.url).slice(0, 200)), h('td', { class: 'num' }, r.ms === null ? '–' : `${r.ms} ms`)))))
+      : h('p', { class: 'muted' }, 'No network requests captured. Turn on network capture in Settings → Session replay.'));
+  };
+  collect(snapshots); drawPanels();
+  stage.after(h('details', { class: 'devtools', open: true }, h('summary', {}, 'Console'), consoleBox), h('details', { class: 'devtools' }, h('summary', {}, 'Network'), netBox));
+  let cursor: string | null = first.next;
+  while (cursor) {
+    const nx = await page(cursor);
+    for (const e of nx.snapshots) player.addEvent(e);
+    collect(nx.snapshots); drawPanels(); cursor = nx.next;
+  }
 }
 
 // ---------- experiments ----------
@@ -618,11 +675,11 @@ function metricEditor(metrics: any[]): HTMLElement {
       opt('funnel', 'Conversion (funnel)', m.kind), opt('count', 'Event count per person', m.kind), opt('continuous', 'Sum of a property per person', m.kind));
     const body: HTMLElement[] = [];
     if (m.kind === 'funnel') {
-      m.series.forEach((s: any, k: number) => body.push(h('div', { class: 'serie' }, h('span', { class: 'swatch num', style: `background:${color(k)}` }, String(k + 1)), eventInput(s.event, v => { s.event = v; }, false),
+      m.series.forEach((s: any, k: number) => body.push(h('div', { class: 'serie' }, h('span', { class: 'swatch num', style: `background:${color(k)}` }, String(k + 1)), nodePicker(s, () => {}, false),
         m.series.length > 1 ? h('button', { class: 'link', type: 'button', onclick: () => { m.series.splice(k, 1); draw(); } }, '✕') : null)));
       body.push(h('button', { class: 'link', type: 'button', onclick: () => { m.series.push({ event: null }); draw(); } }, '+ Add step'));
     } else {
-      body.push(h('div', { class: 'serie' }, eventInput(m.event.event, v => { m.event.event = v; }, true)));
+      body.push(h('div', { class: 'serie' }, nodePicker(m.event, () => {}, true)));
       if (m.kind === 'continuous') body.push(h('label', {}, 'Property', h('input', { value: m.math_property, list: 'props-event', onchange: (e: Event) => { m.math_property = (e.target as HTMLInputElement).value.trim(); } })));
     }
     return h('div', { class: 'card inner editor' }, h('div', { class: 'row' }, h('b', {}, `Metric ${i + 1}`), kind, h('button', { class: 'link', type: 'button', onclick: () => { metrics.splice(i, 1); draw(); } }, 'Remove')), ...body);
@@ -708,8 +765,24 @@ async function surveyEditPage(id: string | null) {
   const sv: any = id ? await api(apiP(`/surveys/${id}`)) : { name: '', type: 'popover', questions: [{ type: 'rating', question: 'How likely are you to recommend us to a friend?', display: 'number', scale: 10, lowerBoundLabel: 'Unlikely', upperBoundLabel: 'Very likely' }], conditions: null };
   const name = h('input', { value: sv.name, placeholder: 'e.g. NPS' }) as HTMLInputElement;
   const type = h('select', {}, opt('popover', 'Popover (posthog-js shows it)', sv.type), opt('api', 'API (your code renders it)', sv.type)) as HTMLSelectElement;
-  const url = h('input', { value: sv.conditions?.url ?? '', placeholder: 'Only on URLs containing… (optional)' }) as HTMLInputElement;
-  const trigger = h('input', { value: sv.conditions?.events?.values?.[0]?.name ?? '', placeholder: 'Show after this event (optional)', list: 'event-names' }) as HTMLInputElement;
+  const c0 = sv.conditions ?? {};
+  const url = h('input', { value: c0.url ?? '', placeholder: 'e.g. /pricing (optional)' }) as HTMLInputElement;
+  const urlMatch = h('select', { 'aria-label': 'URL match' }, [['icontains', 'contains'], ['exact', 'equals'], ['not_icontains', "doesn't contain"], ['is_not', "isn't"], ['regex', 'matches regex'], ['not_regex', "doesn't match regex"]].map(([v, l]) => opt(v, l, c0.urlMatchType ?? 'icontains'))) as HTMLSelectElement;
+  const selector = h('input', { value: c0.selector ?? '', placeholder: 'Only when this CSS selector exists, e.g. #checkout (optional)' }) as HTMLInputElement;
+  const devices = ['Desktop', 'Mobile', 'Tablet'].map(d => [d, h('input', { type: 'checkbox', checked: (c0.deviceTypes ?? []).includes(d) }) as HTMLInputElement] as const);
+  const wait = h('input', { type: 'number', min: 0, value: c0.seenSurveyWaitPeriodInDays ?? '', class: 'narrow', placeholder: 'days' }) as HTMLInputElement;
+  const trigger = h('input', { value: c0.events?.values?.map((v: any) => v.name).join(', ') ?? '', placeholder: 'Show after these events, comma separated (optional)', list: 'event-names' }) as HTMLInputElement;
+  const repeated = h('input', { type: 'checkbox', checked: !!c0.events?.repeatedActivation }) as HTMLInputElement;
+  const cancel = h('input', { value: c0.cancelEvents?.values?.map((v: any) => v.name).join(', ') ?? '', placeholder: 'Cancel a pending trigger on these events (optional)' }) as HTMLInputElement;
+  const actionTrig = h('select', { 'aria-label': 'Action trigger' }, h('option', { value: '' }, 'No action trigger'), actionsList.map(a => h('option', { value: a.id, selected: c0.actions?.values?.[0]?.id === a.id }, a.name))) as HTMLSelectElement;
+  const linked = h('input', { value: sv.linked_flag_key ?? '', placeholder: 'Only for persons with this flag (optional)' }) as HTMLInputElement;
+  const linkedVariant = h('input', { value: c0.linkedFlagVariant ?? '', placeholder: 'variant (optional)' }) as HTMLInputElement;
+  const targeting: PF[] = structuredClone(sv.targeting_flag_filters?.groups?.[0]?.properties ?? []);
+  const rollout = h('input', { type: 'number', min: 0, max: 100, value: sv.targeting_flag_filters?.groups?.[0]?.rollout_percentage ?? 100, class: 'narrow' }) as HTMLInputElement;
+  const iterCount = h('input', { type: 'number', min: 1, value: sv.iteration_count ?? '', class: 'narrow', placeholder: 'times' }) as HTMLInputElement;
+  const iterDays = h('input', { type: 'number', min: 1, value: sv.iteration_frequency_days ?? '', class: 'narrow', placeholder: 'days' }) as HTMLInputElement;
+  const partial = h('input', { type: 'checkbox', checked: !!sv.enable_partial_responses }) as HTMLInputElement;
+  const schedule = h('select', { 'aria-label': 'Schedule' }, opt('once', 'Once per person', sv.schedule ?? 'once'), opt('always', 'Every time conditions match', sv.schedule)) as HTMLSelectElement;
   const qs: any[] = sv.questions; const qbox = h('div', {});
   const drawQ = () => qbox.replaceChildren(...qs.map((q, i) => {
     const extra: HTMLElement[] = [];
@@ -725,20 +798,43 @@ async function surveyEditPage(id: string | null) {
   }), h('button', { type: 'button', onclick: () => { qs.push({ type: 'open', question: '' }); drawQ(); } }, '+ Add question'));
   drawQ();
   const err = errBox(); const btn = h('button', { class: 'primary', type: 'submit' }, id ? 'Save survey' : 'Create survey') as HTMLButtonElement;
-  const form = h('form', {}, eventList(), h('div', { class: 'card' }, h('label', {}, 'Name', name), h('label', {}, 'Type', type)),
+  const names = (v: string) => v.split(',').map(x => x.trim()).filter(Boolean).map(name => ({ name }));
+  const form = h('form', {}, eventList(), propOptions('person'), h('div', { class: 'card' }, h('label', {}, 'Name', name), h('label', {}, 'Type', type),
+      h('label', { class: 'switch' }, partial, 'Save partial responses (each answered question is kept, even if the survey is not finished)')),
     h('div', { class: 'card' }, h('h2', {}, 'Questions'), qbox),
-    h('div', { class: 'card' }, h('h2', {}, 'Display conditions'), h('label', {}, 'URL contains', url), h('label', {}, 'Triggering event', trigger)), err, btn);
+    h('div', { class: 'card' }, h('h2', {}, 'Who sees it'), h('p', { class: 'muted small' }, 'Persons matching all of these (person properties or cohorts). No filters means everyone.'),
+      filterEditor(targeting, () => {}, ['person', 'cohort']), h('label', {}, 'Show to', h('div', { class: 'row' }, rollout, h('span', {}, '% of matching persons'))),
+      h('label', {}, 'Linked feature flag', h('div', { class: 'row' }, linked, linkedVariant))),
+    h('div', { class: 'card' }, h('h2', {}, 'Display conditions'),
+      h('label', {}, 'URL', h('div', { class: 'row' }, urlMatch, url)), h('label', {}, 'CSS selector', selector),
+      h('div', { class: 'row' }, h('span', {}, 'Devices: '), ...devices.map(([d, cb]) => h('label', { class: 'switch' }, cb, d)), h('span', { class: 'muted small' }, '(none = all)')),
+      h('label', {}, 'Wait period', h('div', { class: 'row' }, wait, h('span', { class: 'muted small' }, 'days since the person last saw any survey'))),
+      h('label', {}, 'Triggering events', trigger), h('label', { class: 'switch' }, repeated, 'Show again every time a triggering event happens'),
+      h('label', {}, 'Cancel events', cancel), h('label', {}, 'Triggering action', actionTrig)),
+    h('div', { class: 'card' }, h('h2', {}, 'Schedule'), h('label', {}, 'Show', schedule),
+      h('label', {}, 'Repeat', h('div', { class: 'row' }, iterCount, h('span', {}, 'times, every'), iterDays, h('span', {}, 'days (optional; each iteration asks again)')))), err, btn);
   form.addEventListener('submit', busy(btn, async () => {
-    const conditions: any = {}; if (url.value.trim()) { conditions.url = url.value.trim(); conditions.urlMatchType = 'icontains'; } if (trigger.value.trim()) conditions.events = { repeatedActivation: false, values: [{ name: trigger.value.trim() }] };
-    const body = { name: name.value, type: type.value, questions: qs, conditions: Object.keys(conditions).length ? conditions : null };
+    const conditions: any = {};
+    if (url.value.trim()) { conditions.url = url.value.trim(); conditions.urlMatchType = urlMatch.value; }
+    if (selector.value.trim()) conditions.selector = selector.value.trim();
+    const dt = devices.filter(([, cb]) => cb.checked).map(([d]) => d); if (dt.length) { conditions.deviceTypes = dt; conditions.deviceTypesMatchType = 'exact'; }
+    if (wait.value !== '') conditions.seenSurveyWaitPeriodInDays = Number(wait.value);
+    if (names(trigger.value).length) conditions.events = { repeatedActivation: repeated.checked, values: names(trigger.value) };
+    if (names(cancel.value).length) conditions.cancelEvents = { values: names(cancel.value) };
+    if (actionTrig.value) conditions.actions = { values: [{ id: Number(actionTrig.value) }] };
+    if (linkedVariant.value.trim()) conditions.linkedFlagVariant = linkedVariant.value.trim();
+    const props = targeting.filter(f => f.key || f.type === 'cohort');
+    const tff = props.length || Number(rollout.value) < 100 ? { groups: [{ properties: props, rollout_percentage: Number(rollout.value) }] } : null;
+    const body = { name: name.value, type: type.value, questions: qs, conditions: Object.keys(conditions).length ? conditions : null, targeting_flag_filters: tff,
+      linked_flag_key: linked.value.trim() || null, enable_partial_responses: partial.checked, iteration_count: iterCount.value || null, iteration_frequency_days: iterDays.value || null, schedule: schedule.value };
     const r = id ? await api<any>(apiP(`/surveys/${id}`), { method: 'PATCH', body }) : await api<any>(apiP('/surveys'), { body });
     nav(P(`/surveys/${r.id}`));
   }, err));
   shell(id ? `Edit ${sv.name}` : 'New survey', [], form);
 }
-async function surveyPage(id: string) {
+async function surveyPage(id: string, iteration: number | null = null) {
   shell('Survey', [], loading());
-  const [sv, r] = await Promise.all([api<any>(apiP(`/surveys/${id}`)), api<any>(apiP(`/surveys/${id}/results`))]);
+  const [sv, r] = await Promise.all([api<any>(apiP(`/surveys/${id}`)), api<any>(apiP(`/surveys/${id}/results${iteration ? `?iteration=${iteration}` : ''}`))]);
   const act = (action: string, label: string, cls = '') => h('button', { class: cls, onclick: async () => { await api(apiP(`/surveys/${id}`), { method: 'PATCH', body: { action } }); surveyPage(id); } }, label);
   const actions: Child[] = [link(P(`/surveys/${id}/edit`), 'Edit', 'button')];
   if (sv.status === 'draft') actions.push(act('launch', 'Launch', 'primary'));
@@ -761,9 +857,322 @@ async function surveyPage(id: string) {
       h('div', {}, h('div', { class: 'big' }, fmt(r.shown.persons)), h('div', { class: 'muted' }, 'Shown (persons)')),
       h('div', {}, h('div', { class: 'big' }, fmt(r.sent.responses)), h('div', { class: 'muted' }, 'Responses')),
       h('div', {}, h('div', { class: 'big' }, fmt(r.dismissed.persons)), h('div', { class: 'muted' }, 'Dismissed')),
-      h('div', {}, h('div', { class: 'big' }, r.response_rate === null ? '–' : pct(r.response_rate, 0)), h('div', { class: 'muted' }, 'Response rate')))),
+      h('div', {}, h('div', { class: 'big' }, r.response_rate === null ? '–' : pct(r.response_rate, 0)), h('div', { class: 'muted' }, 'Response rate'))),
+      h('p', { class: 'small' }, h('b', {}, fmt(r.sent.completed)), ' completed · ', h('b', {}, fmt(r.sent.partial)), ' partial · ', h('b', {}, fmt(r.abandoned?.persons ?? 0)), ' abandoned',
+        sv.iteration_count ? h('span', {}, ` · iteration ${sv.current_iteration ?? '–'} of ${sv.iteration_count} `,
+          h('select', { 'aria-label': 'Iteration', onchange: (e: Event) => { const v = (e.target as HTMLSelectElement).value; surveyPage(id, v ? Number(v) : null); } },
+            h('option', { value: '' }, 'All iterations'), Array.from({ length: sv.iteration_count }, (_, k) => h('option', { value: k + 1, selected: iteration === k + 1 }, `Iteration ${k + 1}${r.iterations?.find((x: any) => x.iteration === k + 1) ? ` (${r.iterations.find((x: any) => x.iteration === k + 1).responses})` : ''}`)))) : null)),
     ...r.questions.map(qcard),
     h('p', { class: 'muted small' }, sv.status === 'running' ? 'posthog-js loads this survey from /api/surveys and shows it to matching visitors.' : 'Launch to show this survey to visitors.'));
+}
+
+// ---------- actions ----------
+const MATCHING: [string, string][] = [['exact', 'equals'], ['contains', 'contains'], ['regex', 'matches regex']];
+const stepSummary = (st: any) => [st.event ? eventLabel(st.event) : 'Any event', st.selector ? `matching ${st.selector}` : '', st.text ? `with text “${st.text}”` : '', st.href ? `link ${st.href}` : '', st.url ? `on ${st.url}` : '', (st.properties ?? []).length ? `${st.properties.length} filter(s)` : ''].filter(Boolean).join(' ');
+async function actionsPage() {
+  shell('Actions', [], loading());
+  const list = await api<any[]>(apiP('/actions'));
+  shell('Actions', [link(P('/actions/new'), 'New action', 'button primary')],
+    h('p', { class: 'muted small' }, 'An action names one or more event patterns, such as clicks on a button found by CSS selector, text or link, or page views of a URL. Use actions in insights, cohorts, experiments and surveys.'),
+    list.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Matches'), h('th', {}, 'Updated'))),
+      h('tbody', {}, list.map(a => h('tr', {}, h('td', {}, link(P(`/actions/${a.id}`), a.name)), h('td', { class: 'muted small' }, a.steps.map(stepSummary).join(' · or ')), h('td', { class: 'muted' }, when(a.updated_at))))))
+      : h('p', { class: 'muted empty' }, 'No actions yet.'));
+}
+async function actionPage(id: number | null) {
+  shell('Action', [], loading());
+  await ensureDefs();
+  const a: any = id ? await api(apiP(`/actions/${id}`)) : { name: '', description: '', steps: [{ event: '$autocapture', selector: '', text: '', url: '', url_matching: 'contains' }] };
+  const name = h('input', { value: a.name, placeholder: 'e.g. Clicked sign-up button', required: true }) as HTMLInputElement;
+  const desc = h('input', { value: a.description ?? '', placeholder: 'Optional' }) as HTMLInputElement;
+  const steps: any[] = a.steps; const box = h('div', {});
+  const field = (st: any, k: string, label: string, ph: string, matchKey?: string) => h('label', {}, label, h('div', { class: 'row' },
+    matchKey ? h('select', { 'aria-label': `${label} matching`, onchange: (e: Event) => { st[matchKey] = (e.target as HTMLSelectElement).value; } }, MATCHING.map(([v, l]) => opt(v, l, st[matchKey] ?? (k === 'url' ? 'contains' : 'exact')))) : null,
+    h('input', { value: st[k] ?? '', placeholder: ph, 'aria-label': label, onchange: (e: Event) => { st[k] = (e.target as HTMLInputElement).value.trim(); } })));
+  const draw = () => box.replaceChildren(...steps.map((st, i) => {
+    st.properties ??= [];
+    const auto = st.event === '$autocapture';
+    return h('div', { class: 'card inner' }, h('div', { class: 'row' }, h('b', {}, i ? `OR match ${i + 1}` : 'Match'),
+      h('select', { 'aria-label': 'Step kind', onchange: (e: Event) => { const v = (e.target as HTMLSelectElement).value; st.event = v === 'auto' ? '$autocapture' : v === 'pageview' ? '$pageview' : ''; draw(); } },
+        opt('auto', 'Autocapture (clicks, submits, changes)', auto ? 'auto' : st.event === '$pageview' ? 'pageview' : 'event'), opt('pageview', 'Page view', st.event === '$pageview' ? 'pageview' : ''), opt('event', 'Custom event', !auto && st.event !== '$pageview' ? 'event' : '')),
+      steps.length > 1 ? h('button', { class: 'link', type: 'button', onclick: () => { steps.splice(i, 1); draw(); } }, 'Remove') : null),
+      !auto && st.event !== '$pageview' ? h('label', {}, 'Event name', eventInput(st.event || null, v => { st.event = v ?? ''; }, true)) : null,
+      auto ? field(st, 'selector', 'CSS selector', 'e.g. button.signup, [data-attr="cta"]') : null,
+      auto ? field(st, 'text', 'Element text', 'e.g. Sign up', 'text_matching') : null,
+      auto ? field(st, 'href', 'Link target (href)', 'e.g. /pricing', 'href_matching') : null,
+      field(st, 'url', 'Page URL', 'e.g. /checkout', 'url_matching'),
+      h('div', {}, h('span', { class: 'muted small' }, 'Event property filters'), filterEditor(st.properties, () => {}, ['event'])));
+  }), h('button', { type: 'button', onclick: () => { steps.push({ event: '$autocapture', url_matching: 'contains' }); draw(); } }, '+ Add OR match'));
+  draw();
+  const count = h('div', {});
+  if (id) runInsight({ kind: 'TrendsQuery', series: [{ kind: 'ActionsNode', id, math: 'total' }], interval: 'day', dateRange: { date_from: '-30d' }, trendsFilter: { display: 'ActionsLineGraph' }, properties: [] }, count);
+  const err = errBox(); const btn = h('button', { class: 'primary', type: 'submit' }, id ? 'Save action' : 'Create action') as HTMLButtonElement;
+  const form = h('form', {}, eventList(), propOptions('event'), h('div', { class: 'card' }, h('label', {}, 'Name', name), h('label', {}, 'Description', desc)),
+    h('div', { class: 'card' }, h('h2', {}, 'Match events'), h('p', { class: 'muted small' }, 'An event matches when every filled-in field of any one match block holds. Selectors support tag, #id, .class, [attr=value], :nth-child(n), descendant and child (>) combinators.'), box), err, btn,
+    id ? h('div', { class: 'card' }, h('h2', {}, 'Matching events, last 30 days'), count) : null);
+  form.addEventListener('submit', busy(btn, async () => {
+    const clean = steps.map(st => { const o: any = {}; for (const [k, v] of Object.entries(st)) if (v !== '' && v !== null && v !== undefined && !(Array.isArray(v) && !v.length)) o[k] = v; o.properties = (st.properties ?? []).filter((p: PF) => p.key); return o; });
+    const body = { name: name.value.trim(), description: desc.value.trim(), steps: clean };
+    const r = id ? await api<any>(apiP(`/actions/${id}`), { method: 'PATCH', body }) : await api<any>(apiP('/actions'), { body });
+    await ensureDefs(true); nav(P(`/actions/${r.id}`));
+  }, err));
+  shell(id ? a.name : 'New action', id ? [h('button', { class: 'link danger', onclick: async () => { if (!confirm(`Delete action ${a.name}?`)) return; await api(apiP(`/actions/${id}`), { method: 'DELETE' }); await ensureDefs(true); nav(P('/actions')); } }, 'Delete')] : [], form);
+}
+
+// ---------- cohorts ----------
+async function cohortsPage() {
+  shell('Cohorts', [], loading());
+  const list = await api<any[]>(apiP('/cohorts'));
+  shell('Cohorts', [link(P('/cohorts/new'), 'New cohort', 'button primary')],
+    list.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Type'), h('th', {}, 'Persons'), h('th', {}, 'Last calculated'))),
+      h('tbody', {}, list.map(c => h('tr', {}, h('td', {}, link(P(`/cohorts/${c.id}`), c.name), c.description ? h('div', { class: 'muted small' }, c.description) : null), h('td', { class: 'muted' }, c.is_static ? 'Static' : 'Dynamic'), h('td', { class: 'num' }, fmt(c.count)), h('td', { class: 'muted' }, c.is_static ? '–' : ago(c.last_calculated_at))))))
+      : h('p', { class: 'muted empty' }, 'No cohorts yet. Cohorts group persons by properties, behaviour or an uploaded list, and work as filters in insights, flags, surveys and experiments.'));
+}
+function criteriaEditor(root: any, cohortId: number | null): HTMLElement {
+  const box = h('div', {});
+  root.type ??= 'OR'; root.values ??= [];
+  const draw = () => box.replaceChildren(...root.values.map((g: any, gi: number) => h('div', { class: 'card inner' },
+    h('div', { class: 'row' }, h('b', {}, gi ? 'OR persons who match all of' : 'Persons who match all of'), root.values.length > 1 ? h('button', { class: 'link', type: 'button', onclick: () => { root.values.splice(gi, 1); draw(); } }, 'Remove group') : null),
+    ...g.values.map((c: any, ci: number) => {
+      const kind = c.type === 'behavioral' ? (c.event_type === 'actions' ? 'action' : 'event') : c.type;
+      const kindSel = h('select', { 'aria-label': 'Criterion type', onchange: (e: Event) => {
+        const v = (e.target as HTMLSelectElement).value;
+        g.values[ci] = v === 'person' ? { type: 'person', key: '', operator: 'exact', value: [] } : v === 'cohort' ? { type: 'cohort', key: 'id', value: cohortsList.find(x => x.id !== cohortId)?.id }
+          : { type: 'behavioral', event_type: v === 'action' ? 'actions' : 'events', key: v === 'action' ? actionsList[0]?.id : '$pageview', value: 'performed_event', time_value: 30, time_interval: 'day' };
+        draw(); } }, opt('person', 'Person property', kind), opt('event', 'Performed event', kind), opt('action', 'Performed action', kind), opt('cohort', 'In cohort', kind));
+      const neg = h('label', { class: 'switch' }, h('input', { type: 'checkbox', checked: !!c.negation, onchange: (e: Event) => { c.negation = (e.target as HTMLInputElement).checked; } }), 'not');
+      let body: Child[] = [];
+      if (c.type === 'person') {
+        const tmp: PF[] = [{ key: c.key, value: c.value, operator: c.operator, type: 'person' }];
+        const sync = () => { Object.assign(c, { key: tmp[0]?.key ?? '', value: tmp[0]?.value, operator: tmp[0]?.operator ?? 'exact' }); };
+        body = [filterEditor(tmp, sync, ['person'], true)];
+      } else if (c.type === 'cohort') {
+        body = [h('select', { 'aria-label': 'Cohort', onchange: (e: Event) => { c.value = Number((e.target as HTMLSelectElement).value); } }, cohortsList.filter(x => x.id !== cohortId).map(x => h('option', { value: x.id, selected: Number(c.value) === x.id }, x.name)))];
+      } else {
+        const multi = c.value === 'performed_event_multiple';
+        body = [c.event_type === 'actions'
+          ? h('select', { 'aria-label': 'Action', onchange: (e: Event) => { c.key = Number((e.target as HTMLSelectElement).value); } }, actionsList.map(a => h('option', { value: a.id, selected: Number(c.key) === a.id }, a.name)))
+          : eventInput(c.key || null, v => { c.key = v ?? '$pageview'; }, false),
+          h('select', { 'aria-label': 'How often', onchange: (e: Event) => { c.value = (e.target as HTMLSelectElement).value; if (c.value === 'performed_event_multiple') { c.operator ??= 'gte'; c.operator_value ??= 3; } draw(); } }, opt('performed_event', 'at least once', c.value), opt('performed_event_multiple', 'a number of times', c.value)),
+          multi ? h('select', { 'aria-label': 'Count operator', onchange: (e: Event) => { c.operator = (e.target as HTMLSelectElement).value; } }, [['gte', 'at least'], ['lte', 'at most'], ['exact', 'exactly'], ['gt', 'more than'], ['lt', 'fewer than']].map(([v, l]) => opt(v, l, c.operator ?? 'gte'))) : null,
+          multi ? h('input', { type: 'number', min: 0, class: 'narrow', value: c.operator_value ?? 1, 'aria-label': 'Count', onchange: (e: Event) => { c.operator_value = Number((e.target as HTMLInputElement).value); } }) : null,
+          h('span', {}, 'in the last'), h('input', { type: 'number', min: 1, class: 'narrow', value: c.time_value ?? 30, 'aria-label': 'Time value', onchange: (e: Event) => { c.time_value = Number((e.target as HTMLInputElement).value); } }),
+          h('select', { 'aria-label': 'Time unit', onchange: (e: Event) => { c.time_interval = (e.target as HTMLSelectElement).value; } }, ['day', 'week', 'month', 'year'].map(u => opt(u, u + 's', c.time_interval ?? 'day')))];
+      }
+      return h('div', { class: 'row criterion' }, neg, kindSel, ...body, h('button', { class: 'link', type: 'button', 'aria-label': 'Remove criterion', onclick: () => { g.values.splice(ci, 1); draw(); } }, '✕'));
+    }),
+    h('button', { class: 'link', type: 'button', onclick: () => { g.values.push({ type: 'behavioral', event_type: 'events', key: '$pageview', value: 'performed_event', time_value: 30, time_interval: 'day' }); draw(); } }, '+ Add criterion'))),
+    h('button', { type: 'button', onclick: () => { root.values.push({ type: 'AND', values: [{ type: 'person', key: '', operator: 'exact', value: [] }] }); draw(); } }, '+ Add OR group'));
+  draw(); return box;
+}
+async function cohortPage(id: number | null) {
+  shell('Cohort', [], loading());
+  await ensureDefs();
+  const c: any = id ? await api(apiP(`/cohorts/${id}`)) : { name: '', description: '', is_static: false, filters: { properties: { type: 'OR', values: [{ type: 'AND', values: [{ type: 'behavioral', event_type: 'events', key: '$pageview', value: 'performed_event', time_value: 30, time_interval: 'day' }] }] } } };
+  const name = h('input', { value: c.name, required: true, placeholder: 'e.g. Power users' }) as HTMLInputElement;
+  const desc = h('input', { value: c.description ?? '', placeholder: 'Optional' }) as HTMLInputElement;
+  let isStatic = !!c.is_static;
+  const root = c.filters?.properties ?? { type: 'OR', values: [] };
+  const defBox = h('div', {});
+  const csv = h('textarea', { rows: 5, placeholder: 'One distinct ID, email or person ID per line, or a CSV with a distinct_id, email or person_id column' }) as HTMLTextAreaElement;
+  const file = h('input', { type: 'file', accept: '.csv,text/csv,text/plain', onchange: async (e: Event) => { const f = (e.target as HTMLInputElement).files?.[0]; if (f) csv.value = await f.text(); } }) as HTMLInputElement;
+  const drawDef = () => defBox.replaceChildren(isStatic
+    ? h('div', {}, h('p', { class: 'muted small' }, id ? 'Add more persons to this static cohort:' : 'Upload or paste the persons in this cohort:'), file, csv)
+    : h('div', {}, h('p', { class: 'muted small' }, 'Membership is recalculated when you save, every hour, and on demand.'), criteriaEditor(root, id)));
+  drawDef();
+  const typeSel = id ? h('p', { class: 'muted' }, isStatic ? 'Static cohort (a fixed list of persons)' : 'Dynamic cohort')
+    : h('label', {}, 'Type', h('select', { onchange: (e: Event) => { isStatic = (e.target as HTMLSelectElement).value === 'static'; drawDef(); } }, opt('dynamic', 'Dynamic (matching properties or behaviour)', 'dynamic'), opt('static', 'Static (uploaded list)', '')));
+  const err = errBox(); const btn = h('button', { class: 'primary', type: 'submit' }, id ? 'Save cohort' : 'Create cohort') as HTMLButtonElement;
+  const persons = h('div', {});
+  const form = h('form', {}, eventList(), propOptions('person'), h('div', { class: 'card' }, h('label', {}, 'Name', name), h('label', {}, 'Description', desc), typeSel),
+    h('div', { class: 'card' }, h('h2', {}, isStatic ? 'Persons' : 'Matching criteria'), defBox), err, btn);
+  form.addEventListener('submit', busy(btn, async () => {
+    const body: any = { name: name.value.trim(), description: desc.value.trim() };
+    if (!id) body.is_static = isStatic;
+    if (!isStatic) body.filters = { properties: root };
+    if (isStatic && csv.value.trim()) body.csv = csv.value;
+    let r: any;
+    if (id) { r = await api<any>(apiP(`/cohorts/${id}`), { method: 'PATCH', body: isStatic ? { name: body.name, description: body.description } : body }); if (isStatic && csv.value.trim()) await api(apiP(`/cohorts/${id}/persons`), { body: { csv: csv.value } }); }
+    else r = await api<any>(apiP('/cohorts'), { body });
+    await ensureDefs(true); nav(P(`/cohorts/${r.id}`));
+  }, err));
+  const loadPersons = async () => {
+    const r = await api<any>(apiP(`/cohorts/${id}/persons`));
+    persons.replaceChildren(r.results.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Person'), h('th', {}, 'Distinct IDs'), h('th', {}, 'Last seen'), isStatic ? h('th', {}) : null)),
+      h('tbody', {}, r.results.map((p: any) => h('tr', {}, h('td', {}, link(P(`/persons/${p.id}`), p.name)), h('td', { class: 'muted small' }, p.distinct_ids.slice(0, 3).join(', ')), h('td', { class: 'muted' }, ago(p.last_seen_at)),
+        isStatic ? h('td', {}, h('button', { class: 'link danger', onclick: async () => { await api(apiP(`/cohorts/${id}/persons/${encodeURIComponent(p.id)}`), { method: 'DELETE' }); loadPersons(); } }, 'Remove')) : null))))
+      : h('p', { class: 'muted' }, 'No persons in this cohort yet.'), r.next ? h('p', { class: 'muted small' }, 'Showing the first 100.') : '');
+  };
+  const actions: Child[] = [];
+  if (id) {
+    if (!isStatic) actions.push(h('button', { onclick: async (e: Event) => { (e.target as HTMLButtonElement).textContent = 'Calculating…'; await api(apiP(`/cohorts/${id}/calculate`), { body: {} }); cohortPage(id); } }, 'Recalculate now'));
+    actions.push(h('button', { class: 'link danger', onclick: async () => { if (!confirm(`Delete cohort ${c.name}?`)) return; await api(apiP(`/cohorts/${id}`), { method: 'DELETE' }); await ensureDefs(true); nav(P('/cohorts')); } }, 'Delete'));
+  }
+  shell(id ? c.name : 'New cohort', actions, form,
+    id ? h('section', { class: 'card' }, h('h2', {}, `${fmt(c.count)} persons`), h('p', { class: 'muted small' }, isStatic ? 'Static list.' : `Last calculated ${ago(c.last_calculated_at)}.`), persons) : null);
+  if (id) loadPersons();
+}
+
+// ---------- SQL ----------
+const SQL_EXAMPLES: [string, string][] = [
+  ['Top events, last 7 days', "SELECT event, count() AS events, uniq(distinct_id) AS users\nFROM events\nWHERE timestamp > now() - INTERVAL 7 DAY\nGROUP BY event\nORDER BY events DESC\nLIMIT 20"],
+  ['Pageviews by path', "SELECT properties.$pathname AS path, count() AS views\nFROM events\nWHERE event = '$pageview' AND timestamp > now() - INTERVAL 30 DAY\nGROUP BY path\nORDER BY views DESC\nLIMIT 50"],
+  ['Daily active persons', "SELECT toDate(timestamp) AS day, count(DISTINCT person_id) AS persons\nFROM events\nWHERE timestamp > now() - INTERVAL 14 DAY\nGROUP BY day\nORDER BY day"],
+  ['Persons by email domain', "SELECT person.properties.email AS email, count() AS events\nFROM events\nWHERE person.properties.email LIKE '%@%'\nGROUP BY email\nORDER BY events DESC\nLIMIT 20"],
+  ['Latest persons', "SELECT id, properties.email, created_at FROM persons ORDER BY created_at DESC LIMIT 20"],
+];
+async function sqlPage() {
+  const saved = sessionStorage.getItem(`sql:${pid}`) ?? SQL_EXAMPLES[0][1];
+  const ta = h('textarea', { class: 'sql mono', rows: 10, spellcheck: false, 'aria-label': 'SQL query' }, saved) as HTMLTextAreaElement;
+  const out = h('div', { class: 'result' }); const err = errBox(); const meta = h('p', { class: 'muted small' });
+  const btn = h('button', { class: 'primary', type: 'button' }, 'Run') as HTMLButtonElement;
+  const run = busy(btn, async () => {
+    err.textContent = ''; sessionStorage.setItem(`sql:${pid}`, ta.value); const t = performance.now();
+    out.replaceChildren(loading());
+    try {
+      const r = await api<any>(apiP('/sql'), { body: { query: ta.value } });
+      meta.textContent = `${fmt(r.results.length)} row${r.results.length === 1 ? '' : 's'}${r.hasMore ? ' (more available; add LIMIT/OFFSET)' : ''} · ${Math.round(performance.now() - t)} ms`;
+      out.replaceChildren(h('div', { class: 'scroll-x' }, h('table', { class: 'sql-result' }, h('thead', {}, h('tr', {}, r.columns.map((c: string) => h('th', {}, c)))),
+        h('tbody', {}, r.results.map((row: unknown[]) => h('tr', {}, row.map(v => h('td', { class: typeof v === 'number' ? 'num' : 'mono small' }, v === null ? 'null' : typeof v === 'object' ? JSON.stringify(v) : String(v)))))))));
+    } catch (e) { out.replaceChildren(); meta.textContent = ''; throw e; }
+  }, err);
+  btn.addEventListener('click', run);
+  ta.addEventListener('keydown', (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); btn.click(); } });
+  shell('SQL', [],
+    h('section', { class: 'card' }, h('div', { class: 'row' }, h('span', { class: 'muted small' }, 'Examples:'), ...SQL_EXAMPLES.map(([l, q]) => h('button', { class: 'link', type: 'button', onclick: () => { ta.value = q; } }, l))),
+      ta, h('div', { class: 'row' }, btn, h('span', { class: 'muted small' }, 'Ctrl/⌘ + Enter. Read-only SELECT over events and persons in this project. Times are UTC; results stop at 10,000 rows; queries time out after 25 s.')), err, meta),
+    h('section', { class: 'card' }, out));
+  if (location.hash === '#run') btn.click();
+}
+
+// ---------- heatmaps ----------
+async function heatmapsPage() {
+  shell('Heatmaps', [], loading());
+  const p = project();
+  const params = new URLSearchParams(location.search);
+  const st = { url: params.get('url') ?? '', type: params.get('type') ?? 'click', agg: 'total_count', from: params.get('date_from') ?? '-7d', width: Number(params.get('width')) || 1280, bg: params.get('bg') ?? 'iframe', opacity: 0.7 };
+  const urls = await api<any>(apiP(`/heatmaps/urls?date_from=${encodeURIComponent(st.from)}`)).catch(() => ({ results: [] }));
+  if (!st.url && urls.results.length) st.url = urls.results[0].url;
+  const urlIn = h('input', { value: st.url, list: 'heatmap-urls', placeholder: 'https://your-site/page', class: 'wide', 'aria-label': 'Page URL' }) as HTMLInputElement;
+  const stage = h('div', { class: 'heatmap-stage' }); const side = h('div', {}); const err = errBox();
+  const sel = (label: string, key: keyof typeof st, opts: [string, string][]) => h('label', {}, label, h('select', { onchange: (e: Event) => { (st as any)[key] = (e.target as HTMLSelectElement).value; draw(); } }, opts.map(([v, l]) => opt(v, l, String(st[key])))));
+  const draw = async () => {
+    err.textContent = ''; st.url = urlIn.value.trim();
+    history.replaceState(null, '', `${location.pathname}?${new URLSearchParams({ url: st.url, type: st.type, date_from: st.from, width: String(st.width), bg: st.bg })}`);
+    if (!st.url) { stage.replaceChildren(h('p', { class: 'muted empty' }, 'Pick a page. Pages appear here after posthog-js sends heatmap data (turn on “Collect heatmaps” in Settings).')); return; }
+    stage.replaceChildren(loading());
+    const pattern = st.url.includes('*');
+    const qs = new URLSearchParams({ date_from: st.from, [pattern ? 'url_pattern' : 'url_exact']: st.url, aggregation: st.agg });
+    try {
+      if (st.type === 'scrolldepth') {
+        const r = await api<any>(apiP(`/scroll_depth?${qs}`));
+        return drawScroll(r);
+      }
+      qs.set('type', st.type);
+      const r = await api<any>(apiP(`/heatmaps?${qs}`));
+      drawHeat(r.results);
+    } catch (e) { stage.replaceChildren(); err.textContent = e instanceof Error ? e.message : String(e); }
+  };
+  const background = async (W: number, H: number): Promise<HTMLElement> => {
+    if (st.bg === 'iframe' && !st.url.includes('*')) {
+      return h('iframe', { src: st.url, class: 'heatmap-bg', style: `width:${W}px;height:${H}px`, sandbox: 'allow-same-origin allow-scripts', referrerpolicy: 'no-referrer', title: 'Page preview', scrolling: 'no' });
+    }
+    if (st.bg === 'recording') {
+      // The first full snapshot of the newest recording that started on this page.
+      const recs = await api<any>(apiP('/session_recordings?limit=50'));
+      const rec = recs.results.find((x: any) => x.start_url && (x.start_url === st.url || x.start_url.split('?')[0] === st.url.split('?')[0]));
+      if (rec) {
+        const [pg, mod] = await Promise.all([api<any>(apiP(`/session_recordings/${encodeURIComponent(rec.id)}/snapshots?paged=1`)), loadPlayer()]);
+        const full = pg.snapshots.findIndex((e: any) => e.type === 2);
+        if (full >= 0) {
+          const holder = h('div', { class: 'heatmap-bg rec', style: `width:${W}px;height:${H}px` });
+          const evs = pg.snapshots.slice(0, full + 1);
+          setTimeout(() => { try { const r = new mod.Replayer(evs, { root: holder, skipInactive: true, mouseTail: false }); r.pause(evs[evs.length - 1].timestamp - evs[0].timestamp); const ifr = holder.querySelector('iframe'); if (ifr) { ifr.style.width = `${W}px`; ifr.style.height = `${H}px`; } } catch { /* plain background */ } }, 30);
+          return holder;
+        }
+      }
+      return h('div', { class: 'heatmap-bg blank', style: `width:${W}px;height:${H}px` }, h('p', { class: 'muted' }, 'No recording of this page with a full snapshot was found.'));
+    }
+    return h('div', { class: 'heatmap-bg blank', style: `width:${W}px;height:${H}px` });
+  };
+  const drawHeat = async (cells: any[]) => {
+    const W = st.width; const maxY = cells.reduce((m, c) => Math.max(m, c.client_y), 0); const H = Math.max(800, maxY + 200);
+    const canvas = h('canvas', { width: W, height: H, class: 'heatmap-canvas', style: `opacity:${st.opacity}` }) as HTMLCanvasElement;
+    const ctx = canvas.getContext('2d')!;
+    const max = cells.reduce((m, c) => Math.max(m, c.count), 1);
+    // Intensity pass in alpha, then colourize.
+    const r = st.type === 'mousemove' ? 14 : 22;
+    for (const c of cells) {
+      const x = c.pointer_relative_x * W, y = c.client_y + 8;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, r); const a = Math.min(1, 0.15 + c.count / max);
+      g.addColorStop(0, `rgba(0,0,0,${a})`); g.addColorStop(1, 'rgba(0,0,0,0)'); ctx.fillStyle = g; ctx.fillRect(x - r, y - r, 2 * r, 2 * r);
+    }
+    const img = ctx.getImageData(0, 0, W, H); const d = img.data;
+    for (let i = 0; i < d.length; i += 4) { const a = d[i + 3] / 255; if (!a) continue; const t = Math.min(1, a); const [R, G, B] = t < 0.33 ? [0, Math.round(255 * t * 3), 255] : t < 0.66 ? [Math.round(255 * (t - 0.33) * 3), 255, Math.round(255 * (1 - (t - 0.33) * 3))] : [255, Math.round(255 * (1 - (t - 0.66) * 3)), 0]; d[i] = R; d[i + 1] = G; d[i + 2] = B; d[i + 3] = Math.round(200 * Math.min(1, a * 1.4)); }
+    ctx.putImageData(img, 0, 0);
+    const scale = Math.min(1, (stage.clientWidth || W) / W);
+    const inner = h('div', { class: 'heatmap-inner', style: `width:${W}px;height:${H}px;transform:scale(${scale});transform-origin:0 0` }, await background(W, H), canvas);
+    stage.replaceChildren(h('div', { class: 'heatmap-frame', style: `height:${Math.round(H * scale)}px` }, inner));
+    const total = cells.reduce((t, c) => t + c.count, 0);
+    side.replaceChildren(h('p', { class: 'small' }, h('b', {}, fmt(total)), ` ${st.agg === 'unique_visitors' ? 'visitor-cells' : st.type === 'mousemove' ? 'moves' : 'clicks'} · ${fmt(cells.length)} hot spots · ${W}px wide`),
+      st.bg === 'iframe' ? h('p', { class: 'muted small' }, 'The page is loaded live in a frame. If it stays blank, the site forbids framing: switch the background to a recording.') : '');
+  };
+  const drawScroll = (r: any) => {
+    stage.replaceChildren(h('div', { class: 'hbars' }, r.results.filter((x: any) => x.percentage > 0).map((x: any) => h('div', { class: 'hbar' }, h('span', { class: 'hl' }, `${x.percentage}%`),
+      h('span', { class: 'track' }, h('span', { class: 'fill', style: `width:${100 * x.share}%;background:${color(0)}` })), h('span', { class: 'small' }, `${fmt(x.count)} · ${pct(x.share, 0)}`)))));
+    side.replaceChildren(h('p', { class: 'small' }, h('b', {}, fmt(r.pageviews)), ` page views of ${r.pathname ?? 'all pages'} reported how far they scrolled. Bars show the share that scrolled at least that far.`));
+  };
+  urlIn.addEventListener('change', draw);
+  shell('Heatmaps', [],
+    !p.heatmaps ? h('p', { class: 'muted small' }, 'Heatmap collection is off for this project. ', link(P('/settings'), 'Turn it on in Settings'), '.') : null,
+    h('section', { class: 'card' }, h('datalist', { id: 'heatmap-urls' }, urls.results.map((u: any) => h('option', { value: u.url }, `${u.url} (${u.count})`))),
+      h('div', { class: 'row opts' }, h('label', {}, 'Page (use * as a wildcard)', urlIn),
+        sel('Type', 'type', [['click', 'Clicks'], ['rageclick', 'Rage clicks'], ['deadclick', 'Dead clicks'], ['mousemove', 'Mouse moves'], ['scrolldepth', 'Scroll depth']]),
+        sel('Count', 'agg', [['total_count', 'Total'], ['unique_visitors', 'Unique visitors']]),
+        sel('Dates', 'from', [['-24h', 'Last 24 hours'], ['-7d', 'Last 7 days'], ['-30d', 'Last 30 days'], ['-90d', 'Last 90 days']]),
+        sel('Width', 'width', [['375', 'Mobile 375'], ['768', 'Tablet 768'], ['1024', '1024'], ['1280', '1280'], ['1440', '1440'], ['1920', '1920']]),
+        sel('Background', 'bg', [['iframe', 'Live page'], ['recording', 'Recording snapshot'], ['none', 'None']])), side, err),
+    h('section', { class: 'card' }, stage));
+  draw();
+}
+
+// ---------- replay settings ----------
+function replaySettings(p: Project): HTMLElement {
+  const c = p.replay_config ?? {};
+  const num = (v: unknown, attrs: any = {}) => h('input', { type: 'number', value: v ?? '', class: 'narrow', ...attrs }) as HTMLInputElement;
+  const cb = (v: boolean) => h('input', { type: 'checkbox', checked: v }) as HTMLInputElement;
+  const lines = (v: string[] | undefined, ph: string) => h('textarea', { rows: 2, placeholder: ph }, (v ?? []).join('\n')) as HTMLTextAreaElement;
+  const sample = num(c.sample_rate != null ? Math.round(c.sample_rate * 100) : 100, { min: 0, max: 100 });
+  const minDur = num(c.minimum_duration_ms != null ? c.minimum_duration_ms / 1000 : '', { min: 0, max: 3600, placeholder: 'seconds' });
+  const flagKey = h('input', { value: c.linked_flag?.key ?? '', placeholder: 'flag key (optional)' }) as HTMLInputElement;
+  const flagVar = h('input', { value: c.linked_flag?.variant ?? '', placeholder: 'variant (optional)' }) as HTMLInputElement;
+  const consoleCb = cb(c.console !== false), netTiming = cb(!!c.network?.timing), netHeaders = cb(!!c.network?.headers), netBody = cb(!!c.network?.body);
+  const canvasCb = cb(!!c.canvas?.enabled), fps = num(c.canvas?.fps ?? 4, { min: 0, max: 12 }), quality = num(c.canvas?.quality ?? 0.4, { min: 0, max: 1, step: 0.1 });
+  const urlTrig = lines(c.url_triggers, 'Start recording only on URLs matching these regexes (one per line)');
+  const urlBlock = lines(c.url_blocklist, 'Pause recording on URLs matching these regexes');
+  const evTrig = lines(c.event_triggers, 'Start recording only after one of these events');
+  const match = h('select', {}, opt('any', 'Any trigger starts recording', c.trigger_match ?? 'any'), opt('all', 'All triggers must match', c.trigger_match)) as HTMLSelectElement;
+  const maskInputs = cb(c.masking?.mask_all_inputs !== false);
+  const maskText = h('input', { value: c.masking?.mask_text_selector ?? '', placeholder: 'e.g. .private, [data-mask]' }) as HTMLInputElement;
+  const block = h('input', { value: c.masking?.block_selector ?? '', placeholder: 'e.g. video, .no-record' }) as HTMLInputElement;
+  const err = errBox(); const btn = h('button', { class: 'primary', type: 'submit' }, 'Save replay settings') as HTMLButtonElement;
+  const split = (t: HTMLTextAreaElement) => t.value.split('\n').map(x => x.trim()).filter(Boolean);
+  const form = h('form', { class: 'card', id: 'replay-settings' }, h('h2', {}, 'Session replay'),
+    h('p', { class: 'muted small' }, 'Sent to posthog-js in its remote config; applies to new sessions. Recording itself is switched on above.'),
+    h('div', { class: 'row opts' }, h('label', {}, 'Sample rate %', sample), h('label', {}, 'Minimum duration (s)', minDur), h('label', {}, 'Only with flag', h('div', { class: 'row' }, flagKey, flagVar))),
+    h('div', { class: 'row' }, h('label', { class: 'switch' }, consoleCb, 'Console logs'), h('label', { class: 'switch' }, netTiming, 'Network requests'), h('label', { class: 'switch' }, netHeaders, 'Request headers'), h('label', { class: 'switch' }, netBody, 'Request bodies')),
+    h('div', { class: 'row' }, h('label', { class: 'switch' }, canvasCb, 'Record canvas'), h('label', {}, 'FPS', fps), h('label', {}, 'Quality', quality)),
+    h('label', {}, 'URL triggers', urlTrig), h('label', {}, 'URL blocklist', urlBlock), h('label', {}, 'Event triggers', evTrig), h('label', {}, 'Trigger matching', match),
+    h('div', { class: 'row' }, h('label', { class: 'switch' }, maskInputs, 'Mask all inputs'), h('label', {}, 'Mask text', maskText), h('label', {}, 'Block elements', block)), err, btn);
+  form.addEventListener('submit', busy(btn, async () => {
+    const rc = { sample_rate: Number(sample.value) / 100, minimum_duration_ms: minDur.value === '' ? null : Math.round(Number(minDur.value) * 1000),
+      linked_flag: flagKey.value.trim() ? { key: flagKey.value.trim(), variant: flagVar.value.trim() || null } : null, console: consoleCb.checked,
+      network: { timing: netTiming.checked, headers: netHeaders.checked, body: netBody.checked }, canvas: { enabled: canvasCb.checked, fps: Number(fps.value), quality: Number(quality.value) },
+      url_triggers: split(urlTrig), url_blocklist: split(urlBlock), event_triggers: split(evTrig), trigger_match: match.value,
+      masking: { mask_all_inputs: maskInputs.checked, mask_text_selector: maskText.value.trim() || null, block_selector: block.value.trim() || null } };
+    const r = await api<Project>(apiP(''), { method: 'PATCH', body: { replay_config: rc } });
+    projects = projects.map(x => x.id === r.id ? r : x); btn.textContent = 'Saved';
+  }, err));
+  return form;
 }
 
 // ---------- router ----------
@@ -800,6 +1209,14 @@ async function render() {
     if (sub === '/experiments') return await experimentsPage();
     if (sub === '/experiments/new') return await experimentNewPage();
     if ((r = /^\/experiments\/(\d+)$/.exec(sub))) return await experimentPage(+r[1]);
+    if (sub === '/actions') return await actionsPage();
+    if (sub === '/actions/new') return await actionPage(null);
+    if ((r = /^\/actions\/(\d+)$/.exec(sub))) return await actionPage(+r[1]);
+    if (sub === '/cohorts') return await cohortsPage();
+    if (sub === '/cohorts/new') return await cohortPage(null);
+    if ((r = /^\/cohorts\/(\d+)$/.exec(sub))) return await cohortPage(+r[1]);
+    if (sub === '/sql') return await sqlPage();
+    if (sub === '/heatmaps') return await heatmapsPage();
     if (sub === '/surveys') return await surveysPage();
     if (sub === '/surveys/new') return await surveyEditPage(null);
     if ((r = /^\/surveys\/([\w-]+)\/edit$/.exec(sub))) return await surveyEditPage(r[1]);

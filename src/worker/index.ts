@@ -1,13 +1,14 @@
 // Worker entry: routing, the ingest queue consumer and the daily retention cron (spec R1).
 import { Env, HttpError, IngestMsg, json, storeFor, ProjectRow } from './env';
 import { handleLegacyCapture, handleV1Capture, LEGACY_PATHS, V1_PATH, cors } from './capture';
-import { handleConfig, handleFlags, handleStub, handleSurveys } from './sdk';
+import { handleConfig, handleFlags, handleStub, handleSurveys, handleLocalEvaluation } from './sdk';
 import { handleApi } from './api';
 import { handleSnapshots, chunkPrefix, deletePrefix } from './replay';
 import ui from './ui.gen';
 export { ProjectStore } from './store';
 export { EventShard } from './shard';
 
+const HOURLY = '41 * * * *';
 const SECURITY = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'same-origin' };
 
 async function route(req: Request, env: Env): Promise<Response> {
@@ -18,6 +19,7 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (LEGACY_PATHS.has(bare) && (req.method === 'POST' || req.method === 'GET')) return handleLegacyCapture(req, env, url);
   if (bare === V1_PATH && req.method === 'POST') return handleV1Capture(req, env);
   if (bare === '/s' || bare === '/i/v0/s') return handleSnapshots(req, env, url);
+  if (bare === '/flags/definitions' || bare === '/api/feature_flag/local_evaluation') return handleLocalEvaluation(req, env, url);
   if (bare === '/flags' || bare === '/decide') return handleFlags(req, env, url, bare === '/decide');
   const cfg = /^\/array\/([^/]+)\/config(\.js)?$/.exec(path);
   if (cfg && req.method === 'GET') return handleConfig(req, env, decodeURIComponent(cfg[1]), !!cfg[2]);
@@ -58,13 +60,19 @@ export default {
         const store = storeFor(env, pid);
         const events = msgs.flatMap(m => m.body.events ?? []); const replay = msgs.flatMap(m => m.body.replay ?? []);
         if (events.length) await store.ingest(events);
+        if (events.length && env.COLD_STREAM) await env.COLD_STREAM.send(events.map(e => ({ project_id: pid, uuid: e.uuid, event: e.event, distinct_id: e.distinct_id, timestamp: new Date(e.ts).toISOString(), properties: JSON.stringify(e.properties) })));
         if (replay.length) await store.recordReplay(replay);
         msgs.forEach(m => m.ack());
       }
       catch (e) { console.error('ingest failed', pid, e instanceof Error ? e.message : String(e)); msgs.forEach(m => m.retry({ delaySeconds: 10 })); }
     }));
   },
-  async scheduled(_c: ScheduledController, env: Env): Promise<void> {
+  async scheduled(c: ScheduledController, env: Env): Promise<void> {
+    // Hourly: recompute dynamic cohorts (design.md "Cohorts"). Daily: retention.
+    if (c.cron === HOURLY) {
+      for (const p of (await env.DB.prepare('SELECT id FROM projects').all<{ id: number }>()).results) { try { await storeFor(env, p.id).calculateAllCohorts(); } catch (e) { console.error('cohorts', p.id, e instanceof Error ? e.message : String(e)); } }
+      return;
+    }
     const rows = (await env.DB.prepare('SELECT * FROM projects WHERE retention_days > 0').all<ProjectRow>()).results;
     for (const p of rows) await storeFor(env, p.id).purge(Date.now() - p.retention_days * 86400_000);
     // Recordings: REPLAY_RETENTION_DAYS (default 30), never longer than the project's event retention.

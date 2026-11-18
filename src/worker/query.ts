@@ -7,15 +7,19 @@ export { QueryError } from './eventsql';
 export type { PropertyFilter } from './eventsql';
 
 export type QueryContext = { timezone: string; now?: number };
-export type EventsNode = { kind?: 'EventsNode'; event?: string | null; name?: string; custom_name?: string; math?: string; math_property?: string; math_group_type_index?: number; properties?: PropertyFilter[] };
+export type EventsNode = { kind?: 'EventsNode' | 'ActionsNode'; id?: number; event?: string | null; name?: string; custom_name?: string; math?: string; math_property?: string; math_group_type_index?: number; properties?: PropertyFilter[] };
 export interface ShardApi {
   trend(s: TrendSpec): Promise<unknown[][]>;
   funnel(s: FunnelSpec): Promise<unknown[][]>;
+  funnelCounts(s: FunnelSpec): Promise<unknown[][]>;
+  sqlRows(s: import('./sqlquery').SqlShardSpec): Promise<unknown[][]>;
+  heatmap(s: import('./eventsql').HeatmapSpec): Promise<unknown[][]>;
+  scroll(s: { from: number; to: number; pathname?: string | null }): Promise<unknown[][]>;
   periods(s: PeriodSpec): Promise<unknown[][]>;
   firsts(s: { node: NodeSpec; global?: PropertyFilter[]; before: number }): Promise<unknown[][]>;
   events(s: EventsSpec): Promise<EventRow[]>;
 }
-export type PersonRef = { pk: string; uuid: string | null; props: Record<string, unknown> };
+export type PersonRef = { pk: string; uuid: string | null; props: Record<string, unknown>; created_at?: number };
 export interface Engine {
   /** Shards whose period overlaps [from, to], oldest first. */
   shards(from: number, to: number): Promise<ShardApi[]>;
@@ -23,6 +27,10 @@ export interface Engine {
   groupTypeName(idx: number): string | null;
   firstEventAt(): Promise<number | null>;
   distinctIdsOfPerson(uuid: string): string[];
+  /** A saved action's steps (design.md "Actions"), or null. */
+  action(id: number): { id: number; name: string; steps: import('../shared/actions').ActionStep[] } | null;
+  /** Cohort membership of a resolved person (design.md "Cohorts"); unknown cohorts throw QueryError. */
+  inCohort(id: number, ref: PersonRef): boolean;
 }
 
 const OTHER = '$$_other_$$';
@@ -31,7 +39,21 @@ const MATHS = new Set(['total', 'dau', 'unique_session', 'unique_group', 'sum', 
 const PCT: Record<string, number> = { median: 0.5, p75: 0.75, p90: 0.9, p95: 0.95, p99: 0.99 };
 const breakdownLabel = (v: string) => v === NONE ? 'None' : v === OTHER ? 'Other' : v;
 const personFilters = (fs: PropertyFilter[] | undefined) => (fs ?? []).filter(f => f && f.key && isPersonFilter(f));
-const node = (n: EventsNode): NodeSpec => ({ event: n.event ?? null, properties: n.properties });
+/** EventsNode or ActionsNode to the shard-side matcher; actions carry their steps. */
+export function nodeOf(en: Engine, n: EventsNode): NodeSpec {
+  if (n.kind === 'ActionsNode' || (n.id !== undefined && n.id !== null && n.event === undefined)) {
+    const a = en.action(Number(n.id)); if (!a) throw new QueryError(`unknown action ${n.id}`);
+    return { event: null, properties: n.properties, action: { id: a.id, steps: a.steps } };
+  }
+  return { event: n.event ?? null, properties: n.properties };
+}
+/** Display name of a series: custom name, action name or event name. */
+export function seriesName(en: Engine, n: EventsNode): string {
+  if (n.custom_name) return n.custom_name;
+  if (n.name) return n.name;
+  if (n.kind === 'ActionsNode' || (n.id != null && n.event === undefined)) return en.action(Number(n.id))?.name ?? `Action ${n.id}`;
+  return n.event ?? 'All events';
+}
 const concat = async <T>(ps: Promise<T[]>[]) => (await Promise.all(ps)).flat();
 
 export function percentile(sorted: number[], q: number) {
@@ -41,10 +63,15 @@ export function percentile(sorted: number[], q: number) {
 }
 
 /** Person lookup for a set of rows, plus a predicate for person filters. */
-function people(en: Engine, dids: Iterable<string>) {
+export function people(en: Engine, dids: Iterable<string>) {
   const m = en.resolve([...new Set(dids)]);
   const get = (d: string): PersonRef => m.get(d) ?? { pk: 'd' + d, uuid: null, props: {} };
-  return { get, ok: (d: string, fs: PropertyFilter[]) => !fs.length || fs.every(f => matchPerson(f, get(d).props)) };
+  return { get, ok: (d: string, fs: PropertyFilter[]) => !fs.length || fs.every(f => personFilterOk(en, f, get(d))) };
+}
+/** A person or cohort filter against a resolved person. */
+export function personFilterOk(en: Engine, f: PropertyFilter, ref: PersonRef): boolean {
+  if (f.type === 'cohort') { const inC = en.inCohort(Number(f.value), ref); return f.operator === 'not_in' ? !inC : inC; }
+  return matchPerson(f, ref.props);
 }
 
 export async function runQuery(en: Engine, q: any, qc: QueryContext): Promise<unknown> {
@@ -98,7 +125,7 @@ async function trendSeries(en: Engine, q: any, s: EventsNode, order: number, bks
   const bf = q.breakdownFilter?.breakdown ? q.breakdownFilter : null;
   const personBd = bf && bf.breakdown_type === 'person';
   // Breakdown values are computed per row: clip the buckets to the range so the top-N count matches the old single-store SQL.
-  const spec: TrendSpec = { buckets: bks.map(b => [b.start, b.end]), node: node(s), global: q.properties, breakdown: bf && !personBd ? String(bf.breakdown) : null,
+  const spec: TrendSpec = { buckets: bks.map(b => [b.start, b.end]), node: nodeOf(en, s), global: q.properties, breakdown: bf && !personBd ? String(bf.breakdown) : null,
     numKey: s.math_property ?? null, extra, values: !!PCT[math] };
   const shards = await en.shards(bks[0].start, bks[bks.length - 1].end - 1);
   const rows = await concat(shards.map(sh => sh.trend(spec)));
@@ -144,13 +171,13 @@ async function trendSeries(en: Engine, q: any, s: EventsNode, order: number, bks
     ensure(bv)[Number(bi)] = v;
   }
   const keys = breakdownValues ?? [NONE];
-  const name = s.custom_name || s.name || s.event || 'All events';
+  const name = seriesName(en, s); const isAction = s.kind === 'ActionsNode' || (s.id != null && s.event === undefined);
   return keys.map(bv => {
     const data = values.get(bv) ?? new Array(bks.length).fill(0);
     const count = data.reduce((a, b) => a + b, 0);
     return {
       label: bf ? `${name} - ${breakdownLabel(bv)}` : name,
-      action: { id: s.event ?? null, name, custom_name: s.custom_name ?? null, order, math, math_property: s.math_property ?? null },
+      action: { id: isAction ? Number(s.id) : s.event ?? null, type: isAction ? 'actions' : 'events', name, custom_name: s.custom_name ?? null, order, math, math_property: s.math_property ?? null },
       breakdown_value: bf ? bv : undefined,
       breakdown_label: bf ? breakdownLabel(bv) : undefined,
       data, labels: bks.map(b => b.label), days: bks.map(b => new Date(b.start).toISOString()),
@@ -165,27 +192,65 @@ async function trendSeries(en: Engine, q: any, s: EventsNode, order: number, bks
 const UNIT_MS: Record<string, number> = { second: 1000, minute: 60_000, hour: 3600_000, day: 86400_000, week: 7 * 86400_000, month: 31 * 86400_000 };
 export type FEv = { ts: number; m: number[]; bv: string; v?: number | null };
 
-/** Per-person step events for a funnel, merged across shards and distinct ids, in time order. */
-export async function funnelPeople(en: Engine, steps: EventsNode[], global: PropertyFilter[] | undefined, from: number, to: number, bf: any, value?: string | null): Promise<{ byPerson: Map<string, FEv[]>; P: ReturnType<typeof people> }> {
+/** Rows per batch of a streamed funnel (design.md "Streaming aggregation"). */
+export let FUNNEL_BATCH_ROWS = 100_000;
+export const setFunnelBatchRows = (n: number) => { FUNNEL_BATCH_ROWS = n; };
+/**
+ * Per-person step events for a funnel, merged across shards and distinct ids, in time order, delivered in batches of whole
+ * persons. Pass 1 counts matching events per distinct id in every shard; when the total exceeds the batch size, distinct
+ * ids are grouped by person and packed into batches (persons in key order), and pass 2 fetches each batch's rows with a
+ * distinct-id filter. Memory is bounded by the batch size plus one entry per distinct id, not by the event count.
+ */
+export async function funnelBatches(en: Engine, steps: EventsNode[], global: PropertyFilter[] | undefined, from: number, to: number, bf: any, value: string | null | undefined,
+  onBatch: (byPerson: Map<string, FEv[]>) => void | Promise<void>): Promise<void> {
   const personBd = bf && bf.breakdown_type === 'person';
-  const spec: FunnelSpec = { from, to, steps: steps.map(node), global, breakdown: bf && !personBd ? String(bf.breakdown) : null, value: value ?? null };
-  const rows = await concat((await en.shards(from, to)).map(sh => sh.funnel(spec)));
+  const spec: FunnelSpec = { from, to, steps: steps.map(x => nodeOf(en, x)), global, breakdown: bf && !personBd ? String(bf.breakdown) : null, value: value ?? null };
+  const shards = await en.shards(from, to);
   const gpf = personFilters(global); const spf = steps.map(s => personFilters(s.properties));
-  const P = people(en, rows.map(r => String(r[0])));
-  const byPerson = new Map<string, FEv[]>();
-  for (const r of rows) {
-    const did = String(r[0]);
-    if (!P.ok(did, gpf)) continue;
-    const mask = Number(r[2]);
-    const m = steps.map((_, k) => (mask & (2 ** k)) && P.ok(did, spf[k]) ? 1 : 0);
-    if (!m.some(Boolean)) continue;
-    const ref = P.get(did);
-    const bv = personBd ? (textOf(ref.props[String(bf.breakdown)]) ?? NONE) : String(r[3]);
-    let a = byPerson.get(ref.pk); if (!a) byPerson.set(ref.pk, a = []);
-    a.push({ ts: Number(r[1]), m, bv, v: r[4] === null || r[4] === undefined ? null : Number(r[4]) });
+  const run = async (dids: string[] | null) => {
+    const rows = await concat(shards.map(sh => sh.funnel(dids ? { ...spec, distinctIds: dids } : spec)));
+    const P = people(en, rows.map(r => String(r[0])));
+    const byPerson = new Map<string, FEv[]>();
+    for (const r of rows) {
+      const did = String(r[0]);
+      if (!P.ok(did, gpf)) continue;
+      const mask = Number(r[2]);
+      const m = steps.map((_, k) => (mask & (2 ** k)) && P.ok(did, spf[k]) ? 1 : 0);
+      if (!m.some(Boolean)) continue;
+      const ref = P.get(did);
+      const bv = personBd ? (textOf(ref.props[String(bf.breakdown)]) ?? NONE) : String(r[3]);
+      let a = byPerson.get(ref.pk); if (!a) byPerson.set(ref.pk, a = []);
+      a.push({ ts: Number(r[1]), m, bv, v: r[4] === null || r[4] === undefined ? null : Number(r[4]) });
+    }
+    for (const a of byPerson.values()) a.sort((x, y) => x.ts - y.ts);
+    const sorted = new Map([...byPerson].sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    await onBatch(sorted);
+  };
+  const counts = await concat(shards.map(sh => sh.funnelCounts(spec)));
+  const perDid = new Map<string, number>(); let total = 0;
+  for (const r of counts) { const d = String(r[0]), n = Number(r[1]); perDid.set(d, (perDid.get(d) ?? 0) + n); total += n; }
+  if (!total) return;
+  if (total <= FUNNEL_BATCH_ROWS) return run(null);
+  const byPk = new Map<string, { dids: string[]; n: number }>();
+  const all = [...perDid.keys()];
+  for (let i = 0; i < all.length; i += 5000) {
+    const chunk = all.slice(i, i + 5000); const m = en.resolve(chunk);
+    for (const d of chunk) { const pk = m.get(d)?.pk ?? 'd' + d; let e = byPk.get(pk); if (!e) byPk.set(pk, e = { dids: [], n: 0 }); e.dids.push(d); e.n += perDid.get(d)!; }
   }
-  for (const a of byPerson.values()) a.sort((x, y) => x.ts - y.ts);
-  return { byPerson, P };
+  perDid.clear();
+  let batch: string[] = [], n = 0;
+  for (const pk of [...byPk.keys()].sort()) {
+    const e = byPk.get(pk)!;
+    if (n && n + e.n > FUNNEL_BATCH_ROWS) { await run(batch); batch = []; n = 0; }
+    batch.push(...e.dids); n += e.n;
+  }
+  if (batch.length) await run(batch);
+}
+/** All persons' funnel events at once (small inputs and tests); prefer funnelBatches. */
+export async function funnelPeople(en: Engine, steps: EventsNode[], global: PropertyFilter[] | undefined, from: number, to: number, bf: any, value?: string | null): Promise<{ byPerson: Map<string, FEv[]> }> {
+  const byPerson = new Map<string, FEv[]>();
+  await funnelBatches(en, steps, global, from, to, bf, value, b => { for (const [k, v] of b) byPerson.set(k, v); });
+  return { byPerson };
 }
 
 /** Best path for one person's events (ordered as PostHog's funnel UDF, or unordered). */
@@ -215,19 +280,21 @@ async function funnels(en: Engine, q: any, qc: QueryContext) {
   const unordered = ff.funnelOrderType === 'unordered';
   const bf = q.breakdownFilter?.breakdown ? q.breakdownFilter : null;
   const n = steps.length;
-  const { byPerson } = await funnelPeople(en, steps, q.properties, range.from, range.to, bf);
   const perBreakdown = new Map<string, { counts: number[]; conv: number[][] }>();
-  for (const pk of [...byPerson.keys()].sort()) { // sorted so float sums do not depend on shard layout
-    const b = personFunnel(byPerson.get(pk)!, n, windowMs, unordered, range);
-    if (!b || b.reached <= 0) continue;
-    let agg = perBreakdown.get(b.bv); if (!agg) perBreakdown.set(b.bv, agg = { counts: new Array(n).fill(0), conv: Array.from({ length: n }, () => []) });
-    for (let k = 0; k < b.reached; k++) { agg.counts[k]++; if (k > 0) agg.conv[k].push((b.times[k] - b.times[k - 1]) / 1000); }
-  }
+  // Batches arrive in person-key order, so float sums do not depend on shard layout or batch size.
+  await funnelBatches(en, steps, q.properties, range.from, range.to, bf, null, byPerson => {
+    for (const [, evs] of byPerson) {
+      const b = personFunnel(evs, n, windowMs, unordered, range);
+      if (!b || b.reached <= 0) continue;
+      let agg = perBreakdown.get(b.bv); if (!agg) perBreakdown.set(b.bv, agg = { counts: new Array(n).fill(0), conv: Array.from({ length: n }, () => []) });
+      for (let k = 0; k < b.reached; k++) { agg.counts[k]++; if (k > 0) agg.conv[k].push((b.times[k] - b.times[k - 1]) / 1000); }
+    }
+  });
   const median = (a: number[]) => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); return percentile(s, 0.5); };
   const build = (bv: string) => {
     const agg = perBreakdown.get(bv) ?? { counts: new Array(n).fill(0), conv: Array.from({ length: n }, () => []) };
     return steps.map((s, k) => ({
-      action_id: s.event ?? null, name: unordered ? `Completed ${k + 1} step${k ? 's' : ''}` : s.event ?? 'All events', custom_name: s.custom_name ?? null, order: k,
+      action_id: s.kind === 'ActionsNode' ? Number(s.id) : s.event ?? null, name: unordered ? `Completed ${k + 1} step${k ? 's' : ''}` : seriesName(en, { ...s, custom_name: undefined }), custom_name: s.custom_name ?? null, order: k,
       count: agg.counts[k],
       average_conversion_time: k && agg.conv[k].length ? agg.conv[k].reduce((a, b) => a + b, 0) / agg.conv[k].length : null,
       median_conversion_time: k ? median(agg.conv[k]) : null,
@@ -277,12 +344,13 @@ async function retention(en: Engine, q: any, qc: QueryContext) {
   const bks = buckets({ from: first, to: last }, unit, tz).slice(0, total);
   const endMs = bks[bks.length - 1].end;
   validateFilters(rf.targetEntity?.properties); validateFilters(rf.returningEntity?.properties);
-  const target: EventsNode = { event: rf.targetEntity?.id ?? '$pageview', properties: rf.targetEntity?.properties };
-  const returning: EventsNode = { event: rf.returningEntity?.id ?? target.event, properties: rf.returningEntity?.properties };
+  const entity = (e: any, dflt: EventsNode): EventsNode => !e ? dflt : e.type === 'actions' ? { kind: 'ActionsNode', id: Number(e.id), properties: e.properties } : { event: e.id ?? dflt.event, properties: e.properties };
+  const target = entity(rf.targetEntity, { event: '$pageview' });
+  const returning = entity(rf.returningEntity, target);
   const shards = await en.shards(first, endMs - 1);
   const bspec = bks.map(b => [b.start, b.end] as [number, number]);
   const periods = async (n: EventsNode) => {
-    const rows = await concat(shards.map(sh => sh.periods({ buckets: bspec, node: node(n), global: q.properties })));
+    const rows = await concat(shards.map(sh => sh.periods({ buckets: bspec, node: nodeOf(en, n), global: q.properties })));
     const pf = [...personFilters(n.properties), ...personFilters(q.properties)];
     const P = people(en, rows.map(r => String(r[0])));
     const m = new Map<string, Set<number>>();
@@ -292,7 +360,7 @@ async function retention(en: Engine, q: any, qc: QueryContext) {
   const cohorts: Set<string>[] = bks.map(() => new Set());
   if (rf.retentionType === 'retention_first_time') {
     const all = await en.shards(-8.64e15, endMs - 1);
-    const rows = await concat(all.map(sh => sh.firsts({ node: node(target), global: q.properties, before: endMs })));
+    const rows = await concat(all.map(sh => sh.firsts({ node: nodeOf(en, target), global: q.properties, before: endMs })));
     const pf = [...personFilters(target.properties), ...personFilters(q.properties)];
     const P = people(en, rows.map(r => String(r[0])));
     const firsts = new Map<string, number>();
@@ -333,7 +401,7 @@ async function eventsQuery(en: Engine, q: any) {
   let more = false;
   for (let round = 0; round < 20; round++) {
     const want = limit - out.length + 1;
-    const spec: EventsSpec = { event: q.event || null, properties: q.properties, distinctIds, after: Number.isFinite(after) ? after : null, before: Number.isFinite(before) ? before : null, cursor, limit: want };
+    const spec: EventsSpec = { event: q.event || null, excludeEvents: q.event || q.includeHeatmapEvents ? null : ['$$heatmap'], properties: q.properties, distinctIds, after: Number.isFinite(after) ? after : null, before: Number.isFinite(before) ? before : null, cursor, limit: want };
     const rows = (await concat(shards.map(sh => sh.events(spec)))).sort((a, b) => b.timestamp - a.timestamp || (a.uuid < b.uuid ? 1 : a.uuid > b.uuid ? -1 : 0)).slice(0, want);
     const exhausted = rows.length < want;
     const P = pf.length ? people(en, rows.map(r => r.distinct_id)) : null;

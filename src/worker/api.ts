@@ -4,7 +4,8 @@ import { authenticate, createPersonalKey, login, logout, signup, signupOpen } fr
 import { randomToken } from '../shared/ids';
 import { forgetToken } from './projects';
 import { QueryError } from './query';
-import { chunkPrefix, deletePrefix, readSnapshots } from './replay';
+import { chunkPrefix, deletePrefix, readSnapshots, readSnapshotsPage, cleanReplayConfig, ReplayConfigError } from './replay';
+import { handleLocalEvaluation } from './sdk';
 
 const readJson = async (req: Request) => { try { return await req.json() as any; } catch { throw new HttpError(400, 'bad_request', 'Body must be JSON.'); } };
 const validTz = (tz: string) => { try { new Intl.DateTimeFormat('en', { timeZone: tz }); return true; } catch { return false; } };
@@ -61,7 +62,10 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
       const anon = b.anonymize_ips !== undefined ? (b.anonymize_ips ? 1 : 0) : project.anonymize_ips;
       const ac = b.autocapture_opt_out !== undefined ? (b.autocapture_opt_out ? 1 : 0) : project.autocapture_opt_out;
       const rec = b.session_recording !== undefined ? (b.session_recording ? 1 : 0) : (project.session_recording ?? 0);
-      const r = await env.DB.prepare('UPDATE projects SET name = ?, timezone = ?, retention_days = ?, anonymize_ips = ?, autocapture_opt_out = ?, session_recording = ? WHERE id = ? RETURNING *').bind(name, tz, ret, anon, ac, rec, pid).first<ProjectRow>();
+      const hm = b.heatmaps !== undefined ? (b.heatmaps ? 1 : 0) : (project.heatmaps ?? 0);
+      let rc = project.replay_config ?? null;
+      if (b.replay_config !== undefined) { try { rc = b.replay_config === null ? null : JSON.stringify(cleanReplayConfig(b.replay_config)); } catch (e) { if (e instanceof ReplayConfigError) throw new HttpError(400, 'bad_request', e.message); throw e; } }
+      const r = await env.DB.prepare('UPDATE projects SET name = ?, timezone = ?, retention_days = ?, anonymize_ips = ?, autocapture_opt_out = ?, session_recording = ?, heatmaps = ?, replay_config = ? WHERE id = ? RETURNING *').bind(name, tz, ret, anon, ac, rec, hm, rc, pid).first<ProjectRow>();
       forgetToken(project.api_token);
       return json(projectOut(r!));
     }
@@ -73,11 +77,21 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
     const r = await env.DB.prepare('UPDATE projects SET api_token = ? WHERE id = ? RETURNING *').bind(randomToken('phc_', 43), pid).first<ProjectRow>();
     forgetToken(project.api_token); return json(projectOut(r!));
   }
+  const asQueryError = (e: unknown): never => { const msg = e instanceof Error ? e.message : String(e); if (e instanceof QueryError || /unsupported|needs|must|at least|at most|unknown|bad |not supported|not allowed|expected|unexpected|timed out|too many|too long|cannot/.test(msg)) throw new HttpError(400, 'invalid_query', msg); throw e; };
   if (sub === '/query' && m === 'POST') {
     const b = await readJson(req);
-    try { return json(await store.query(b.query ?? b, qc)); }
-    catch (e) { const msg = e instanceof Error ? e.message : String(e); if (e instanceof QueryError || /unsupported|needs|must|at least|at most|unknown|bad /.test(msg)) throw new HttpError(400, 'invalid_query', msg); throw e; }
+    try { return json(await store.query(b.query ?? b, qc)); } catch (e) { return asQueryError(e); }
   }
+  // SQL editor (design.md "SQL"): read-only SELECT over events and persons.
+  if (sub === '/sql' && m === 'POST') {
+    const b = await readJson(req); if (typeof b.query !== 'string' || !b.query.trim()) throw new HttpError(400, 'bad_request', 'query (a SELECT statement) is required.');
+    try { return json(await store.sqlQuery(b.query, qc)); } catch (e) { return asQueryError(e); }
+  }
+  if ((sub === '/heatmaps' || sub === '/heatmaps/urls' || sub === '/scroll_depth') && m === 'GET') {
+    const q = Object.fromEntries(url.searchParams);
+    try { return json(sub === '/heatmaps' ? await store.heatmap(q) : sub === '/heatmaps/urls' ? await store.heatmapUrls(q) : await store.scrollDepth(q)); } catch (e) { return asQueryError(e); }
+  }
+  if (sub === '/feature_flags/local_evaluation') return handleLocalEvaluation(req, env, url, project);
   if (sub === '/events' && m === 'GET') {
     const props = url.searchParams.get('properties');
     return json(await store.query({ kind: 'EventsQuery', event: url.searchParams.get('event') || undefined, personId: url.searchParams.get('person_id') || undefined, cursor: url.searchParams.get('cursor') || undefined, limit: Number(url.searchParams.get('limit')) || 100, properties: props ? JSON.parse(props) : [] }, qc));
@@ -119,8 +133,35 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
   if (s && m === 'POST') { const b = await readJson(req); if (!await store.addTile(+s[1], Number(b.insight_id))) throw new HttpError(404, 'not_found'); return json({ ok: true }, 201); }
   s = /^\/dashboards\/(\d+)\/tiles\/(\d+)$/.exec(sub);
   if (s && m === 'DELETE') { if (!await store.removeTile(+s[1], +s[2])) throw new HttpError(404, 'not_found'); return json({ ok: true }); }
+  if (sub === '/actions') {
+    if (m === 'GET') return json(await store.listActions());
+    if (m === 'POST') { const r = await store.saveAction(null, await readJson(req)); if ('error' in r) throw new HttpError(400, 'bad_request', r.error); return json(r, 201); }
+  }
+  s = /^\/actions\/(\d+)$/.exec(sub);
+  if (s) {
+    if (m === 'GET') { const a = await store.getAction(+s[1]); if (!a) throw new HttpError(404, 'not_found'); return json(a); }
+    if (m === 'PATCH') { const r = await store.saveAction(+s[1], await readJson(req)); if ('error' in r) throw new HttpError(r.error === 'not_found' ? 404 : 400, r.error === 'not_found' ? 'not_found' : 'bad_request', r.error); return json(r); }
+    if (m === 'DELETE') { if (!await store.deleteAction(+s[1])) throw new HttpError(404, 'not_found'); return json({ ok: true }); }
+  }
+  if (sub === '/cohorts') {
+    if (m === 'GET') return json(await store.listCohorts());
+    if (m === 'POST') { const r = await store.saveCohort(null, await readCohortBody(req)); if ('error' in r) throw new HttpError(400, 'bad_request', r.error); return json(r, 201); }
+  }
+  s = /^\/cohorts\/(\d+)(\/persons|\/calculate)?(?:\/([^/]+))?$/.exec(sub);
+  if (s) {
+    const id = +s[1];
+    if (!s[2]) {
+      if (m === 'GET') { const c = await store.getCohort(id); if (!c) throw new HttpError(404, 'not_found'); return json(c); }
+      if (m === 'PATCH') { const r = await store.saveCohort(id, await readCohortBody(req)); if ('error' in r) throw new HttpError(r.error === 'not_found' ? 404 : 400, r.error === 'not_found' ? 'not_found' : 'bad_request', r.error); return json(r); }
+      if (m === 'DELETE') { if (!await store.deleteCohort(id)) throw new HttpError(404, 'not_found'); return json({ ok: true }); }
+    }
+    if (s[2] === '/calculate' && m === 'POST') { if (!await store.getCohort(id)) throw new HttpError(404, 'not_found'); try { await store.calculateCohort(id); } catch (e) { return asQueryError(e); } return json(await store.getCohort(id)); }
+    if (s[2] === '/persons' && !s[3] && m === 'GET') { if (!await store.getCohort(id)) throw new HttpError(404, 'not_found'); return json(await store.cohortPersons(id, url.searchParams.get('cursor') ? Number(url.searchParams.get('cursor')) : null)); }
+    if (s[2] === '/persons' && !s[3] && m === 'POST') { const r = await store.addCohortPersons(id, await readCohortBody(req)); if ('error' in r) throw new HttpError(r.error === 'not_found' ? 404 : 400, r.error === 'not_found' ? 'not_found' : 'bad_request', r.error as string); return json(r); }
+    if (s[2] === '/persons' && s[3] && m === 'DELETE') { if (!await store.removeCohortPerson(id, decodeURIComponent(s[3]))) throw new HttpError(404, 'not_found'); return json({ ok: true }); }
+  }
   if (sub === '/feature_flags') {
-    if (m === 'GET') return json(await store.listFlags());
+    if (m === 'GET') return json(await store.listFlags(url.searchParams.get('include_internal') === '1'));
     if (m === 'POST') { const r = await store.saveFlag(null, await readJson(req)); if ('error' in r) throw new HttpError(400, 'bad_request', r.error); return json(r, 201); }
   }
   s = /^\/feature_flags\/(\d+)$/.exec(sub);
@@ -146,7 +187,7 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
   }
   s = /^\/surveys\/([\w-]+)(\/results)?$/.exec(sub);
   if (s) {
-    if (s[2] && m === 'GET') { const r = await store.surveyResults(s[1]); if (!r) throw new HttpError(404, 'not_found'); return json(r); }
+    if (s[2] && m === 'GET') { const it = Number(url.searchParams.get('iteration')); const r = await store.surveyResults(s[1], Number.isInteger(it) && it > 0 ? it : null); if (!r) throw new HttpError(404, 'not_found'); return json(r); }
     if (!s[2] && m === 'GET') { const e = await store.getSurvey(s[1]); if (!e) throw new HttpError(404, 'not_found'); return json(e); }
     if (!s[2] && m === 'PATCH') { const r = await store.saveSurvey(s[1], await readJson(req)); if ('error' in r) throw new HttpError(r.error === 'not_found' ? 404 : 400, r.error === 'not_found' ? 'not_found' : 'bad_request', r.error); return json(r); }
     if (!s[2] && m === 'DELETE') { if (!await store.deleteSurvey(s[1])) throw new HttpError(404, 'not_found'); return json({ ok: true }); }
@@ -158,12 +199,25 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
   s = /^\/session_recordings\/([^/]+)(\/snapshots)?$/.exec(sub);
   if (s) {
     const sid = decodeURIComponent(s[1]);
-    if (s[2] && m === 'GET') { const r = await store.getRecording(sid); if (!r) throw new HttpError(404, 'not_found'); return json({ snapshots: await readSnapshots(env, pid, sid) }); }
+    if (s[2] && m === 'GET') {
+      const r = await store.getRecording(sid); if (!r) throw new HttpError(404, 'not_found');
+      // Paged (?cursor= or ?paged=1): about 16 MB of events per page, with `next` for the following page.
+      if (url.searchParams.has('cursor') || url.searchParams.get('paged') === '1') return json(await readSnapshotsPage(env, pid, sid, url.searchParams.get('cursor') || null));
+      return json({ snapshots: await readSnapshots(env, pid, sid) });
+    }
     if (!s[2] && m === 'GET') { const r = await store.getRecording(sid); if (!r) throw new HttpError(404, 'not_found'); return json(r); }
     if (!s[2] && m === 'DELETE') { if (!await store.deleteRecording(sid)) throw new HttpError(404, 'not_found'); await deletePrefix(env, chunkPrefix(pid, sid)); return json({ ok: true }); }
   }
   throw new HttpError(404, 'not_found');
 }
 function projectOut(p: ProjectRow) {
-  return { id: p.id, name: p.name, api_token: p.api_token, timezone: p.timezone, retention_days: p.retention_days, anonymize_ips: !!p.anonymize_ips, autocapture_opt_out: !!p.autocapture_opt_out, session_recording: !!p.session_recording, created_at: p.created_at };
+  let rc: unknown = null; try { rc = p.replay_config ? JSON.parse(p.replay_config) : null; } catch { rc = null; }
+  return { id: p.id, name: p.name, api_token: p.api_token, timezone: p.timezone, retention_days: p.retention_days, anonymize_ips: !!p.anonymize_ips, autocapture_opt_out: !!p.autocapture_opt_out,
+    session_recording: !!p.session_recording, replay_config: rc, heatmaps: !!p.heatmaps, created_at: p.created_at };
+}
+/** Cohort bodies are JSON, or a CSV upload (text/csv) of distinct ids or emails for a static cohort. */
+async function readCohortBody(req: Request) {
+  const ct = req.headers.get('content-type') ?? '';
+  if (ct.includes('text/csv') || ct.includes('text/plain')) { const t = await req.text(); if (t.length > 20_000_000) throw new HttpError(413, 'payload_too_large', 'CSV over 20 MB.'); return { csv: t }; }
+  return readJson(req);
 }
