@@ -1,106 +1,85 @@
-// Insight queries run inside a ProjectStore (design.md "Queries"). All SQL is SQLite, all times are ms UTC.
+// Insight queries (design.md "Queries"), run by the head ProjectStore as a two-phase plan: every event shard whose period
+// overlaps the range runs event-level SQL (eventsql.ts) and returns rows keyed by distinct_id; the head maps distinct ids to
+// persons, applies person filters and person breakdowns, and aggregates. Results are exact. All times are ms UTC.
 import { buckets, resolveRange, startOf, addInterval, label as bucketLabel, Interval } from '../shared/dates';
+import { NONE, QueryError, PropertyFilter, NodeSpec, TrendSpec, FunnelSpec, PeriodSpec, EventsSpec, EventRow, isPersonFilter, matchPerson, textOf, validateFilters } from './eventsql';
+export { QueryError } from './eventsql';
+export type { PropertyFilter } from './eventsql';
 
 export type QueryContext = { timezone: string; now?: number };
-export type PropertyFilter = { key: string; value?: unknown; operator?: string; type?: 'event' | 'person' };
 export type EventsNode = { kind?: 'EventsNode'; event?: string | null; name?: string; custom_name?: string; math?: string; math_property?: string; math_group_type_index?: number; properties?: PropertyFilter[] };
-export class QueryError extends Error { constructor(msg: string) { super(msg); } }
+export interface ShardApi {
+  trend(s: TrendSpec): Promise<unknown[][]>;
+  funnel(s: FunnelSpec): Promise<unknown[][]>;
+  periods(s: PeriodSpec): Promise<unknown[][]>;
+  firsts(s: { node: NodeSpec; global?: PropertyFilter[]; before: number }): Promise<unknown[][]>;
+  events(s: EventsSpec): Promise<EventRow[]>;
+}
+export type PersonRef = { pk: string; uuid: string | null; props: Record<string, unknown> };
+export interface Engine {
+  /** Shards whose period overlaps [from, to], oldest first. */
+  shards(from: number, to: number): Promise<ShardApi[]>;
+  resolve(dids: string[]): Map<string, PersonRef>;
+  groupTypeName(idx: number): string | null;
+  firstEventAt(): Promise<number | null>;
+  distinctIdsOfPerson(uuid: string): string[];
+}
 
-const PERSON_KEY = `COALESCE('p' || d.person_id, 'd' || e.distinct_id)`;
-const JOINS = `LEFT JOIN person_distinct_ids d ON d.distinct_id = e.distinct_id LEFT JOIN persons p ON p.id = d.person_id`;
-const NONE = '$$_none_$$', OTHER = '$$_other_$$';
+const OTHER = '$$_other_$$';
 const AGG_DISPLAYS = new Set(['BoldNumber', 'ActionsTable', 'ActionsPie', 'ActionsBarValue']);
 const MATHS = new Set(['total', 'dau', 'unique_session', 'unique_group', 'sum', 'avg', 'min', 'max', 'median', 'p75', 'p90', 'p95', 'p99']);
-
-type Sql = { sql: string; params: SqlStorageValue[] };
-const pathOf = (key: string) => { if (typeof key !== 'string' || !key || key.length > 400) throw new QueryError('bad property key'); return '$.' + JSON.stringify(key); };
-const col = (type: string | undefined) => type === 'person' ? 'p.properties' : 'e.properties';
-/** Text form of a JSON property: booleans as true/false, numbers as SQLite prints them, null when missing. */
-function textExpr(src: string, key: string): Sql {
-  const p = pathOf(key);
-  return { sql: `(CASE json_type(${src}, ?) WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' WHEN 'null' THEN NULL WHEN 'object' THEN json_extract(${src}, ?) WHEN 'array' THEN json_extract(${src}, ?) ELSE CAST(json_extract(${src}, ?) AS TEXT) END)`, params: [p, p, p, p] };
-}
-function propertySql(f: PropertyFilter): Sql {
-  const src = col(f.type); const t = textExpr(src, f.key); const op = f.operator ?? 'exact';
-  const vals = (Array.isArray(f.value) ? f.value : [f.value]).filter(v => v !== undefined && v !== null).map(v => typeof v === 'string' ? v : JSON.stringify(v));
-  const inList = `(SELECT value FROM json_each(?))`;
-  switch (op) {
-    case 'exact': return { sql: `${t.sql} IN ${inList}`, params: [...t.params, JSON.stringify(vals)] };
-    case 'is_not': return { sql: `(${t.sql} IS NULL OR ${t.sql} NOT IN ${inList})`, params: [...t.params, ...t.params, JSON.stringify(vals)] };
-    case 'icontains': return { sql: `instr(lower(${t.sql}), lower(?)) > 0`, params: [...t.params, String(vals[0] ?? '')] };
-    case 'not_icontains': return { sql: `(${t.sql} IS NULL OR instr(lower(${t.sql}), lower(?)) = 0)`, params: [...t.params, ...t.params, String(vals[0] ?? '')] };
-    case 'gt': case 'gte': case 'lt': case 'lte': {
-      const sym = { gt: '>', gte: '>=', lt: '<', lte: '<=' }[op];
-      return { sql: `CAST(json_extract(${src}, ?) AS REAL) ${sym} ?`, params: [pathOf(f.key), Number(vals[0])] };
-    }
-    case 'is_set': return { sql: `json_type(${src}, ?) IS NOT NULL AND json_type(${src}, ?) != 'null'`, params: [pathOf(f.key), pathOf(f.key)] };
-    case 'is_not_set': return { sql: `(json_type(${src}, ?) IS NULL OR json_type(${src}, ?) = 'null')`, params: [pathOf(f.key), pathOf(f.key)] };
-    case 'is_date_before': case 'is_date_after': {
-      const t2 = Date.parse(String(vals[0])); if (!Number.isFinite(t2)) throw new QueryError('bad date value');
-      return { sql: `julianday(json_extract(${src}, ?)) ${op === 'is_date_before' ? '<' : '>'} julianday(?)`, params: [pathOf(f.key), new Date(t2).toISOString()] };
-    }
-    default: throw new QueryError(`unsupported operator ${op}`);
-  }
-}
-function filtersSql(fs: PropertyFilter[] | undefined): Sql {
-  const parts = (fs ?? []).filter(f => f && f.key).map(propertySql);
-  if (!parts.length) return { sql: '1', params: [] };
-  return { sql: parts.map(p => `(${p.sql})`).join(' AND '), params: parts.flatMap(p => p.params) };
-}
-function nodeSql(n: EventsNode): Sql {
-  const f = filtersSql(n.properties);
-  if (n.event === null || n.event === undefined || n.event === '') return f;
-  return { sql: `e.event = ? AND ${f.sql}`, params: [n.event, ...f.params] };
-}
-const and = (...s: Sql[]): Sql => ({ sql: s.map(x => `(${x.sql})`).join(' AND '), params: s.flatMap(x => x.params) });
-function breakdownExpr(bf: any): Sql | null {
-  if (!bf?.breakdown) return null;
-  const t = textExpr(col(bf.breakdown_type === 'person' ? 'person' : 'event'), String(bf.breakdown));
-  return { sql: `COALESCE(${t.sql}, '${NONE}')`, params: t.params };
-}
-const bucketCte = (bs: { start: number; end: number }[]): Sql => ({ sql: `b(i, s, en) AS (SELECT CAST(key AS INTEGER), json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?))`, params: [JSON.stringify(bs.map(b => [b.start, b.end]))] });
+const PCT: Record<string, number> = { median: 0.5, p75: 0.75, p90: 0.9, p95: 0.95, p99: 0.99 };
 const breakdownLabel = (v: string) => v === NONE ? 'None' : v === OTHER ? 'Other' : v;
+const personFilters = (fs: PropertyFilter[] | undefined) => (fs ?? []).filter(f => f && f.key && isPersonFilter(f));
+const node = (n: EventsNode): NodeSpec => ({ event: n.event ?? null, properties: n.properties });
+const concat = async <T>(ps: Promise<T[]>[]) => (await Promise.all(ps)).flat();
 
-function percentile(sorted: number[], q: number) {
+export function percentile(sorted: number[], q: number) {
   if (!sorted.length) return 0;
   const pos = (sorted.length - 1) * q, lo = Math.floor(pos), hi = Math.ceil(pos);
   return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
 }
 
-export function runQuery(sql: SqlStorage, q: any, qc: QueryContext): unknown {
+/** Person lookup for a set of rows, plus a predicate for person filters. */
+function people(en: Engine, dids: Iterable<string>) {
+  const m = en.resolve([...new Set(dids)]);
+  const get = (d: string): PersonRef => m.get(d) ?? { pk: 'd' + d, uuid: null, props: {} };
+  return { get, ok: (d: string, fs: PropertyFilter[]) => !fs.length || fs.every(f => matchPerson(f, get(d).props)) };
+}
+
+export async function runQuery(en: Engine, q: any, qc: QueryContext): Promise<unknown> {
   if (!q || typeof q !== 'object') throw new QueryError('query must be an object');
+  validateFilters(q.properties);
+  for (const s of Array.isArray(q.series) ? q.series : []) validateFilters(s?.properties);
   switch (q.kind) {
-    case 'TrendsQuery': return trends(sql, q, qc);
-    case 'FunnelsQuery': return funnels(sql, q, qc);
-    case 'RetentionQuery': return retention(sql, q, qc);
-    case 'EventsQuery': return eventsQuery(sql, q);
+    case 'TrendsQuery': return trends(en, q, qc);
+    case 'FunnelsQuery': return funnels(en, q, qc);
+    case 'RetentionQuery': return retention(en, q, qc);
+    case 'EventsQuery': return eventsQuery(en, q);
     default: throw new QueryError(`unsupported query kind ${q.kind}`);
   }
 }
 
-function firstEvent(sql: SqlStorage): number | null { return (sql.exec('SELECT MIN(timestamp) AS m FROM events').one().m as number | null) ?? null; }
-
 // ---------------- Trends ----------------
-function trends(sql: SqlStorage, q: any, qc: QueryContext) {
+async function trends(en: Engine, q: any, qc: QueryContext) {
   const tz = qc.timezone, now = qc.now ?? Date.now();
   const series: EventsNode[] = Array.isArray(q.series) && q.series.length ? q.series : [{ event: '$pageview' }];
   if (series.length > 20) throw new QueryError('at most 20 series');
   const interval: Interval = ['hour', 'day', 'week', 'month'].includes(q.interval) ? q.interval : 'day';
-  const range = resolveRange(q.dateRange?.date_from, q.dateRange?.date_to, tz, now, q.dateRange?.date_from === 'all' ? firstEvent(sql) : null);
+  const range = resolveRange(q.dateRange?.date_from, q.dateRange?.date_to, tz, now, q.dateRange?.date_from === 'all' ? await en.firstEventAt() : null);
   const display = q.trendsFilter?.display ?? 'ActionsLineGraph';
   const aggregated = AGG_DISPLAYS.has(display);
-  const run = (r: { from: number; to: number }, compareLabel?: string) => {
+  const run = async (r: { from: number; to: number }, compareLabel?: string) => {
     const bks = aggregated ? [{ start: r.from, end: r.to + 1, label: `${bucketLabel(r.from, 'day', tz)} - ${bucketLabel(r.to, 'day', tz)}` }] : buckets(r, interval, tz);
     if (bks.length > 2000) throw new QueryError('too many intervals; pick a larger interval');
     const out: any[] = [];
-    series.forEach((s, i) => out.push(...trendSeries(sql, q, s, i, bks, r, aggregated, compareLabel)));
+    for (let i = 0; i < series.length; i++) out.push(...await trendSeries(en, q, series[i], i, bks, r, aggregated, compareLabel));
     return out;
   };
-  let results = run(range, q.compareFilter?.compare ? 'current' : undefined);
+  let results = await run(range, q.compareFilter?.compare ? 'current' : undefined);
   if (q.compareFilter?.compare) {
     const len = range.to - range.from;
-    const prev = { from: range.from - len - 1, to: range.from - 1 };
-    const pres = run(prev, 'previous');
+    const pres = await run({ from: range.from - len - 1, to: range.from - 1 }, 'previous');
     // Previous-period series use the current period's labels, aligned by index.
     for (const p of pres) { const cur = results.find(r => r.action.order === p.action.order && r.breakdown_value === p.breakdown_value); if (cur) { p.labels = cur.labels; p.days = cur.days; } }
     results = [...results, ...pres];
@@ -108,56 +87,61 @@ function trends(sql: SqlStorage, q: any, qc: QueryContext) {
   return { kind: 'TrendsQuery', results, timezone: tz, interval, date_from: new Date(range.from).toISOString(), date_to: new Date(range.to).toISOString() };
 }
 
-function trendSeries(sql: SqlStorage, q: any, s: EventsNode, order: number, bks: { start: number; end: number; label: string }[], range: { from: number; to: number }, aggregated: boolean, compareLabel?: string) {
+async function trendSeries(en: Engine, q: any, s: EventsNode, order: number, bks: { start: number; end: number; label: string }[], range: { from: number; to: number }, aggregated: boolean, compareLabel?: string) {
   const math = s.math ?? 'total';
   if (!MATHS.has(math)) throw new QueryError(`unsupported math ${math}`);
-  const where = and(nodeSql(s), filtersSql(q.properties));
-  const bd = breakdownExpr(q.breakdownFilter);
-  let bdSql: Sql = { sql: `'${NONE}'`, params: [] };
+  const numeric = ['sum', 'avg', 'min', 'max', 'median', 'p75', 'p90', 'p95', 'p99'].includes(math);
+  if (numeric && !s.math_property) throw new QueryError(`math ${math} needs math_property`);
+  let extra: TrendSpec['extra'] = null;
+  if (math === 'unique_session') extra = 'session';
+  if (math === 'unique_group') { const g = en.groupTypeName(Number(s.math_group_type_index ?? 0)); if (!g) throw new QueryError('unknown group type'); extra = { group: g }; }
+  const bf = q.breakdownFilter?.breakdown ? q.breakdownFilter : null;
+  const personBd = bf && bf.breakdown_type === 'person';
+  // Breakdown values are computed per row: clip the buckets to the range so the top-N count matches the old single-store SQL.
+  const spec: TrendSpec = { buckets: bks.map(b => [b.start, b.end]), node: node(s), global: q.properties, breakdown: bf && !personBd ? String(bf.breakdown) : null,
+    numKey: s.math_property ?? null, extra, values: !!PCT[math] };
+  const shards = await en.shards(bks[0].start, bks[bks.length - 1].end - 1);
+  const rows = await concat(shards.map(sh => sh.trend(spec)));
+  const pf = [...personFilters(s.properties), ...personFilters(q.properties)];
+  const needPeople = pf.length || personBd || math === 'dau';
+  const P = needPeople ? people(en, rows.map(r => String(r[1]))) : null;
+  type R = { bi: number; did: string; bv: string; c: number; sum: number; min: number | null; max: number | null; n: number; ex: unknown };
+  let rs: R[] = [];
+  for (const r of rows) {
+    const did = String(r[1]);
+    if (P && !P.ok(did, pf)) continue;
+    const bv = personBd ? (textOf(P!.get(did).props[String(bf.breakdown)]) ?? NONE) : String(r[2]);
+    if (spec.values) rs.push({ bi: Number(r[0]), did, bv, c: 1, sum: Number(r[3]), min: null, max: null, n: 1, ex: null });
+    else rs.push({ bi: Number(r[0]), did, bv, c: Number(r[3]), sum: Number(r[4] ?? 0), min: r[5] == null ? null : Number(r[5]), max: r[6] == null ? null : Number(r[6]), n: Number(r[7]), ex: r[8] });
+  }
+  // Only events inside [from, to] count towards the top breakdown values.
   let breakdownValues: string[] | null = null;
-  if (bd) {
-    const limit = Math.min(Math.max(Number(q.breakdownFilter.breakdown_limit) || 25, 1), 100);
-    const top = sql.exec(`SELECT ${bd.sql} AS bv, COUNT(*) AS c FROM events e ${JOINS} WHERE e.timestamp >= ? AND e.timestamp <= ? AND ${where.sql} GROUP BY bv ORDER BY c DESC LIMIT ?`,
-      ...bd.params, range.from, range.to, ...where.params, limit + 1).toArray().map(r => String(r.bv));
+  if (bf) {
+    const limit = Math.min(Math.max(Number(bf.breakdown_limit) || 25, 1), 100);
+    const tally = new Map<string, number>();
+    for (const r of rs) tally.set(r.bv, (tally.get(r.bv) ?? 0) + r.c);
+    const top = [...tally].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).map(e => e[0]);
     breakdownValues = top.slice(0, limit);
-    const hasOther = top.length > limit;
-    bdSql = hasOther ? { sql: `(CASE WHEN ${bd.sql} IN (SELECT value FROM json_each(?)) THEN ${bd.sql} ELSE '${OTHER}' END)`, params: [...bd.params, JSON.stringify(breakdownValues), ...bd.params] } : bd;
-    if (hasOther) breakdownValues.push(OTHER);
+    if (top.length > limit) { const keep = new Set(breakdownValues); rs = rs.map(r => keep.has(r.bv) ? r : { ...r, bv: OTHER }); breakdownValues.push(OTHER); }
   }
-  const prop = s.math_property ? textExpr('e.properties', s.math_property) : null;
-  const numExpr = s.math_property ? { sql: `CAST(json_extract(e.properties, ?) AS REAL)`, params: [pathOf(s.math_property)] } : null;
-  if (['sum', 'avg', 'min', 'max', 'median', 'p75', 'p90', 'p95', 'p99'].includes(math) && !numExpr) throw new QueryError(`math ${math} needs math_property`);
-  let agg: Sql;
-  const groupType = (): string => {
-    const gt = sql.exec('SELECT name FROM group_types WHERE idx = ?', Number(s.math_group_type_index ?? 0)).toArray()[0]?.name as string | undefined;
-    if (!gt) throw new QueryError('unknown group type'); return gt;
-  };
-  switch (math) {
-    case 'total': agg = { sql: 'COUNT(*)', params: [] }; break;
-    case 'dau': agg = { sql: `COUNT(DISTINCT ${PERSON_KEY})`, params: [] }; break;
-    case 'unique_session': agg = { sql: `COUNT(DISTINCT json_extract(e.properties, '$."$session_id"'))`, params: [] }; break;
-    case 'unique_group': agg = { sql: `COUNT(DISTINCT json_extract(e.properties, ?))`, params: ['$."$groups".' + JSON.stringify(groupType())] }; break;
-    case 'sum': agg = { sql: `COALESCE(SUM(${numExpr!.sql}), 0)`, params: numExpr!.params }; break;
-    case 'avg': agg = { sql: `COALESCE(AVG(${numExpr!.sql}), 0)`, params: numExpr!.params }; break;
-    case 'min': agg = { sql: `COALESCE(MIN(${numExpr!.sql}), 0)`, params: numExpr!.params }; break;
-    case 'max': agg = { sql: `COALESCE(MAX(${numExpr!.sql}), 0)`, params: numExpr!.params }; break;
-    default: agg = { sql: 'NULL', params: [] };
-  }
-  void prop;
-  const cte = bucketCte(bks);
+  const cells = new Map<string, R[]>();
+  for (const r of rs) { const k = `${r.bi}\u0000${r.bv}`; let a = cells.get(k); if (!a) cells.set(k, a = []); a.push(r); }
   const values = new Map<string, number[]>();
   const ensure = (bv: string) => { let a = values.get(bv); if (!a) { a = new Array(bks.length).fill(0); values.set(bv, a); } return a; };
-  if (['median', 'p75', 'p90', 'p95', 'p99'].includes(math)) {
-    const qv = { median: 0.5, p75: 0.75, p90: 0.9, p95: 0.95, p99: 0.99 }[math as 'median']!;
-    const groups = new Map<string, number[]>();
-    for (const r of sql.exec(`WITH ${cte.sql} SELECT b.i AS bi, ${bdSql.sql} AS bv, ${numExpr!.sql} AS v FROM b JOIN events e ON e.timestamp >= b.s AND e.timestamp < b.en ${JOINS} WHERE ${where.sql} AND ${numExpr!.sql} IS NOT NULL`,
-      ...cte.params, ...bdSql.params, ...numExpr!.params, ...where.params, ...numExpr!.params)) {
-      const k = `${r.bi}\u0000${r.bv}`; let a = groups.get(k); if (!a) groups.set(k, a = []); a.push(Number(r.v));
+  for (const [k, a] of cells) {
+    const [bi, bv] = k.split('\u0000');
+    let v = 0;
+    switch (math) {
+      case 'total': v = a.reduce((x, r) => x + r.c, 0); break;
+      case 'dau': v = new Set(a.map(r => P!.get(r.did).pk)).size; break;
+      case 'unique_session': case 'unique_group': v = new Set(a.filter(r => r.ex !== null && r.ex !== undefined).map(r => String(r.ex))).size; break;
+      case 'sum': v = a.reduce((x, r) => x + r.sum, 0); break;
+      case 'avg': { const n = a.reduce((x, r) => x + r.n, 0); v = n ? a.reduce((x, r) => x + r.sum, 0) / n : 0; break; }
+      case 'min': { const m = a.filter(r => r.min !== null).map(r => r.min!); v = m.length ? Math.min(...m) : 0; break; }
+      case 'max': { const m = a.filter(r => r.max !== null).map(r => r.max!); v = m.length ? Math.max(...m) : 0; break; }
+      default: { const s2 = a.map(r => r.sum).sort((x, y) => x - y); v = percentile(s2, PCT[math]); }
     }
-    for (const [k, a] of groups) { const [bi, bv] = k.split('\u0000'); a.sort((x, y) => x - y); ensure(bv)[Number(bi)] = percentile(a, qv); }
-  } else {
-    for (const r of sql.exec(`WITH ${cte.sql} SELECT b.i AS bi, ${bdSql.sql} AS bv, ${agg.sql} AS v FROM b JOIN events e ON e.timestamp >= b.s AND e.timestamp < b.en ${JOINS} WHERE ${where.sql} GROUP BY bi, bv`,
-      ...cte.params, ...bdSql.params, ...agg.params, ...where.params)) ensure(String(r.bv))[Number(r.bi)] = Number(r.v) || 0;
+    ensure(bv)[Number(bi)] = v;
   }
   const keys = breakdownValues ?? [NONE];
   const name = s.custom_name || s.name || s.event || 'All events';
@@ -165,72 +149,80 @@ function trendSeries(sql: SqlStorage, q: any, s: EventsNode, order: number, bks:
     const data = values.get(bv) ?? new Array(bks.length).fill(0);
     const count = data.reduce((a, b) => a + b, 0);
     return {
-      label: bd ? `${name} - ${breakdownLabel(bv)}` : name,
+      label: bf ? `${name} - ${breakdownLabel(bv)}` : name,
       action: { id: s.event ?? null, name, custom_name: s.custom_name ?? null, order, math, math_property: s.math_property ?? null },
-      breakdown_value: bd ? bv : undefined,
-      breakdown_label: bd ? breakdownLabel(bv) : undefined,
+      breakdown_value: bf ? bv : undefined,
+      breakdown_label: bf ? breakdownLabel(bv) : undefined,
       data, labels: bks.map(b => b.label), days: bks.map(b => new Date(b.start).toISOString()),
       count: Math.round(count * 1000) / 1000,
       aggregated_value: aggregated ? data[0] : undefined,
       compare_label: compareLabel,
     };
-  }).filter(r => !bd || r.count > 0 || keys.length === 1);
+  }).filter(r => !bf || r.count > 0 || keys.length === 1);
 }
 
 // ---------------- Funnels ----------------
 const UNIT_MS: Record<string, number> = { second: 1000, minute: 60_000, hour: 3600_000, day: 86400_000, week: 7 * 86400_000, month: 31 * 86400_000 };
+export type FEv = { ts: number; m: number[]; bv: string; v?: number | null };
 
-function funnels(sql: SqlStorage, q: any, qc: QueryContext) {
+/** Per-person step events for a funnel, merged across shards and distinct ids, in time order. */
+export async function funnelPeople(en: Engine, steps: EventsNode[], global: PropertyFilter[] | undefined, from: number, to: number, bf: any, value?: string | null): Promise<{ byPerson: Map<string, FEv[]>; P: ReturnType<typeof people> }> {
+  const personBd = bf && bf.breakdown_type === 'person';
+  const spec: FunnelSpec = { from, to, steps: steps.map(node), global, breakdown: bf && !personBd ? String(bf.breakdown) : null, value: value ?? null };
+  const rows = await concat((await en.shards(from, to)).map(sh => sh.funnel(spec)));
+  const gpf = personFilters(global); const spf = steps.map(s => personFilters(s.properties));
+  const P = people(en, rows.map(r => String(r[0])));
+  const byPerson = new Map<string, FEv[]>();
+  for (const r of rows) {
+    const did = String(r[0]);
+    if (!P.ok(did, gpf)) continue;
+    const mask = Number(r[2]);
+    const m = steps.map((_, k) => (mask & (2 ** k)) && P.ok(did, spf[k]) ? 1 : 0);
+    if (!m.some(Boolean)) continue;
+    const ref = P.get(did);
+    const bv = personBd ? (textOf(ref.props[String(bf.breakdown)]) ?? NONE) : String(r[3]);
+    let a = byPerson.get(ref.pk); if (!a) byPerson.set(ref.pk, a = []);
+    a.push({ ts: Number(r[1]), m, bv, v: r[4] === null || r[4] === undefined ? null : Number(r[4]) });
+  }
+  for (const a of byPerson.values()) a.sort((x, y) => x.ts - y.ts);
+  return { byPerson, P };
+}
+
+/** Best path for one person's events (ordered as PostHog's funnel UDF, or unordered). */
+export function personFunnel(evs: FEv[], n: number, windowMs: number, unordered: boolean, range: { from: number; to: number }) {
+  if (!unordered) return orderedPass(evs.filter(e => e.ts >= range.from && e.ts <= range.to), n, windowMs);
+  let best: { reached: number; times: number[]; bv: string } | null = null;
+  for (let i = 0; i < evs.length; i++) {
+    const start = evs[i];
+    if (start.ts < range.from || start.ts > range.to || !start.m.some(Boolean)) continue;
+    const done = new Map<number, number>();
+    for (let j = i; j < evs.length && evs[j].ts <= start.ts + windowMs; j++) evs[j].m.forEach((v, k) => { if (v && !done.has(k)) done.set(k, evs[j].ts); });
+    const cand = { reached: done.size, times: [...done.values()].sort((a, b) => a - b), bv: start.bv };
+    if (!best || cand.reached > best.reached) best = cand;
+    if (best.reached === n) break;
+  }
+  return best;
+}
+
+async function funnels(en: Engine, q: any, qc: QueryContext) {
   const tz = qc.timezone, now = qc.now ?? Date.now();
   const steps: EventsNode[] = Array.isArray(q.series) ? q.series : [];
   if (steps.length < 2) throw new QueryError('a funnel needs at least 2 steps');
   if (steps.length > 20) throw new QueryError('at most 20 steps');
-  const range = resolveRange(q.dateRange?.date_from, q.dateRange?.date_to, tz, now, q.dateRange?.date_from === 'all' ? firstEvent(sql) : null);
+  const range = resolveRange(q.dateRange?.date_from, q.dateRange?.date_to, tz, now, q.dateRange?.date_from === 'all' ? await en.firstEventAt() : null);
   const ff = q.funnelsFilter ?? {};
   const windowMs = Math.max(1, Number(ff.funnelWindowInterval) || 14) * (UNIT_MS[ff.funnelWindowIntervalUnit ?? 'day'] ?? UNIT_MS.day);
   const unordered = ff.funnelOrderType === 'unordered';
-  const conds = steps.map(nodeSql);
-  const global = filtersSql(q.properties);
-  const bd = breakdownExpr(q.breakdownFilter);
-  const sel = conds.map((c, k) => ({ sql: `(CASE WHEN ${c.sql} THEN 1 ELSE 0 END) AS s${k}`, params: c.params }));
-  const any = { sql: conds.map(c => `(${c.sql})`).join(' OR '), params: conds.flatMap(c => c.params) };
+  const bf = q.breakdownFilter?.breakdown ? q.breakdownFilter : null;
   const n = steps.length;
-  type Best = { reached: number; times: number[]; bv: string };
+  const { byPerson } = await funnelPeople(en, steps, q.properties, range.from, range.to, bf);
   const perBreakdown = new Map<string, { counts: number[]; conv: number[][] }>();
-  const record = (b: Best) => {
+  for (const pk of [...byPerson.keys()].sort()) { // sorted so float sums do not depend on shard layout
+    const b = personFunnel(byPerson.get(pk)!, n, windowMs, unordered, range);
+    if (!b || b.reached <= 0) continue;
     let agg = perBreakdown.get(b.bv); if (!agg) perBreakdown.set(b.bv, agg = { counts: new Array(n).fill(0), conv: Array.from({ length: n }, () => []) });
     for (let k = 0; k < b.reached; k++) { agg.counts[k]++; if (k > 0) agg.conv[k].push((b.times[k] - b.times[k - 1]) / 1000); }
-  };
-  let curKey: string | null = null; let evs: { ts: number; m: number[]; bv: string }[] = [];
-  const flush = () => {
-    if (!evs.length) return;
-    let best: Best | null = null;
-    for (let i = 0; i < evs.length; i++) {
-      const start = evs[i];
-      if (start.ts < range.from || start.ts > range.to) continue;
-      if (unordered) {
-        if (!start.m.some(Boolean)) continue;
-        const done = new Map<number, number>();
-        for (let j = i; j < evs.length && evs[j].ts <= start.ts + windowMs; j++) evs[j].m.forEach((v, k) => { if (v && !done.has(k)) done.set(k, evs[j].ts); });
-        const times = [...done.values()].sort((a, b) => a - b);
-        const cand = { reached: done.size, times, bv: start.bv };
-        if (!best || cand.reached > best.reached) best = cand;
-      } else break; // ordered funnels are handled below in one pass
-      if (best && best.reached === n) break;
-    }
-    if (!unordered) best = orderedPass(evs, n, windowMs);
-    if (best && best.reached > 0) record(best);
-    evs = [];
-  };
-  const params = [...sel.flatMap(s => s.params), ...(bd?.params ?? []), range.from, range.to, ...any.params, ...global.params];
-  const cur = sql.exec(`SELECT ${PERSON_KEY} AS pk, e.timestamp AS ts, ${sel.map(s => s.sql).join(', ')}, ${bd ? bd.sql : `'${NONE}'`} AS bv
-      FROM events e ${JOINS} WHERE e.timestamp >= ? AND e.timestamp <= ? AND (${any.sql}) AND ${global.sql} ORDER BY pk, e.timestamp`, ...params);
-  for (const r of cur) {
-    const key = String(r.pk);
-    if (key !== curKey) { flush(); curKey = key; }
-    evs.push({ ts: Number(r.ts), m: steps.map((_, k) => Number(r['s' + k])), bv: String(r.bv) });
   }
-  flush();
   const median = (a: number[]) => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); return percentile(s, 0.5); };
   const build = (bv: string) => {
     const agg = perBreakdown.get(bv) ?? { counts: new Array(n).fill(0), conv: Array.from({ length: n }, () => []) };
@@ -239,13 +231,14 @@ function funnels(sql: SqlStorage, q: any, qc: QueryContext) {
       count: agg.counts[k],
       average_conversion_time: k && agg.conv[k].length ? agg.conv[k].reduce((a, b) => a + b, 0) / agg.conv[k].length : null,
       median_conversion_time: k ? median(agg.conv[k]) : null,
-      breakdown_value: bd ? bv : undefined, breakdown_label: bd ? breakdownLabel(bv) : undefined,
+      breakdown_value: bf ? bv : undefined, breakdown_label: bf ? breakdownLabel(bv) : undefined,
     }));
   };
-  if (!bd) return { kind: 'FunnelsQuery', results: build(NONE), date_from: new Date(range.from).toISOString(), date_to: new Date(range.to).toISOString() };
-  const limit = Math.min(Math.max(Number(q.breakdownFilter.breakdown_limit) || 25, 1), 100);
+  const dates = { date_from: new Date(range.from).toISOString(), date_to: new Date(range.to).toISOString() };
+  if (!bf) return { kind: 'FunnelsQuery', results: build(NONE), ...dates };
+  const limit = Math.min(Math.max(Number(bf.breakdown_limit) || 25, 1), 100);
   const keys = [...perBreakdown.entries()].sort((a, b) => b[1].counts[0] - a[1].counts[0]).slice(0, limit).map(e => e[0]);
-  return { kind: 'FunnelsQuery', results: keys.map(build), date_from: new Date(range.from).toISOString(), date_to: new Date(range.to).toISOString() };
+  return { kind: 'FunnelsQuery', results: keys.map(build), ...dates };
 }
 
 /**
@@ -253,7 +246,7 @@ function funnels(sql: SqlStorage, q: any, qc: QueryContext) {
  * starts a new chain (replacing the previous one); a step-k event extends the chain that reached step k-1 when it is within
  * the window of that chain's first event. The result is the first chain to reach the furthest step, with its step times.
  */
-function orderedPass(evs: { ts: number; m: number[]; bv: string }[], n: number, windowMs: number) {
+function orderedPass(evs: FEv[], n: number, windowMs: number) {
   type Chain = { start: number; times: number[]; bv: string };
   const entered: (Chain | null)[] = new Array(n).fill(null);
   let max: Chain | null = null;
@@ -273,7 +266,7 @@ function orderedPass(evs: { ts: number; m: number[]; bv: string }[], n: number, 
 }
 
 // ---------------- Retention ----------------
-function retention(sql: SqlStorage, q: any, qc: QueryContext) {
+async function retention(en: Engine, q: any, qc: QueryContext) {
   const tz = qc.timezone, now = qc.now ?? Date.now();
   const rf = q.retentionFilter ?? {};
   const unit: Interval = ({ Hour: 'hour', Day: 'day', Week: 'week', Month: 'month' } as Record<string, Interval>)[rf.period ?? 'Day'] ?? 'day';
@@ -283,27 +276,32 @@ function retention(sql: SqlStorage, q: any, qc: QueryContext) {
   const first = unit === 'hour' ? last - (total - 1) * 3600_000 : addInterval(last, unit, -(total - 1), tz);
   const bks = buckets({ from: first, to: last }, unit, tz).slice(0, total);
   const endMs = bks[bks.length - 1].end;
+  validateFilters(rf.targetEntity?.properties); validateFilters(rf.returningEntity?.properties);
   const target: EventsNode = { event: rf.targetEntity?.id ?? '$pageview', properties: rf.targetEntity?.properties };
   const returning: EventsNode = { event: rf.returningEntity?.id ?? target.event, properties: rf.returningEntity?.properties };
-  const global = filtersSql(q.properties);
-  const cte = bucketCte(bks);
-  const periods = (node: EventsNode) => {
-    const c = and(nodeSql(node), global);
+  const shards = await en.shards(first, endMs - 1);
+  const bspec = bks.map(b => [b.start, b.end] as [number, number]);
+  const periods = async (n: EventsNode) => {
+    const rows = await concat(shards.map(sh => sh.periods({ buckets: bspec, node: node(n), global: q.properties })));
+    const pf = [...personFilters(n.properties), ...personFilters(q.properties)];
+    const P = people(en, rows.map(r => String(r[0])));
     const m = new Map<string, Set<number>>();
-    for (const r of sql.exec(`WITH ${cte.sql} SELECT DISTINCT ${PERSON_KEY} AS pk, b.i AS bi FROM b JOIN events e ON e.timestamp >= b.s AND e.timestamp < b.en ${JOINS} WHERE ${c.sql}`, ...cte.params, ...c.params)) {
-      const k = String(r.pk); let s = m.get(k); if (!s) m.set(k, s = new Set()); s.add(Number(r.bi));
-    }
+    for (const r of rows) { const d = String(r[0]); if (!P.ok(d, pf)) continue; const k = P.get(d).pk; let s = m.get(k); if (!s) m.set(k, s = new Set()); s.add(Number(r[1])); }
     return m;
   };
   const cohorts: Set<string>[] = bks.map(() => new Set());
   if (rf.retentionType === 'retention_first_time') {
-    const c = and(nodeSql(target), global);
-    const firsts = sql.exec(`SELECT ${PERSON_KEY} AS pk, MIN(e.timestamp) AS f FROM events e ${JOINS} WHERE ${c.sql} GROUP BY pk HAVING f >= ? AND f < ?`, ...c.params, first, endMs);
-    for (const r of firsts) { const f = Number(r.f); const i = bks.findIndex(b => f >= b.start && f < b.end); if (i >= 0) cohorts[i].add(String(r.pk)); }
+    const all = await en.shards(-8.64e15, endMs - 1);
+    const rows = await concat(all.map(sh => sh.firsts({ node: node(target), global: q.properties, before: endMs })));
+    const pf = [...personFilters(target.properties), ...personFilters(q.properties)];
+    const P = people(en, rows.map(r => String(r[0])));
+    const firsts = new Map<string, number>();
+    for (const r of rows) { const d = String(r[0]); if (!P.ok(d, pf)) continue; const k = P.get(d).pk; const t = Number(r[1]); if (!firsts.has(k) || t < firsts.get(k)!) firsts.set(k, t); }
+    for (const [pk, f] of firsts) { if (f < first || f >= endMs) continue; const i = bks.findIndex(b => f >= b.start && f < b.end); if (i >= 0) cohorts[i].add(pk); }
   } else {
-    for (const [pk, s] of periods(target)) for (const i of s) cohorts[i].add(pk);
+    for (const [pk, s] of await periods(target)) for (const i of s) cohorts[i].add(pk);
   }
-  const ret = periods(returning);
+  const ret = await periods(returning);
   const name = unit[0].toUpperCase() + unit.slice(1);
   const results = bks.map((b, i) => {
     const values: { count: number }[] = [];
@@ -318,26 +316,41 @@ function retention(sql: SqlStorage, q: any, qc: QueryContext) {
 }
 
 // ---------------- Events ----------------
-function eventsQuery(sql: SqlStorage, q: any) {
+/** Newest first across shards (k-way merge on (timestamp, uuid)); the cursor is `<timestamp>_<uuid>`. */
+async function eventsQuery(en: Engine, q: any) {
   const limit = Math.min(Math.max(Number(q.limit) || 100, 1), 1000);
-  const parts: Sql[] = [filtersSql(q.properties)];
-  if (q.event) parts.push({ sql: 'e.event = ?', params: [String(q.event)] });
-  if (q.personId) parts.push({ sql: 'e.distinct_id IN (SELECT distinct_id FROM person_distinct_ids WHERE person_id = (SELECT id FROM persons WHERE uuid = ?))', params: [String(q.personId)] });
-  if (q.distinctId) parts.push({ sql: 'e.distinct_id = ?', params: [String(q.distinctId)] });
-  if (q.after) { const t = Date.parse(q.after); if (Number.isFinite(t)) parts.push({ sql: 'e.timestamp >= ?', params: [t] }); }
-  if (q.before) { const t = Date.parse(q.before); if (Number.isFinite(t)) parts.push({ sql: 'e.timestamp < ?', params: [t] }); }
-  if (q.cursor) { const [t, id] = String(q.cursor).split('_').map(Number); parts.push({ sql: '(e.timestamp < ? OR (e.timestamp = ? AND e.id < ?))', params: [t, t, id] }); }
-  const w = and(...parts);
-  const rows = sql.exec(`SELECT e.id, e.uuid, e.event, e.distinct_id, e.timestamp, e.properties, p.uuid AS person_uuid, p.properties AS person_properties
-      FROM events e ${JOINS} WHERE ${w.sql} ORDER BY e.timestamp DESC, e.id DESC LIMIT ?`, ...w.params, limit + 1).toArray();
-  const more = rows.length > limit; const page = rows.slice(0, limit);
+  const pf = personFilters(q.properties);
+  let distinctIds: string[] | null = null;
+  if (q.personId) distinctIds = en.distinctIdsOfPerson(String(q.personId));
+  if (q.distinctId) distinctIds = distinctIds ? distinctIds.filter(d => d === String(q.distinctId)) : [String(q.distinctId)];
+  if (distinctIds && !distinctIds.length) return { kind: 'EventsQuery', hasMore: false, next: null, results: [] };
+  const after = q.after ? Date.parse(q.after) : NaN, before = q.before ? Date.parse(q.before) : NaN;
+  let cursor: [number, string] | null = null;
+  if (q.cursor) { const s = String(q.cursor); const i = s.indexOf('_'); const t = Number(s.slice(0, i)); if (i > 0 && Number.isFinite(t)) cursor = [t, s.slice(i + 1)]; }
+  const lo = Number.isFinite(after) ? after : -8.64e15, hi = Math.min(Number.isFinite(before) ? before - 1 : 8.64e15, cursor ? cursor[0] : 8.64e15);
+  const shards = await en.shards(lo, hi);
+  const out: EventRow[] = [];
+  let more = false;
+  for (let round = 0; round < 20; round++) {
+    const want = limit - out.length + 1;
+    const spec: EventsSpec = { event: q.event || null, properties: q.properties, distinctIds, after: Number.isFinite(after) ? after : null, before: Number.isFinite(before) ? before : null, cursor, limit: want };
+    const rows = (await concat(shards.map(sh => sh.events(spec)))).sort((a, b) => b.timestamp - a.timestamp || (a.uuid < b.uuid ? 1 : a.uuid > b.uuid ? -1 : 0)).slice(0, want);
+    const exhausted = rows.length < want;
+    const P = pf.length ? people(en, rows.map(r => r.distinct_id)) : null;
+    for (const r of rows) { if (!P || P.ok(r.distinct_id, pf)) out.push(r); }
+    if (rows.length) cursor = [rows[rows.length - 1].timestamp, rows[rows.length - 1].uuid];
+    if (out.length > limit) { more = true; break; }
+    if (exhausted) break;
+  }
+  const page = out.slice(0, limit);
+  const P = people(en, page.map(r => r.distinct_id));
   return {
     kind: 'EventsQuery', hasMore: more,
-    next: more ? `${page[page.length - 1].timestamp}_${page[page.length - 1].id}` : null,
+    next: more ? `${page[page.length - 1].timestamp}_${page[page.length - 1].uuid}` : null,
     results: page.map(r => {
-      const pp = r.person_properties ? JSON.parse(String(r.person_properties)) : null;
+      const ref = P.get(r.distinct_id);
       return { uuid: r.uuid, event: r.event, distinct_id: r.distinct_id, timestamp: new Date(Number(r.timestamp)).toISOString(), properties: JSON.parse(String(r.properties)),
-        person: r.person_uuid ? { id: r.person_uuid, name: pp?.email ?? pp?.name ?? r.distinct_id } : null };
+        person: ref.uuid ? { id: ref.uuid, name: (ref.props.email ?? ref.props.name ?? r.distinct_id) as string } : null };
     }),
   };
 }

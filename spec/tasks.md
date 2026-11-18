@@ -37,3 +37,28 @@ Work in this order. Finish each check before the next task.
     posthog-node; screenshots with `scripts/shots.mjs`.
 11. **Deploy.** Follow `design.md` ("Deploy") with `ALLOWED_EMAILS` set,
     then point a real site's snippet at it and see events in Events.
+
+0.2 (after 1-11, or on an existing 0.1 build):
+
+12. **Event shards (R15).** `EventShard` class and binding, `eventsql.ts`
+    primitives, head registry and `ingest_log`, two-phase trends, funnels,
+    retention and events, legacy table as a pseudo-shard, purge and person
+    deletion across shards. Check: `tests/shards.test.ts` (day shards,
+    month shards and legacy agree) and every earlier test still passes.
+13. **Session replay (R16).** R2 binding, D1 `0002_replay.sql`, `/s/`
+    handler, queue metadata, `session_recordings`, snapshots API with field
+    decompression, remote config `sessionRecording`, retention; then the
+    rrweb-player bundle and the Session replay, person and events screens.
+    Check: `tests/replay.test.ts` with the recorded fixtures, then a real
+    posthog-js recording plays in the UI.
+14. **Experiments (R17).** `shared/stats.ts`, experiment CRUD creating the
+    multivariate flag, launch and stop, exposure and metrics, results and
+    screens. Check: `tests/experiments.test.ts` (sampler vs closed form,
+    the 200-person experiment).
+15. **Surveys (R18).** Survey CRUD, `/api/surveys`, remote config
+    `surveys`, results and screens. Check: the survey tests with the
+    recorded events, and a survey shown and answered by posthog-js in a
+    browser.
+16. **E2E and screenshots.** `npm run e2e` (now with replay, survey and
+    experiment checks); `scripts/demo-02.mjs` and `scripts/shots-02.mjs`.
+17. **Upgrade a deployment.** `design.md` "Upgrading 0.1 → 0.2".

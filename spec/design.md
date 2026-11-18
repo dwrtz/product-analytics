@@ -6,9 +6,10 @@ names here (bindings, tables, routes) are the ones the tests and scripts use.
 
 ## Stack
 
-- **Runtime:** one Cloudflare Worker (TypeScript, ES modules) with a
-  SQLite-backed Durable Object class, a D1 database, a Queue with a
-  dead-letter queue, static assets and a daily Cron Trigger.
+- **Runtime:** one Cloudflare Worker (TypeScript, ES modules) with two
+  SQLite-backed Durable Object classes (`ProjectStore`, `EventShard`), a D1
+  database, an R2 bucket, a Queue with a dead-letter queue, static assets
+  and a daily Cron Trigger.
 - **Libraries (runtime):** `lz-string` (LZ64 bodies). Everything else is
   Web platform: `DecompressionStream` (gzip, deflate), `crypto.subtle`
   (SHA-1 flag hashing, SHA-256, PBKDF2), `Intl.DateTimeFormat` (time zones).
@@ -17,7 +18,11 @@ names here (bindings, tables, routes) are the ones the tests and scripts use.
 - **Web app:** vanilla TypeScript, no framework, SVG charts, bundled by
   esbuild into `src/worker/ui.gen.ts` (JS and CSS as strings, plus
   `app_name`), so the Worker serves `/`, `/app.js` and `/app.css` itself
-  and the assets binding serves only `/static/*`.
+  and the assets binding serves only `/static/*`. The replay player is
+  `rrweb-player` 2.x (MIT, rrweb-io/rrweb), bundled by the same script into
+  `playerJs` / `playerCss` and served as `/player.js` and `/player.css`;
+  the Recording screen imports it on demand, so other screens do not pay
+  for its ~320 KB.
 - **Tooling:** Wrangler 4, TypeScript, esbuild, Vitest 5 with
   `@cloudflare/vitest-plugin` (tests run inside workerd with real D1,
   Durable Objects and Queues), Playwright and `posthog-node` for the e2e
@@ -30,12 +35,14 @@ names here (bindings, tables, routes) are the ones the tests and scripts use.
 Layout:
 
 ```
-src/shared/   decode.ts timestamp.ts ids.ts flags.ts dates.ts   (pure, unit-tested)
-src/worker/   index.ts env.ts capture.ts sdk.ts projects.ts auth.ts api.ts store.ts query.ts ui.gen.ts
-src/ui/       app.ts style.css
-migrations/   0001_init.sql
-scripts/      build-ui.mjs copy-sdk.mjs gen-vectors.mjs seed-demo.mjs demo-setup.mjs shots.mjs
-tests/        setup.ts vectors.test.ts store.test.ts http.test.ts
+src/shared/   decode.ts timestamp.ts ids.ts flags.ts dates.ts stats.ts   (pure, unit-tested)
+src/worker/   index.ts env.ts capture.ts sdk.ts projects.ts auth.ts api.ts store.ts shard.ts eventsql.ts query.ts
+              replay.ts experiments.ts surveys.ts ui.gen.ts
+src/ui/       app.ts player.ts style.css
+migrations/   0001_init.sql 0002_replay.sql
+scripts/      build-ui.mjs copy-sdk.mjs gen-vectors.mjs seed-demo.mjs demo-setup.mjs shots.mjs demo-02.mjs shots-02.mjs
+tests/        setup.ts vectors.test.ts store.test.ts http.test.ts shards.test.ts replay.test.ts experiments.test.ts
+tests/fixtures/  snapshot-requests.json survey-events.json   (recorded posthog-js traffic, research.md)
 e2e/          e2e.ts
 ```
 
@@ -54,18 +61,92 @@ The options on Cloudflare:
 | Basin (Pipelines into R2 Iceberg, queried with Basin SQL) | The scale-out path for very large projects. Not for 0.1: no local emulation, query latency in seconds, a token in the Worker, and tables are append-only, so persons and merges would still live elsewhere. |
 
 So: **D1** holds the instance (users, sessions, personal API keys,
-projects). **One `ProjectStore` Durable Object per project**, addressed by
-`idFromName("project:<id>")`, holds that project's events, persons,
-distinct ids, groups, definitions, insights, dashboards and flags.
+projects). **One `ProjectStore` Durable Object per project** (the *head*),
+addressed by `idFromName("project:<id>")`, holds that project's persons,
+distinct ids, groups, definitions, insights, dashboards, flags,
+experiments, surveys, recording metadata and the shard registry, and
+**`EventShard` Durable Objects** hold its events, one per UTC month (next
+section).
 Ingestion goes **capture → Queue → consumer → ProjectStore**, so capture
 answers fast, bursts are smoothed, and failed writes are retried and finally
 parked in the dead-letter queue. Nothing in code names a database id,
 account, domain or token: all of it comes from `wrangler.jsonc` and vars.
 
 Size guidance: an event row is about 1-2 KB with typical posthog-js
-properties, so one project holds roughly 5-10 million events before the
-10 GB limit; `retention_days` with the daily purge keeps a project under it.
-Settings shows the project's database size.
+properties, so one shard (one month) holds roughly 5-10 million events
+before its 10 GB limit; the head holds no events (except 0.1 data) and
+stays small. Settings shows the project's total size across its objects.
+
+## Event shards (0.2: more events)
+
+0.1 kept every event in the project's one Durable Object, so a project
+stopped at 10 GB. 0.2 splits events by time, keeps every answer exact, and
+keeps `wrangler dev` and the tests working with no account.
+
+**Options considered.**
+
+| Option | Verdict |
+|---|---|
+| **Time shards: one SQLite Durable Object per (project, UTC month)**, head does person work and final aggregation (chosen) | Exact; unbounded total size (10 GB per month, ~5-10 M events per month); old data is dropped by deleting whole objects; queries touch only the months in range and run in parallel; the same code runs in `wrangler dev` and Vitest; no new token. Cost: a query's person resolution and final aggregation run in the head, so a query's working set (rows grouped by distinct id) must fit in one isolate's memory. |
+| Hash shards (by distinct id) | Spreads write load, but every query touches every shard, merges move a person's events between shards, and retention cannot drop objects. |
+| D1 per project, or one D1 sharded by month | 10 GB per database and a network hop per statement; nothing gained over Durable Objects. |
+| Workers Analytics Engine | Sampled at volume (not exact), no persons, needs an account token for SQL, not in local dev. |
+| Basin (Pipelines → R2 Iceberg → Basin SQL) | Right for billions of events and ad-hoc SQL, but seconds of latency, append-only (persons still elsewhere), a token in the Worker and no local emulation. Kept as the next step: a deploy can add a Pipeline that copies normalized events to R2 Iceberg for warehouse queries without changing this design. |
+
+**How it works.**
+
+- Shard key: the event's timestamp in UTC, month granularity, named
+  `<head id>:<YYYY-MM>` (`SHARD_PERIOD=day` gives day shards `YYYY-MM-DD`;
+  tests use it to exercise many shards). The period is fixed per project in
+  the head's `meta` table on first use, so changing the var later does not
+  re-route old data. The head's `shards` table registers each shard with
+  its `[start, end)` and an event count.
+- Ingest (head `ingest`): drop uuids already in `ingest_log` (7 days) or
+  in the legacy table or in flight in this object; group the rest by
+  shard and `insert` them there in parallel (`INSERT OR IGNORE` by uuid);
+  then, in one head transaction, update the registry counts, record the
+  uuids in `ingest_log`, and run definitions, groups and person processing
+  (`protocol.md` 7) in arrival order. A crash between the two steps
+  retries the message: the shard ignores the duplicates and the head, not
+  having logged them, processes persons exactly once. A retry of the same
+  uuid more than 7 days later is stored once but could update persons
+  twice (SDK retries happen within minutes).
+- Legacy: events stored by 0.1 stay in the head's `events` table; the head
+  queries that table with the same primitives as one more shard, so an
+  upgraded instance keeps its history with no migration step.
+- Queries are two-phase (`eventsql.ts`, `query.ts`): each shard whose
+  period overlaps the range runs event-level SQL (event name, event
+  property filters, event breakdowns, buckets) and returns compact rows
+  keyed by `distinct_id`; the head maps distinct ids to persons
+  (`person_distinct_ids` and `persons`, in chunks of 5,000), applies person
+  property filters (the same semantics as SQL, `matchPerson`) and person
+  breakdowns, then aggregates:
+  - Trends: shards group by (bucket, distinct id, breakdown, session or
+    group key) with count, sum, min, max and numeric count; the head sums
+    counts, counts distinct person keys (`dau`), distinct session/group
+    keys, and sums/averages; percentiles get raw values.
+  - Funnels: shards stream `(distinct_id, ts, step bitmask, breakdown)` in
+    time order; the head groups by person key across shards and runs the
+    same ordered/unordered matcher as 0.1.
+  - Retention: shards return distinct `(distinct_id, bucket)`; first-time
+    retention asks every shard before the end for `MIN(timestamp)` per
+    distinct id and takes the minimum per person.
+  - Events: a k-way merge over shards on `(timestamp, uuid)`, newest
+    first; the cursor is `<timestamp>_<uuid>`.
+  Sums over floats are taken in a fixed order (persons sorted) so results
+  do not depend on how data is sharded.
+- Retention purge deletes shards whose period ended before the cutoff
+  (`deleteAll`) and trims the boundary shard and the legacy table.
+  Deleting a person with events deletes their distinct ids' events in
+  every shard; deleting a project deletes every shard.
+- Exactness: all counts are exact at every age; nothing is sampled or
+  pre-aggregated.
+
+**Limits.** 10 GB and about 5-10 M events per project per month; a query
+holds its grouped rows in the head (about 100 bytes per (bucket, distinct
+id) pair for trends and per matching event for funnels), so funnels over
+tens of millions of matching events in one range should be split; Durable
+Object RPC messages are limited to 32 MiB per shard response.
 
 ## Cloudflare config (`wrangler.example.jsonc`)
 
@@ -77,8 +158,9 @@ Settings shows the project's database size.
   "workers_dev": false,
   "preview_urls": false,
   "d1_databases": [{ "binding": "DB", "database_name": "product-analytics", "database_id": "<from d1 create>", "migrations_dir": "migrations" }],
-  "durable_objects": { "bindings": [{ "name": "STORE", "class_name": "ProjectStore" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectStore"] }],
+  "durable_objects": { "bindings": [{ "name": "STORE", "class_name": "ProjectStore" }, { "name": "SHARDS", "class_name": "EventShard" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectStore"] }, { "tag": "v2", "new_sqlite_classes": ["EventShard"] }],
+  "r2_buckets": [{ "binding": "REPLAY", "bucket_name": "product-analytics-replay" }],
   "queues": {
     "producers": [{ "binding": "INGEST", "queue": "product-analytics-ingest" }],
     "consumers": [{ "queue": "product-analytics-ingest", "max_batch_size": 100, "max_batch_timeout": 2, "max_retries": 10, "dead_letter_queue": "product-analytics-ingest-dlq" }]
@@ -99,20 +181,23 @@ committed. Vars:
 | `SITE_URL` | The app's own origin, no trailing slash. Owner API writes with a session cookie must send this exact `Origin`; the snippet in Settings uses it as `api_host`; cookies get `Secure` when it is https. |
 | `ALLOWED_EMAILS` | Comma-separated emails that may sign up. Empty: only the first account can sign up. |
 | `DEFAULT_RETENTION_DAYS` | Retention for new projects, in days. Empty or `0`: keep events forever. |
+| `REPLAY_RETENTION_DAYS` | Days to keep session recordings (default 30); never longer than the project's event retention when that is set. `0` keeps them as long as events. |
+| `SHARD_PERIOD` | `month` (default) or `day`; read once per project. For tests. |
 
 There are no secrets.
 
 ## Deploy
 
 With an API token scoped to the target account (Workers Scripts, D1,
-Queues edit; Workers Routes and DNS edit on the zone when a custom domain is
-used):
+Queues and R2 edit; Workers Routes and DNS edit on the zone when a custom
+domain is used):
 
 1. `npm install`, then `cp wrangler.example.jsonc wrangler.jsonc`.
 2. `npx wrangler d1 create product-analytics`; put the id in
    `wrangler.jsonc`.
-3. `npx wrangler queues create product-analytics-ingest` and
-   `npx wrangler queues create product-analytics-ingest-dlq`.
+3. `npx wrangler queues create product-analytics-ingest`,
+   `npx wrangler queues create product-analytics-ingest-dlq` and
+   `npx wrangler r2 bucket create product-analytics-replay`.
 4. `npx wrangler d1 migrations apply DB --remote`.
 5. Set `SITE_URL` to the public origin and `ALLOWED_EMAILS` to the owners'
    emails **before** the first deploy (otherwise whoever signs up first owns
@@ -124,8 +209,22 @@ used):
    site, and check events arrive in Activity.
 
 Upgrades: `npm run deploy`; new D1 migrations with step 4. The Durable
-Object creates and upgrades its own tables on start (`CREATE ... IF NOT
+Objects create and upgrade their own tables on start (`CREATE ... IF NOT
 EXISTS`), so a new store schema version adds statements there.
+
+**Upgrading 0.1 → 0.2:** create the R2 bucket, apply D1 migration
+`0002_replay.sql` (adds `projects.session_recording`, default 0; existing
+rows and data are untouched), deploy with the `v2` Durable Object
+migration (new class `EventShard`). Existing events stay in each head's
+legacy table and are queried as before; new events go to shards.
+
+**Deploying without asset upload.** Wrangler uploads `/static` as Workers
+Assets. A deploy pipeline that can only upload the script (for example
+the Cloudflare API through a connector that cannot send the assets JWT)
+can instead put the posthog-js files in the R2 bucket under `static/<file>`
+and wrap the Worker so `ASSETS.fetch` reads `static/<file>` from `REPLAY`
+(content type from the extension, CORS and caching added by the Worker as
+usual). The app does not change.
 
 ## Data model
 
@@ -141,6 +240,8 @@ CREATE TABLE personal_api_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id IN
 CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, api_token TEXT NOT NULL UNIQUE,
   timezone TEXT NOT NULL DEFAULT 'UTC', retention_days INTEGER NOT NULL DEFAULT 0, anonymize_ips INTEGER NOT NULL DEFAULT 0,
   autocapture_opt_out INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+-- migrations/0002_replay.sql
+ALTER TABLE projects ADD COLUMN session_recording INTEGER NOT NULL DEFAULT 0;
 ```
 
 - Passwords: PBKDF2-SHA256, 100,000 iterations, 16-byte random salt,
@@ -152,7 +253,10 @@ CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
   keys: `phx_` + 43 base62; only the SHA-256 and a mask (`phx_...abcd`) are stored;
   the key is shown once.
 
-### ProjectStore (SQLite in the Durable Object)
+### ProjectStore (head; SQLite in the Durable Object)
+
+The `events` table and its indexes are the 0.1 (legacy) events and also
+the schema of every `EventShard` (which has only this table).
 
 ```sql
 CREATE TABLE events (id INTEGER PRIMARY KEY, uuid TEXT NOT NULL UNIQUE, event TEXT NOT NULL, distinct_id TEXT NOT NULL,
@@ -178,7 +282,26 @@ CREATE TABLE dashboard_tiles (dashboard_id INTEGER NOT NULL, insight_id INTEGER 
 CREATE TABLE feature_flags (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, name TEXT NOT NULL DEFAULT '',
   active INTEGER NOT NULL DEFAULT 1, filters TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+-- 0.2
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);                 -- shard_period
+CREATE TABLE shards (key TEXT PRIMARY KEY, start INTEGER NOT NULL, end INTEGER NOT NULL, events INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE ingest_log (uuid TEXT PRIMARY KEY, at INTEGER NOT NULL);         -- kept 7 days
+CREATE TABLE session_recordings (session_id TEXT PRIMARY KEY, distinct_id TEXT NOT NULL, start_ts INTEGER NOT NULL,
+  end_ts INTEGER NOT NULL, click_count INTEGER NOT NULL DEFAULT 0, keypress_count INTEGER NOT NULL DEFAULT 0,
+  console_error_count INTEGER NOT NULL DEFAULT 0, first_url TEXT, size INTEGER NOT NULL DEFAULT 0,
+  chunks INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+CREATE TABLE experiments (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+  feature_flag_key TEXT NOT NULL, metrics TEXT NOT NULL DEFAULT '[]', filters TEXT NOT NULL DEFAULT '[]',
+  start_date INTEGER, end_date INTEGER, archived INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE surveys (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', type TEXT NOT NULL,
+  questions TEXT NOT NULL, appearance TEXT NOT NULL, conditions TEXT, linked_flag_key TEXT,
+  enable_partial_responses INTEGER NOT NULL DEFAULT 0, start_date INTEGER, end_date INTEGER,
+  archived INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 ```
+
+R2 (`REPLAY`): `replay/<project id>/<session id>/<first ts, 15 digits>-<8 hex>`
+= gzip of the JSON array of that request's rrweb events (each with
+`windowId` added from `$window_id`), as received (still field-compressed).
 
 Times are integer ms UTC. Properties are JSON text. Property definitions
 record a type per name (`Numeric`, `Boolean`, `DateTime` for ISO-looking
@@ -193,14 +316,14 @@ already-known names.
    changes and project deletion in that isolate).
 2. `enqueue` packs events into messages of at most 100 KB of JSON
    (`{pid, events}`) and sends them two per `sendBatch`. An event over
-   100 KB on its own is written straight to the store.
+   100 KB on its own is written straight to the store. `/s/` sends
+   `{pid, replay: [meta]}` messages (Session replay).
 3. The queue consumer groups messages by project and calls
-   `ProjectStore.ingest(events)`; on error it retries the messages after
-   10 seconds; after 10 tries they go to the DLQ.
-4. `ingest` runs in one `transactionSync`: per event, `INSERT OR IGNORE`
-   by uuid (a duplicate is skipped entirely), definitions,
-   `$groupidentify`, then person processing (`protocol.md` section 7).
-   It returns `{inserted, duplicates}`.
+   `ProjectStore.ingest(events)` and `recordReplay(metas)`; on error it
+   retries the messages after 10 seconds; after 10 tries they go to the DLQ.
+4. `ingest` writes to the shards, then runs definitions, `$groupidentify`
+   and person processing (`protocol.md` section 7) in one head transaction
+   ("Event shards"). It returns `{inserted, duplicates}`.
 
 ## Queries (`query.ts`)
 
@@ -209,9 +332,10 @@ inside the project's store. Shapes follow PostHog's query schema names so
 saved insights read naturally: `TrendsQuery`, `FunnelsQuery`,
 `RetentionQuery`, `EventsQuery`.
 
-**Person key.** Every query that counts people joins
-`person_distinct_ids` and uses `COALESCE('p' || person_id, 'd' ||
-distinct_id)`: an event's current person if it has one, else its distinct
+**Person key.** Every query that counts people maps each event's
+`distinct_id` through `person_distinct_ids` at query time (in the head,
+"Event shards") to `'p' || person_id`, or `'d' || distinct_id` when it has
+no person: an event's current person if it has one, else its distinct
 id. Merges therefore apply to past events at once.
 
 **Date ranges** (`dateRange.date_from` / `date_to`): `-Nh`, `-Nd`, `-Nw`,
@@ -286,8 +410,8 @@ returningEntity {id, properties}}`, global `properties`, and an optional
 
 **Events.** `EventsQuery {event, properties, personId, distinctId, after,
 before, limit (1-1000, default 100), cursor}` newest first; the cursor is
-`<timestamp>_<row id>` from `next`, so paging is stable while events
-arrive. Each row has the event, its time as ISO, properties and the
+`<timestamp>_<uuid>` from `next` (ties broken by uuid), so paging is stable
+while events arrive. Each row has the event, its time as ISO, properties and the
 current person `{id, name}`.
 
 **Property filters in queries** (`{key, value, operator, type: event|person}`):
@@ -314,15 +438,15 @@ must send `Origin` equal to `SITE_URL` (403 `bad_origin`).
 | `/api/personal_api_keys` | GET, POST | POST `{label}` → `{key}` once |
 | `/api/personal_api_keys/:id` | DELETE | |
 | `/api/projects` | GET, POST | POST `{name, timezone}` (IANA, checked) |
-| `/api/projects/:id` | GET, PATCH, DELETE | PATCH `{name, timezone, retention_days, anonymize_ips, autocapture_opt_out}`; DELETE removes the store |
+| `/api/projects/:id` | GET, PATCH, DELETE | PATCH `{name, timezone, retention_days, anonymize_ips, autocapture_opt_out, session_recording}`; DELETE removes the store, its shards and recordings |
 | `/api/projects/:id/reset_token` | POST | new `phc_` token; the old one stops working |
 | `/api/projects/:id/query` | POST | `{query}`; 400 `invalid_query` |
 | `/api/projects/:id/events` | GET | `event`, `cursor`, `limit`, `person_id`, `distinct_id`, `properties` (JSON) |
 | `/api/projects/:id/definitions` | GET | event names, property names and types, group types |
 | `/api/projects/:id/property_values` | GET | `type=event|person`, `key`: up to 50 distinct values (persons, or the latest 5000 events) |
-| `/api/projects/:id/stats` | GET | events, persons, events in 24 h, last event time, database bytes |
+| `/api/projects/:id/stats` | GET | events, persons, events in 24 h, last event time, database bytes (head + shards), shard count |
 | `/api/projects/:id/persons` | GET | `search` (email, name or distinct id), `cursor`; `{results, next, total}` |
-| `/api/projects/:id/persons/:uuid` | GET, DELETE | DELETE `?delete_events=1` also deletes the person's events |
+| `/api/projects/:id/persons/:uuid` | GET, DELETE | DELETE `?delete_events=1` also deletes the person's events and recordings |
 | `/api/projects/:id/insights` | GET, POST | `{name, description, query}` → with `short_id` |
 | `/api/projects/:id/insights/:short_id` | GET, PATCH, DELETE | |
 | `/api/projects/:id/dashboards` | GET, POST | `{name, description, date_from, pinned}` |
@@ -331,16 +455,26 @@ must send `Origin` equal to `SITE_URL` (403 `bad_origin`).
 | `/api/projects/:id/dashboards/:id/tiles/:insight_id` | DELETE | |
 | `/api/projects/:id/feature_flags` | GET, POST | `{key, name, active, filters}`; key `[A-Za-z0-9_-]{1,200}`, unique; variants must sum to 100 |
 | `/api/projects/:id/feature_flags/:id` | GET, PATCH, DELETE | each change bumps `version` |
+| `/api/projects/:id/session_recordings` | GET | `person_id`, `distinct_id`, `before` (ms, cursor), `limit` (≤200); `{results, next}`; each `{id, distinct_id, start_time, end_time, recording_duration (s), click_count, keypress_count, console_error_count, start_url, size, chunks, person}` |
+| `/api/projects/:id/session_recordings/:session` | GET, DELETE | DELETE removes the metadata and the R2 chunks |
+| `/api/projects/:id/session_recordings/:session/snapshots` | GET | `{snapshots: [rrweb events]}`, decompressed, time order (up to 64 MB of JSON) |
+| `/api/projects/:id/experiments` | GET, POST | POST `{name, description, feature_flag_key, variants?, metrics, filters?}`; creates the flag (off) when missing |
+| `/api/projects/:id/experiments/:id` | GET, PATCH, DELETE | PATCH fields, or `{action: "launch"|"stop"}`; DELETE keeps the flag |
+| `/api/projects/:id/experiments/:id/results` | GET | Experiments |
+| `/api/projects/:id/surveys` | GET, POST | Surveys |
+| `/api/projects/:id/surveys/:id` | GET, PATCH, DELETE | PATCH fields, or `{action: "launch"|"stop"|"resume"}` |
+| `/api/projects/:id/surveys/:id/results` | GET | Surveys |
 
 Other Worker routes: the SDK routes of `protocol.md`, `/_health`
-(`{"ok":true}`), `/app.js`, `/app.css`, and every other GET path returns
+(`{"ok":true}`), `/app.js`, `/app.css`, `/player.js`, `/player.css`, and every other GET path returns
 the app shell (history routing). All app responses carry
 `X-Content-Type-Options: nosniff` and `Referrer-Policy: same-origin`.
 
 ## Screens
 
 Left nav: app name, project switcher, Dashboards, Insights, Events,
-Persons, Feature flags, Settings, Account. Mobile (≤760 px): the
+Persons, Session replay, Feature flags, Experiments, Surveys, Settings,
+Account. Mobile (≤760 px): the
 nav becomes a wrapping top bar; tables scroll sideways.
 
 - **Sign in / Sign up** (`/login`, `/signup`): sign-up hidden when
@@ -358,11 +492,31 @@ nav becomes a wrapping top bar; tables scroll sideways.
   Save, rename, add to dashboard.
 - **Events** (`/events`): table (event, person, URL or library, time),
   newest first, with Reload, an event-name filter, property filters, rows
-  that expand to all properties, and "Load more".
+  that expand to all properties, and "Load more". With recording on, an
+  event with `$session_id` has a ▶ link to its recording.
 - **Persons** (`/persons`, `/persons/:uuid`): searchable list with total
   and an "anonymous" tag; person page with properties, distinct ids, first
-  and last seen, identified state, recent events, and "Delete person and
-  events".
+  and last seen, identified state, recordings, recent events, and "Delete
+  person and events".
+- **Session replay** (`/replay`, `/replay/:session`): list (person, start,
+  duration, clicks, keys, console errors, start URL; newest first, "Load
+  more"); recording page with rrweb-player (play, speed, skip inactive,
+  full screen), session facts, the session's events with their offset from
+  the start, and delete. A session with no full snapshot says so.
+- **Experiments** (`/experiments`, `/new`, `/:id`): list with status;
+  new-experiment form (name, flag key, variants with splits that must sum
+  to 100, metrics editor: conversion funnel steps, event count, or
+  property sum); experiment page with Launch / Stop, flag link, exposures,
+  and per metric a table (variant, exposures, conversions or total, rate
+  or mean, 95% credible interval drawn as a bar, chance to be best, uplift)
+  with a "Winner" or "Not significant" tag and the reason.
+- **Surveys** (`/surveys`, `/new`, `/:id`, `/:id/edit`): list with status;
+  editor (name, popover or API, questions with type, text, optional,
+  rating scale and labels, choices, link; display conditions: URL
+  contains, triggering event); results page (persons shown, responses,
+  dismissed, response rate; per question NPS with promoters, passives and
+  detractors and the score distribution, choice bars, or the latest 12 text
+  answers) with Edit, Launch / Stop / Resume, Delete.
 - **Feature flags** (`/feature_flags`, `/new`, `/:id`): list with release
   summary and an on/off switch; editor with key, description, active,
   condition sets (person property filters and rollout %), and either a
@@ -371,7 +525,7 @@ nav becomes a wrapping top bar; tables scroll sideways.
   one it finds but does not offer it.)
 - **Settings** (`/settings`): project name, time zone, token (copy, reset),
   the snippet for this instance, retention days, discard IPs, autocapture
-  off, usage (events, persons, last event, database size), other projects
+  off, record sessions, usage (events, persons, last event, database size), other projects
   and a new-project form, delete project (type the name to confirm).
 - **Account** (`/account`): signed-in email, personal API keys (create,
   shown once; revoke), sign out.
@@ -387,24 +541,147 @@ nav becomes a wrapping top bar; tables scroll sideways.
 - `tests/http.test.ts`: accounts and sign-up policy, Origin check, capture
   in every body encoding, beacon, errors, CORS, v1, queue to store end to
   end, `/flags` and `/decide`, remote config, token reset.
+- `tests/shards.test.ts`: 600 seeded events over 50 days stored as day
+  shards, month shards, and half in the legacy table: nine trends, funnel
+  and retention queries and full event paging must agree; purge and person
+  deletion across shards.
+- `tests/replay.test.ts`: the two `/s/` bodies recorded from posthog-js
+  1.450.1 (`tests/fixtures/snapshot-requests.json`) → one recording with 2
+  chunks, 10 clicks, 4 key presses; snapshots decompressed (no `cv`, full
+  snapshot has a document node); delete; recording-off projects drop data.
+- `tests/experiments.test.ts`: `lgamma`, the gamma sampler, Monte Carlo
+  vs the closed-form P(B > A) for four Beta pairs, determinism; an
+  experiment over 200 persons (exposure gating, a person with two variants
+  excluded, funnel / count / sum metrics, winner); the 50-exposure rule;
+  survey CRUD, `/api/surveys`, remote config and results from the recorded
+  survey events (`tests/fixtures/survey-events.json`).
 - `e2e/e2e.ts` (`E2E_EMAIL=... npm run e2e` against `npm run dev`): makes
-  a project; serves a customer page on 127.0.0.1 with the Settings snippet
-  (plus `opt_out_useragent_filter: true`); Playwright loads it, clicks,
-  identifies; `posthog-node` captures, identifies, aliases and evaluates a
-  flag; then checks stored events, persons, a trend, a funnel and
-  retention, and the web app's screens.
+  a project with recording on, an experiment on a multivariate flag and a
+  launched survey; serves a customer page on 127.0.0.1 with the Settings
+  snippet (plus `opt_out_useragent_filter: true`); Playwright loads it,
+  reads flags (exposure), types into a text and a password field, clicks,
+  identifies, triggers and answers the survey popover; `posthog-node`
+  captures, identifies, aliases and evaluates a flag; then checks stored
+  events, persons, a trend, a funnel, retention, the recording (snapshots
+  decompressed, password not present), survey results, experiment
+  exposures and conversions, and the web app's screens including the
+  replay player.
 - Demo: `scripts/demo-setup.mjs <site> <email> <password>` makes the
   "Acme Store" project with 58 days of seeded data, five insights, a
   dashboard and two flags; `scripts/shots.mjs` takes the screenshots.
+  `scripts/demo-02.mjs <site> <email> <password> <project>` adds three
+  real recordings, an experiment with 640 seeded exposures and an NPS
+  survey with seeded answers; `scripts/shots-02.mjs` takes the 0.2
+  screenshots.
 
-## Limits (0.1)
+## Session replay (`replay.ts`)
 
-- 10 GB per project (Durable Object limit); use `retention_days`.
-- Queries run on one Durable Object; a 30-second CPU budget per request.
-  Ranges of a few million events are fine; larger ones should use a
-  coarser interval or shorter range.
-- The token cache can serve a reset or deleted token for up to 30 seconds
-  in other isolates.
+- `/s/` decodes the body (`protocol.md` 4, 11), groups `$snapshot` events
+  by project and `$session_id`, and per session writes one R2 object
+  (gzip JSON array) and computes metadata: start and end (min and max
+  rrweb timestamp), clicks (type 3, source 2, `data.type` 2), key presses
+  (type 3, source 5), console errors (type 6 `rrweb/console@1` at level
+  `error`), first URL (first type 4 `href`), size (JSON bytes), 1 chunk.
+  Metadata goes on the queue; `recordReplay` upserts it (min start, max
+  end, sums, first URL from the earliest chunk).
+- Snapshots are read by listing the session's prefix, gunzipping each
+  chunk, undoing field compression (`protocol.md` 11) and sorting by
+  timestamp.
+- Privacy: posthog-js masks inputs by default (`maskAllInputs`); the
+  server does not unmask or add anything. Recording is off per project
+  until the owner turns it on.
+- Retention: the cron expires recordings whose end is older than the
+  replay retention and deletes their R2 prefixes; deleting a person (with
+  events) or a project deletes theirs.
+
+## Experiments (`experiments.ts`, `shared/stats.ts`)
+
+**Choice: Bayesian.** It answers the question owners ask ("how likely is
+B better?") at any time without fixing a sample size in advance, and
+reading results early does not invalidate it the way it does a
+fixed-horizon frequentist test. PostHog's public docs
+(posthog.com/docs/experiments/statistics-bayesian) describe the same kind
+of engine: a flat prior, "chance to win", 95% credible intervals, a 95%
+threshold and at least 50 exposures per variant; this build keeps those
+user-facing rules. The model differs on purpose: instead of a normal
+approximation of the relative effect, each variant gets its exact
+conjugate posterior (below) and variants are compared by sampling, which
+stays correct for small counts and rates near 0 or 1 and gives "probability
+to be best" across more than two variants directly. No PostHog code or
+`ee/` content is used.
+
+- Exposure: per person key, the first `$feature_flag_called` with
+  `$feature_flag` = the experiment's flag key between start and end (or
+  now), variant = `$feature_flag_response`. Persons with two different
+  valid variants are excluded and counted in `multiple_variant_persons`.
+  Optional `filters` (property filters) restrict exposures and metric
+  events.
+- Metrics, counting only each person's events at or after their exposure
+  and up to the end:
+  - **Conversion** (`funnel`, 1-10 steps, window default 14 days): a person
+    converts when the ordered funnel matcher (Queries, Funnels) reaches the
+    last step. Posterior per variant: Beta(1 + conversions, 1 + exposures −
+    conversions).
+  - **Count** (`count`): events per exposed person. Posterior of the rate:
+    Gamma(shape 1 + total events, rate 1 + exposures).
+  - **Continuous** (`continuous`, `math_property`): per-person sum of the
+    property (0 for exposed persons without events). Posterior of the
+    mean: Normal(sample mean, sample sd / √n) (large-sample approximation
+    under a flat prior).
+- Comparison: 20,000 joint draws from the variants' posteriors with a
+  seeded PRNG (mulberry32; seed 42 + metric index), Marsaglia-Tsang gamma
+  sampling, Beta via two gammas, Box-Muller normals. Reported per variant:
+  posterior mean, 95% credible interval (2.5th and 97.5th percentiles),
+  probability to be best (share of draws where it is highest), expected
+  loss, and uplift against the first variant (`control`; relative difference of posterior
+  means) with its 95% interval.
+- Significance: a metric is significant when one variant's probability to
+  be best is ≥ 0.95 and every variant has ≥ 50 exposures; otherwise the
+  result says why not.
+- Check: for two Beta posteriors with integer parameters the sampler's
+  P(B > A) is compared with the exact sum
+  Σ_{i<α_B} B(α_A+i, β_A+β_B) / ((β_B+i) B(1+i, β_B) B(α_A, β_A)).
+- Result: `{status, date_from, date_to, variants: [{key, exposures}],
+  multiple_variant_persons, metrics: [{kind, name, significant, winner,
+  reason, variants: [{key, exposures, conversions | count | sum,
+  conversion_rate | mean, posterior_mean, credible_interval,
+  probability_to_be_best, uplift, uplift_interval, expected_loss}]}]}`.
+
+## Surveys (`surveys.ts`)
+
+- Stored per project in the head; ids are UUIDs; question ids are kept or
+  generated. Validation: name; type `popover|api|widget|external_survey`;
+  1-20 questions of type `open|link|rating|single_choice|multiple_choice`
+  with text; rating `scale` 2, 3, 5, 7 or 10 and `display` number or
+  emoji; at least two choices for choice questions. `appearance` merges
+  over `{whiteLabel: true}`. `conditions` is stored as sent (posthog-js
+  reads `url`, `urlMatchType`, `selector`, `events`, `deviceTypes`).
+- Status: draft (no `start_date`), running (`start_date`, no `end_date`),
+  complete (`end_date`). `/api/surveys` lists running, unarchived surveys.
+- Results read the survey's events from every shard (up to 50,000 per
+  event name per shard): shown and dismissed (events, distinct persons);
+  responses = `survey sent` events, the latest per `$survey_submission_id`
+  (else per event); completed = those without `$survey_completed: false`;
+  response rate = persons who responded / persons shown. Per question the
+  answer is `$survey_response_<id>`, else the legacy name. Rating:
+  distribution over the scale (0-10 for 10, else 1-n), average, and for
+  0-10 scales NPS = round(100 × (promoters 9-10 − detractors 0-6) /
+  answers). Choice: counts per choice (multiple choice counts each
+  selection; answers outside the list are added). Open and link: the latest
+  100 answers with person and time.
+
+## Limits (0.2)
+
+- 10 GB per project per month (one shard); `retention_days` bounds the
+  total. The head (persons, flags, metadata) has its own 10 GB.
+- A query's final aggregation runs in the head with a 30-second CPU
+  budget; see "Event shards" for memory guidance.
+- The token cache can serve a reset or deleted token, or an old
+  recording/survey setting, for up to 30 seconds in other isolates.
+- Recording chunks are one per request; the snapshots endpoint returns up
+  to 64 MB of JSON per recording.
+- Flags hash the distinct id, so a visitor's variant can change at
+  identify (no experience continuity); such a person is excluded from the
+  experiment.
 - No local flag evaluation (`/api/feature_flag/local_evaluation`), cohorts,
-  actions, HogQL, session replay, experiments, surveys, data warehouse or
-  exports. Replay data sent by an SDK is accepted and discarded.
+  actions, HogQL, heatmaps, data warehouse or exports.

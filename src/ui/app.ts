@@ -2,7 +2,7 @@
 import settings from '../../spekkr.inputs.json';
 
 const APP = settings.app_name;
-type Project = { id: number; name: string; api_token: string; timezone: string; retention_days: number; anonymize_ips: boolean; autocapture_opt_out: boolean; created_at: string };
+type Project = { id: number; name: string; api_token: string; timezone: string; retention_days: number; anonymize_ips: boolean; autocapture_opt_out: boolean; session_recording: boolean; created_at: string };
 type Me = { id: number; email: string; name: string };
 let me: Me | null = null;
 let projects: Project[] = [];
@@ -80,7 +80,7 @@ function shell(title: Child | Child[], actions: Child[], ...content: Child[]) {
       h('div', { class: 'proj' }, picker),
       h('div', { class: 'side-links' },
         item('/dashboards', 'Dashboards'), item('/insights', 'Insights'), item('/events', 'Events'), item('/persons', 'Persons'),
-        item('/feature_flags', 'Feature flags'), item('/settings', 'Settings'),
+        item('/replay', 'Session replay'), item('/feature_flags', 'Feature flags'), item('/experiments', 'Experiments'), item('/surveys', 'Surveys'), item('/settings', 'Settings'),
         link('/account', 'Account', here === '/account' ? 'active' : ''))),
     h('main', {}, h('header', { class: 'top' }, h('h1', {}, title), h('div', { class: 'row' }, actions)), ...content)));
 }
@@ -393,7 +393,7 @@ async function eventsPage() {
       tbody.append(h('tr', { class: 'clickable', onclick: () => { detail.hidden = !detail.hidden; } },
         h('td', {}, h('b', {}, eventLabel(e.event)), e.event === '$autocapture' && e.properties.$el_text ? h('span', { class: 'muted' }, ` “${String(e.properties.$el_text).slice(0, 40)}”`) : null),
         h('td', {}, e.person ? link(P(`/persons/${e.person.id}`), e.person.name) : h('span', { class: 'muted' }, e.distinct_id)),
-        h('td', { class: 'muted url' }, String(e.properties.$current_url ?? e.properties.$lib ?? '')),
+        h('td', { class: 'muted url' }, project().session_recording && e.properties.$session_id ? h('a', { href: P(`/replay/${encodeURIComponent(e.properties.$session_id)}`), class: 'replay-link', title: 'Watch this session', onclick: (ev: MouseEvent) => { ev.stopPropagation(); ev.preventDefault(); nav(P(`/replay/${encodeURIComponent(e.properties.$session_id)}`)); } }, '▶') : null, String(e.properties.$current_url ?? e.properties.$lib ?? '')),
         h('td', { class: 'muted nowrap' }, when(e.timestamp))), detail);
     }
     cursor = r.next; more.hidden = !r.hasMore;
@@ -425,6 +425,7 @@ async function personPage(id: string) {
   shell('Person', [], loading());
   const p = await api<any>(apiP(`/persons/${encodeURIComponent(id)}`));
   const ev = await api<any>(apiP(`/events?person_id=${encodeURIComponent(p.id)}&limit=50`));
+  const recs = await api<any>(apiP(`/session_recordings?person_id=${encodeURIComponent(p.id)}&limit=20`)).catch(() => ({ results: [] }));
   shell(p.name, [h('button', { class: 'link danger', onclick: async () => {
     const withEvents = confirm(`Delete ${p.name}? Press OK to also delete their events, or Cancel to keep everything.`);
     if (!withEvents) return; await api(apiP(`/persons/${encodeURIComponent(p.id)}?delete_events=1`), { method: 'DELETE' }); nav(P('/persons'));
@@ -432,6 +433,7 @@ async function personPage(id: string) {
     h('div', { class: 'cols' },
       h('section', { class: 'card' }, h('h2', {}, 'Properties'), Object.keys(p.properties).length ? propTable(p.properties) : h('p', { class: 'muted' }, 'No properties.')),
       h('section', {}, h('div', { class: 'card' }, h('h2', {}, 'Details'), h('dl', { class: 'facts' }, h('dt', {}, 'Distinct IDs'), h('dd', {}, p.distinct_ids.join(', ')), h('dt', {}, 'First seen'), h('dd', {}, when(p.created_at)), h('dt', {}, 'Last seen'), h('dd', {}, when(p.last_seen_at)), h('dt', {}, 'Identified'), h('dd', {}, p.is_identified ? 'Yes' : 'No'))),
+        recs.results.length ? h('div', { class: 'card' }, h('h2', {}, 'Recordings'), recordingsTable(recs.results, false)) : null,
         h('div', { class: 'card' }, h('h2', {}, 'Recent events'), ev.results.length ? h('ul', { class: 'timeline' }, ev.results.map((e: any) => h('li', {}, h('b', {}, eventLabel(e.event)), h('span', { class: 'muted small' }, ` ${when(e.timestamp)}`), e.properties.$pathname ? h('div', { class: 'muted small' }, e.properties.$pathname) : null))) : h('p', { class: 'muted' }, 'No events.')))));
 }
 
@@ -502,11 +504,13 @@ async function settingsPage() {
   const ret = h('input', { type: 'number', min: 0, value: p.retention_days, class: 'narrow' }) as HTMLInputElement;
   const anon = h('input', { type: 'checkbox', checked: p.anonymize_ips }) as HTMLInputElement;
   const ac = h('input', { type: 'checkbox', checked: p.autocapture_opt_out }) as HTMLInputElement;
+  const rec = h('input', { type: 'checkbox', checked: p.session_recording }) as HTMLInputElement;
   const err = errBox(); const btn = h('button', { class: 'primary', type: 'submit' }, 'Save settings') as HTMLButtonElement;
   const form = h('form', { class: 'card' }, h('h2', {}, 'Project'), h('label', {}, 'Name', name), h('label', {}, 'Time zone', tz),
-    h('label', {}, 'Keep events for (days, 0 = forever)', ret), h('label', { class: 'switch' }, anon, 'Discard client IP addresses'), h('label', { class: 'switch' }, ac, 'Turn off autocapture for all clients'), err, btn);
+    h('label', {}, 'Keep events for (days, 0 = forever)', ret), h('label', { class: 'switch' }, anon, 'Discard client IP addresses'), h('label', { class: 'switch' }, ac, 'Turn off autocapture for all clients'),
+    h('label', { class: 'switch' }, rec, 'Record sessions (session replay; inputs are masked by posthog-js)'), err, btn);
   form.addEventListener('submit', busy(btn, async () => {
-    const r = await api<Project>(apiP(''), { method: 'PATCH', body: { name: name.value, timezone: tz.value, retention_days: Number(ret.value), anonymize_ips: anon.checked, autocapture_opt_out: ac.checked } });
+    const r = await api<Project>(apiP(''), { method: 'PATCH', body: { name: name.value, timezone: tz.value, retention_days: Number(ret.value), anonymize_ips: anon.checked, autocapture_opt_out: ac.checked, session_recording: rec.checked } });
     projects = projects.map(x => x.id === r.id ? r : x); btn.textContent = 'Saved'; setTimeout(() => settingsPage(), 800);
   }, err));
   shell('Settings', [],
@@ -535,6 +539,231 @@ async function accountPage() {
       h('section', { class: 'card' }, h('h2', {}, 'Personal API keys'), h('p', { class: 'muted small' }, 'Use a personal key as a Bearer token to call /api from scripts. It acts as you.'), f, err, shown,
         keys.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Label'), h('th', {}, 'Key'), h('th', {}, 'Last used'), h('th', {}))), h('tbody', {}, keys.map(k => h('tr', {}, h('td', {}, k.label || '–'), h('td', {}, h('code', {}, k.mask)), h('td', { class: 'muted' }, ago(k.last_used_at)),
           h('td', {}, h('button', { class: 'link danger', onclick: async () => { if (!confirm('Revoke this key?')) return; await api(`/api/personal_api_keys/${k.id}`, { method: 'DELETE' }); accountPage(); } }, 'Revoke')))))) : null))));
+}
+
+// ---------- session replay ----------
+const secs = (n: number) => n < 60 ? `${n}s` : n < 3600 ? `${Math.floor(n / 60)}m ${n % 60}s` : `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`;
+function recordingsTable(list: any[], showPerson = true) {
+  if (!list.length) return h('p', { class: 'muted empty' }, project().session_recording ? 'No recordings yet. Sessions appear here a few seconds after a visitor loads a page with the snippet.' : 'Session recording is off. Turn it on in Settings.');
+  return h('table', {}, h('thead', {}, h('tr', {}, showPerson ? h('th', {}, 'Person') : null, h('th', {}, 'Start'), h('th', { class: 'num' }, 'Duration'), h('th', { class: 'num' }, 'Clicks'), h('th', { class: 'num' }, 'Keys'), h('th', { class: 'num' }, 'Errors'), h('th', {}, 'Start URL'))),
+    h('tbody', {}, list.map(r => h('tr', { class: 'clickable', onclick: () => nav(P(`/replay/${encodeURIComponent(r.id)}`)) },
+      showPerson ? h('td', {}, r.person ? r.person.name : h('span', { class: 'muted' }, r.distinct_id || 'anonymous')) : null,
+      h('td', { class: 'nowrap' }, link(P(`/replay/${encodeURIComponent(r.id)}`), when(r.start_time))), h('td', { class: 'num' }, secs(r.recording_duration)),
+      h('td', { class: 'num' }, fmt(r.click_count)), h('td', { class: 'num' }, fmt(r.keypress_count)), h('td', { class: 'num' }, r.console_error_count ? h('span', { class: 'danger' }, fmt(r.console_error_count)) : '0'),
+      h('td', { class: 'muted url' }, r.start_url ?? '')))));
+}
+async function replayListPage() {
+  shell('Session replay', [], loading());
+  const out = h('div', {}); const more = h('button', { hidden: true }, 'Load more') as HTMLButtonElement;
+  let next: number | null = null; const all: any[] = [];
+  const load = async () => {
+    const r = await api<any>(apiP(`/session_recordings?limit=50${next ? `&before=${next}` : ''}`));
+    all.push(...r.results); next = r.next; more.hidden = !next; out.replaceChildren(recordingsTable(all));
+  };
+  more.addEventListener('click', load);
+  shell('Session replay', [h('button', { onclick: () => { all.length = 0; next = null; load(); } }, 'Reload')], out, more);
+  await load();
+}
+let playerMod: Promise<any> | null = null;
+function loadPlayer() {
+  if (!playerMod) {
+    const css = h('link', { rel: 'stylesheet', href: '/player.css' }); document.head.append(css);
+    const url = '/player.js'; playerMod = import(url);
+  }
+  return playerMod;
+}
+async function replayPage(sid: string) {
+  shell('Recording', [], loading());
+  let rec: any;
+  try { rec = await api<any>(apiP(`/session_recordings/${encodeURIComponent(sid)}`)); }
+  catch (e) { if (e instanceof ApiError && e.status === 404) return shell('Recording', [], h('p', { class: 'muted empty' }, 'No recording for this session. Recording may be off, or the session had no snapshots.')); throw e; }
+  const stage = h('div', { class: 'player', id: 'player' }, loading());
+  const evBox = h('div', {}, loading());
+  shell(rec.person ? `${rec.person.name} · ${when(rec.start_time)}` : `Recording · ${when(rec.start_time)}`,
+    [h('button', { class: 'link danger', onclick: async () => { if (!confirm('Delete this recording?')) return; await api(apiP(`/session_recordings/${encodeURIComponent(sid)}`), { method: 'DELETE' }); nav(P('/replay')); } }, 'Delete recording')],
+    h('div', { class: 'cols replay' }, h('section', { class: 'card' }, stage),
+      h('section', {}, h('div', { class: 'card' }, h('h2', {}, 'Session'), h('dl', { class: 'facts' },
+        h('dt', {}, 'Person'), h('dd', {}, rec.person ? link(P(`/persons/${rec.person.id}`), rec.person.name) : rec.distinct_id || '–'),
+        h('dt', {}, 'Duration'), h('dd', {}, secs(rec.recording_duration)), h('dt', {}, 'Start URL'), h('dd', {}, rec.start_url ?? '–'),
+        h('dt', {}, 'Clicks'), h('dd', {}, fmt(rec.click_count)), h('dt', {}, 'Key presses'), h('dd', {}, fmt(rec.keypress_count)), h('dt', {}, 'Console errors'), h('dd', {}, fmt(rec.console_error_count)),
+        h('dt', {}, 'Session ID'), h('dd', {}, h('code', {}, rec.id)))), h('div', { class: 'card' }, h('h2', {}, 'Events in this session'), evBox))));
+  const props = JSON.stringify([{ key: '$session_id', value: [sid], operator: 'exact', type: 'event' }]);
+  api<any>(apiP(`/events?limit=200&properties=${encodeURIComponent(props)}`)).then(ev => {
+    const start = new Date(rec.start_time).getTime();
+    evBox.replaceChildren(ev.results.length ? h('ul', { class: 'timeline' }, [...ev.results].reverse().map((e: any) => h('li', {}, h('span', { class: 'muted small mono' }, secs(Math.max(0, Math.round((new Date(e.timestamp).getTime() - start) / 1000)))), ' ', h('b', {}, eventLabel(e.event)),
+      e.properties.$pathname ? h('span', { class: 'muted small' }, ` ${e.properties.$pathname}`) : null))) : h('p', { class: 'muted' }, 'No events.'));
+  }).catch(() => evBox.replaceChildren());
+  const [{ snapshots }, mod] = await Promise.all([api<any>(apiP(`/session_recordings/${encodeURIComponent(sid)}/snapshots`)), loadPlayer()]);
+  if (!snapshots.length || !snapshots.some((e: any) => e.type === 2)) { stage.replaceChildren(h('p', { class: 'muted empty' }, 'This recording has no full snapshot yet, so it cannot be played.')); return; }
+  stage.replaceChildren();
+  const width = Math.max(320, stage.clientWidth - 4);
+  new mod.default({ target: stage, props: { events: snapshots, width, height: Math.round(width * 0.6), autoPlay: false, showController: true, skipInactive: true } });
+}
+
+// ---------- experiments ----------
+const pct = (x: number | null | undefined, d = 1) => x === null || x === undefined ? '–' : `${(x * 100).toFixed(d)}%`;
+const statusTag = (st: string) => h('span', { class: `tag status-${st}` }, st === 'draft' ? 'Draft' : st === 'running' ? 'Running' : 'Complete');
+async function experimentsPage() {
+  shell('Experiments', [], loading());
+  const list = await api<any[]>(apiP('/experiments'));
+  shell('Experiments', [link(P('/experiments/new'), 'New experiment', 'button primary')],
+    list.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Flag'), h('th', {}, 'Variants'), h('th', {}, 'Status'), h('th', {}, 'Started'))),
+      h('tbody', {}, list.map(e => h('tr', {}, h('td', {}, link(P(`/experiments/${e.id}`), e.name)), h('td', {}, h('code', {}, e.feature_flag_key)), h('td', { class: 'muted' }, e.variants.map((v: any) => v.key).join(', ')), h('td', {}, statusTag(e.status)), h('td', { class: 'muted' }, e.start_date ? when(e.start_date) : '–')))))
+      : h('p', { class: 'muted empty' }, 'No experiments yet. An experiment splits persons with a multivariate feature flag and compares metrics after each person first sees the flag.'));
+}
+function metricEditor(metrics: any[]): HTMLElement {
+  const box = h('div', {});
+  const draw = () => box.replaceChildren(...metrics.map((m, i) => {
+    const kind = h('select', { 'aria-label': 'Metric kind', onchange: (e: Event) => { const k = (e.target as HTMLSelectElement).value; metrics[i] = k === 'funnel' ? { kind: k, series: [{ event: '$pageview' }] } : k === 'count' ? { kind: k, event: { event: '$pageview' } } : { kind: k, event: { event: 'purchase' }, math_property: 'amount' }; draw(); } },
+      opt('funnel', 'Conversion (funnel)', m.kind), opt('count', 'Event count per person', m.kind), opt('continuous', 'Sum of a property per person', m.kind));
+    const body: HTMLElement[] = [];
+    if (m.kind === 'funnel') {
+      m.series.forEach((s: any, k: number) => body.push(h('div', { class: 'serie' }, h('span', { class: 'swatch num', style: `background:${color(k)}` }, String(k + 1)), eventInput(s.event, v => { s.event = v; }, false),
+        m.series.length > 1 ? h('button', { class: 'link', type: 'button', onclick: () => { m.series.splice(k, 1); draw(); } }, '✕') : null)));
+      body.push(h('button', { class: 'link', type: 'button', onclick: () => { m.series.push({ event: null }); draw(); } }, '+ Add step'));
+    } else {
+      body.push(h('div', { class: 'serie' }, eventInput(m.event.event, v => { m.event.event = v; }, true)));
+      if (m.kind === 'continuous') body.push(h('label', {}, 'Property', h('input', { value: m.math_property, list: 'props-event', onchange: (e: Event) => { m.math_property = (e.target as HTMLInputElement).value.trim(); } })));
+    }
+    return h('div', { class: 'card inner editor' }, h('div', { class: 'row' }, h('b', {}, `Metric ${i + 1}`), kind, h('button', { class: 'link', type: 'button', onclick: () => { metrics.splice(i, 1); draw(); } }, 'Remove')), ...body);
+  }), h('button', { type: 'button', onclick: () => { metrics.push({ kind: 'funnel', series: [{ event: '$pageview' }] }); draw(); } }, '+ Add metric'));
+  draw(); return box;
+}
+async function experimentNewPage() {
+  shell('New experiment', [], loading());
+  await ensureDefs();
+  const name = h('input', { placeholder: 'e.g. New checkout button' }) as HTMLInputElement;
+  const key = h('input', { placeholder: 'checkout-button-test' }) as HTMLInputElement;
+  const variants = [{ key: 'control', rollout_percentage: 50 }, { key: 'test', rollout_percentage: 50 }];
+  const vbox = h('div', {});
+  const drawV = () => vbox.replaceChildren(h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Variant'), h('th', {}, 'Split %'), h('th', {}))), h('tbody', {}, variants.map((v, i) => h('tr', {},
+    h('td', {}, i === 0 ? h('code', {}, 'control') : h('input', { value: v.key, 'aria-label': 'Variant key', onchange: (e: Event) => { v.key = (e.target as HTMLInputElement).value.trim(); } })),
+    h('td', {}, h('input', { type: 'number', min: 0, max: 100, value: v.rollout_percentage, class: 'narrow', 'aria-label': 'Split', onchange: (e: Event) => { v.rollout_percentage = Number((e.target as HTMLInputElement).value); } })),
+    h('td', {}, i > 1 ? h('button', { class: 'link', type: 'button', onclick: () => { variants.splice(i, 1); drawV(); } }, '✕') : null))))),
+    h('button', { class: 'link', type: 'button', onclick: () => { variants.push({ key: `test-${variants.length}`, rollout_percentage: 0 }); drawV(); } }, '+ Add variant'));
+  drawV();
+  const metrics: any[] = [{ kind: 'funnel', series: [{ event: '$pageview' }, { event: null }] }];
+  const err = errBox(); const btn = h('button', { class: 'primary', type: 'submit' }, 'Save as draft') as HTMLButtonElement;
+  const form = h('form', {}, eventList(), propOptions('event'),
+    h('div', { class: 'card' }, h('label', {}, 'Name', name), h('label', {}, 'Feature flag key', key, h('span', { class: 'muted small' }, 'A new multivariate flag is created (off until you launch). An existing multivariate flag can be reused.'))),
+    h('div', { class: 'card' }, h('h2', {}, 'Variants'), vbox),
+    h('div', { class: 'card' }, h('h2', {}, 'Metrics'), h('p', { class: 'muted small' }, 'Only events at or after a person’s first exposure ($feature_flag_called) count.'), metricEditor(metrics)), err, btn);
+  form.addEventListener('submit', busy(btn, async () => {
+    if (variants.reduce((a, v) => a + v.rollout_percentage, 0) !== 100) throw new Error('Variant splits must add up to 100%.');
+    const e = await api<any>(apiP('/experiments'), { body: { name: name.value, feature_flag_key: key.value.trim(), variants, metrics } });
+    nav(P(`/experiments/${e.id}`));
+  }, err));
+  shell('New experiment', [], form);
+}
+function intervalBar(lo: number, hi: number, mean: number, min: number, max: number, c: string) {
+  const W = 300, x = (v: number) => max > min ? ((v - min) / (max - min)) * W : W / 2;
+  return s('svg', { viewBox: `0 0 ${W} 18`, class: 'ci', preserveAspectRatio: 'none', role: 'img', 'aria-label': `95% interval ${lo.toPrecision(3)} to ${hi.toPrecision(3)}` },
+    s('rect', { x: x(lo), y: 4, width: Math.max(2, x(hi) - x(lo)), height: 10, rx: 3, fill: c, opacity: 0.35 }), s('rect', { x: x(mean) - 1, y: 1, width: 2, height: 16, fill: c }));
+}
+async function experimentPage(id: number) {
+  shell('Experiment', [], loading());
+  const [e, r] = await Promise.all([api<any>(apiP(`/experiments/${id}`)), api<any>(apiP(`/experiments/${id}/results`))]);
+  const act = (action: string, msg: string) => h('button', { class: action === 'launch' ? 'primary' : '', onclick: async () => { if (!confirm(msg)) return; await api(apiP(`/experiments/${id}`), { method: 'PATCH', body: { action } }); experimentPage(id); } }, action === 'launch' ? 'Launch' : 'Stop experiment');
+  const actions: Child[] = [];
+  if (e.status === 'draft') actions.push(act('launch', `Launch ${e.name}? This turns on flag ${e.feature_flag_key}.`));
+  if (e.status === 'running') actions.push(act('stop', 'Stop the experiment? Results freeze at this moment; the flag stays as it is.'));
+  actions.push(h('button', { class: 'link danger', onclick: async () => { if (!confirm(`Delete experiment ${e.name}? The flag is kept.`)) return; await api(apiP(`/experiments/${id}`), { method: 'DELETE' }); nav(P('/experiments')); } }, 'Delete'));
+  const metricCard = (m: any, i: number) => {
+    const isConv = m.kind === 'funnel';
+    const lo = Math.min(...m.variants.map((v: any) => v.credible_interval[0])), hi = Math.max(...m.variants.map((v: any) => v.credible_interval[1]));
+    const val = (x: number) => isConv ? pct(x) : fmt(Math.round(x * 1000) / 1000);
+    return h('section', { class: 'card' }, h('div', { class: 'row spread' }, h('h2', {}, `${i + 1}. ${m.name}`), m.significant ? h('span', { class: 'tag status-running' }, `Winner: ${m.winner}`) : h('span', { class: 'tag' }, 'Not significant')),
+      m.reason ? h('p', { class: 'muted small' }, m.reason) : null,
+      h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Variant'), h('th', { class: 'num' }, 'Exposures'), h('th', { class: 'num' }, isConv ? 'Conversions' : m.kind === 'count' ? 'Events' : 'Sum'),
+        h('th', { class: 'num' }, isConv ? 'Rate' : 'Mean'), h('th', {}, '95% credible interval'), h('th', { class: 'num' }, 'Chance to be best'), h('th', { class: 'num' }, 'Uplift'))),
+        h('tbody', {}, m.variants.map((v: any, k: number) => h('tr', {}, h('td', {}, h('span', { class: 'swatch', style: `background:${color(k)}` }), v.key),
+          h('td', { class: 'num' }, fmt(v.exposures)), h('td', { class: 'num' }, fmt(isConv ? v.conversions : m.kind === 'count' ? v.count : v.sum)),
+          h('td', { class: 'num' }, isConv ? pct(v.conversion_rate) : fmt(Math.round(v.mean * 100) / 100)),
+          h('td', {}, h('div', { class: 'ci-cell' }, intervalBar(v.credible_interval[0], v.credible_interval[1], v.posterior_mean, lo, hi, color(k)), h('span', { class: 'muted small nowrap' }, `${val(v.credible_interval[0])} – ${val(v.credible_interval[1])}`))),
+          h('td', { class: 'num' }, h('b', {}, pct(v.probability_to_be_best))), h('td', { class: 'num' }, v.uplift === null ? h('span', { class: 'muted' }, 'baseline') : h('span', { class: v.uplift >= 0 ? 'pos' : 'danger' }, `${v.uplift >= 0 ? '+' : ''}${pct(v.uplift)}`)))))));
+  };
+  shell(h('span', {}, e.name, ' ', statusTag(e.status)), actions,
+    h('div', { class: 'card' }, h('dl', { class: 'facts' }, h('dt', {}, 'Feature flag'), h('dd', {}, e.feature_flag_id ? link(P(`/feature_flags/${e.feature_flag_id}`), e.feature_flag_key) : e.feature_flag_key),
+      h('dt', {}, 'Variants'), h('dd', {}, e.variants.map((v: any) => `${v.key} ${v.rollout_percentage}%`).join(' · ')),
+      h('dt', {}, 'Running'), h('dd', {}, e.start_date ? `${when(e.start_date)} → ${e.end_date ? when(e.end_date) : 'now'}` : 'Not launched'),
+      h('dt', {}, 'Exposures'), h('dd', {}, (r.variants ?? []).map((v: any) => `${v.key}: ${fmt(v.exposures)}`).join(' · ') + (r.multiple_variant_persons ? ` (${r.multiple_variant_persons} persons saw several variants and are excluded)` : '')))),
+    e.status === 'draft' ? h('p', { class: 'muted empty' }, 'Launch the experiment to start collecting exposures. Your code reads the variant with posthog.getFeatureFlag(key).') : null,
+    ...(r.metrics ?? []).map(metricCard),
+    h('p', { class: 'muted small' }, 'Bayesian analysis: Beta-Binomial for conversion, Gamma-Poisson for counts, Normal approximation for sums; 20,000 seeded Monte Carlo draws. A winner needs a 95% chance to be best and 50 exposures per variant.'));
+}
+
+// ---------- surveys ----------
+const QTYPE: [string, string][] = [['open', 'Open text'], ['rating', 'Rating'], ['single_choice', 'Single choice'], ['multiple_choice', 'Multiple choice'], ['link', 'Link']];
+async function surveysPage() {
+  shell('Surveys', [], loading());
+  const list = await api<any[]>(apiP('/surveys'));
+  shell('Surveys', [link(P('/surveys/new'), 'New survey', 'button primary')],
+    list.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Type'), h('th', {}, 'Questions'), h('th', {}, 'Status'), h('th', {}, 'Created'))),
+      h('tbody', {}, list.map(sv => h('tr', {}, h('td', {}, link(P(`/surveys/${sv.id}`), sv.name)), h('td', { class: 'muted' }, sv.type), h('td', { class: 'num' }, fmt(sv.questions.length)), h('td', {}, statusTag(sv.status)), h('td', { class: 'muted' }, when(sv.created_at))))))
+      : h('p', { class: 'muted empty' }, 'No surveys yet. posthog-js shows launched popover surveys to visitors and sends the answers back as events.'));
+}
+async function surveyEditPage(id: string | null) {
+  shell('Survey', [], loading());
+  await ensureDefs();
+  const sv: any = id ? await api(apiP(`/surveys/${id}`)) : { name: '', type: 'popover', questions: [{ type: 'rating', question: 'How likely are you to recommend us to a friend?', display: 'number', scale: 10, lowerBoundLabel: 'Unlikely', upperBoundLabel: 'Very likely' }], conditions: null };
+  const name = h('input', { value: sv.name, placeholder: 'e.g. NPS' }) as HTMLInputElement;
+  const type = h('select', {}, opt('popover', 'Popover (posthog-js shows it)', sv.type), opt('api', 'API (your code renders it)', sv.type)) as HTMLSelectElement;
+  const url = h('input', { value: sv.conditions?.url ?? '', placeholder: 'Only on URLs containing… (optional)' }) as HTMLInputElement;
+  const trigger = h('input', { value: sv.conditions?.events?.values?.[0]?.name ?? '', placeholder: 'Show after this event (optional)', list: 'event-names' }) as HTMLInputElement;
+  const qs: any[] = sv.questions; const qbox = h('div', {});
+  const drawQ = () => qbox.replaceChildren(...qs.map((q, i) => {
+    const extra: HTMLElement[] = [];
+    if (q.type === 'rating') extra.push(h('div', { class: 'row' }, h('label', { class: 'inline' }, 'Scale ', h('select', { onchange: (e: Event) => { q.scale = Number((e.target as HTMLSelectElement).value); } }, [3, 5, 7, 10].map(n => h('option', { value: n, selected: q.scale === n }, n === 10 ? '0-10 (NPS)' : `1-${n}`)))),
+      h('input', { value: q.lowerBoundLabel ?? '', placeholder: 'Low label', onchange: (e: Event) => { q.lowerBoundLabel = (e.target as HTMLInputElement).value; } }), h('input', { value: q.upperBoundLabel ?? '', placeholder: 'High label', onchange: (e: Event) => { q.upperBoundLabel = (e.target as HTMLInputElement).value; } })));
+    if (q.type === 'single_choice' || q.type === 'multiple_choice') extra.push(h('label', {}, 'Choices, one per line', h('textarea', { rows: 3, onchange: (e: Event) => { q.choices = (e.target as HTMLTextAreaElement).value.split('\n').map(x => x.trim()).filter(Boolean); } }, (q.choices ?? []).join('\n'))));
+    if (q.type === 'link') extra.push(h('label', {}, 'Link URL', h('input', { value: q.link ?? '', onchange: (e: Event) => { q.link = (e.target as HTMLInputElement).value; } })));
+    return h('div', { class: 'card inner' }, h('div', { class: 'row' }, h('b', {}, `Question ${i + 1}`),
+      h('select', { 'aria-label': 'Question type', onchange: (e: Event) => { q.type = (e.target as HTMLSelectElement).value; if (q.type === 'rating') { q.scale ??= 5; q.display ??= 'number'; } if (q.type.endsWith('choice')) q.choices ??= ['Yes', 'No']; drawQ(); } }, QTYPE.map(([v, l]) => opt(v, l, q.type))),
+      h('label', { class: 'switch' }, h('input', { type: 'checkbox', checked: !!q.optional, onchange: (e: Event) => { q.optional = (e.target as HTMLInputElement).checked; } }), 'Optional'),
+      qs.length > 1 ? h('button', { class: 'link', type: 'button', onclick: () => { qs.splice(i, 1); drawQ(); } }, 'Remove') : null),
+      h('label', {}, 'Question', h('input', { value: q.question, onchange: (e: Event) => { q.question = (e.target as HTMLInputElement).value; } })), ...extra);
+  }), h('button', { type: 'button', onclick: () => { qs.push({ type: 'open', question: '' }); drawQ(); } }, '+ Add question'));
+  drawQ();
+  const err = errBox(); const btn = h('button', { class: 'primary', type: 'submit' }, id ? 'Save survey' : 'Create survey') as HTMLButtonElement;
+  const form = h('form', {}, eventList(), h('div', { class: 'card' }, h('label', {}, 'Name', name), h('label', {}, 'Type', type)),
+    h('div', { class: 'card' }, h('h2', {}, 'Questions'), qbox),
+    h('div', { class: 'card' }, h('h2', {}, 'Display conditions'), h('label', {}, 'URL contains', url), h('label', {}, 'Triggering event', trigger)), err, btn);
+  form.addEventListener('submit', busy(btn, async () => {
+    const conditions: any = {}; if (url.value.trim()) { conditions.url = url.value.trim(); conditions.urlMatchType = 'icontains'; } if (trigger.value.trim()) conditions.events = { repeatedActivation: false, values: [{ name: trigger.value.trim() }] };
+    const body = { name: name.value, type: type.value, questions: qs, conditions: Object.keys(conditions).length ? conditions : null };
+    const r = id ? await api<any>(apiP(`/surveys/${id}`), { method: 'PATCH', body }) : await api<any>(apiP('/surveys'), { body });
+    nav(P(`/surveys/${r.id}`));
+  }, err));
+  shell(id ? `Edit ${sv.name}` : 'New survey', [], form);
+}
+async function surveyPage(id: string) {
+  shell('Survey', [], loading());
+  const [sv, r] = await Promise.all([api<any>(apiP(`/surveys/${id}`)), api<any>(apiP(`/surveys/${id}/results`))]);
+  const act = (action: string, label: string, cls = '') => h('button', { class: cls, onclick: async () => { await api(apiP(`/surveys/${id}`), { method: 'PATCH', body: { action } }); surveyPage(id); } }, label);
+  const actions: Child[] = [link(P(`/surveys/${id}/edit`), 'Edit', 'button')];
+  if (sv.status === 'draft') actions.push(act('launch', 'Launch', 'primary'));
+  if (sv.status === 'running') actions.push(act('stop', 'Stop'));
+  if (sv.status === 'complete') actions.push(act('resume', 'Resume'));
+  actions.push(h('button', { class: 'link danger', onclick: async () => { if (!confirm(`Delete survey ${sv.name}? Responses stay in your events.`)) return; await api(apiP(`/surveys/${id}`), { method: 'DELETE' }); nav(P('/surveys')); } }, 'Delete'));
+  const bars = (rows: { label: string; count: number }[], total: number) => h('div', { class: 'hbars' }, rows.map((x, k) => h('div', { class: 'hbar' }, h('span', { class: 'hl' }, x.label),
+    h('span', { class: 'track' }, h('span', { class: 'fill', style: `width:${total ? (100 * x.count / total) : 0}%;background:${color(k % 2 ? 0 : 0)}` })), h('span', { class: 'small' }, `${fmt(x.count)} · ${total ? pct(x.count / total, 0) : '0%'}`))));
+  const qcard = (q: any, i: number) => {
+    let body: Child;
+    if (q.type === 'rating') body = h('div', {}, q.nps !== undefined ? h('div', { class: 'bold-number' }, h('div', {}, h('div', { class: 'big' }, String(q.nps)), h('div', { class: 'muted' }, 'NPS')),
+      h('div', {}, h('div', { class: 'big pos' }, fmt(q.promoters)), h('div', { class: 'muted' }, 'Promoters')), h('div', {}, h('div', { class: 'big muted' }, fmt(q.passives)), h('div', { class: 'muted' }, 'Passives')), h('div', {}, h('div', { class: 'big danger' }, fmt(q.detractors)), h('div', { class: 'muted' }, 'Detractors')))
+      : h('p', {}, 'Average ', h('b', {}, q.average === null ? '–' : q.average.toFixed(2))), bars(q.distribution.map((d: any) => ({ label: String(d.value), count: d.count })), q.responses));
+    else if (q.choices) body = bars(q.choices.map((c: any) => ({ label: c.choice, count: c.count })), q.responses);
+    else body = q.latest?.length ? h('ul', { class: 'timeline' }, q.latest.slice(0, 12).map((a: any) => h('li', {}, h('div', {}, a.value), h('span', { class: 'muted small' }, `${a.person ? a.person.name : a.distinct_id} · ${when(a.timestamp)}`)))) : h('p', { class: 'muted' }, 'No answers yet.');
+    return h('section', { class: 'card' }, h('h2', {}, `${i + 1}. ${q.question}`), h('p', { class: 'muted small' }, `${fmt(q.responses)} answers${q.latest?.length > 12 ? ' · latest 12 shown' : ''}`), body);
+  };
+  shell(h('span', {}, sv.name, ' ', statusTag(sv.status)), actions,
+    h('div', { class: 'card' }, h('div', { class: 'bold-number' },
+      h('div', {}, h('div', { class: 'big' }, fmt(r.shown.persons)), h('div', { class: 'muted' }, 'Shown (persons)')),
+      h('div', {}, h('div', { class: 'big' }, fmt(r.sent.responses)), h('div', { class: 'muted' }, 'Responses')),
+      h('div', {}, h('div', { class: 'big' }, fmt(r.dismissed.persons)), h('div', { class: 'muted' }, 'Dismissed')),
+      h('div', {}, h('div', { class: 'big' }, r.response_rate === null ? '–' : pct(r.response_rate, 0)), h('div', { class: 'muted' }, 'Response rate')))),
+    ...r.questions.map(qcard),
+    h('p', { class: 'muted small' }, sv.status === 'running' ? 'posthog-js loads this survey from /api/surveys and shows it to matching visitors.' : 'Launch to show this survey to visitors.'));
 }
 
 // ---------- router ----------
@@ -566,6 +795,15 @@ async function render() {
     if (sub === '/feature_flags/new') return await flagPage(null);
     if ((r = /^\/feature_flags\/(\d+)$/.exec(sub))) return await flagPage(+r[1]);
     if (sub === '/settings') return await settingsPage();
+    if (sub === '/replay') return await replayListPage();
+    if ((r = /^\/replay\/([^/]+)$/.exec(sub))) return await replayPage(decodeURIComponent(r[1]));
+    if (sub === '/experiments') return await experimentsPage();
+    if (sub === '/experiments/new') return await experimentNewPage();
+    if ((r = /^\/experiments\/(\d+)$/.exec(sub))) return await experimentPage(+r[1]);
+    if (sub === '/surveys') return await surveysPage();
+    if (sub === '/surveys/new') return await surveyEditPage(null);
+    if ((r = /^\/surveys\/([\w-]+)\/edit$/.exec(sub))) return await surveyEditPage(r[1]);
+    if ((r = /^\/surveys\/([\w-]+)$/.exec(sub))) return await surveyPage(r[1]);
     shell('Not found', [], h('p', {}, 'Nothing here. ', link(P('/dashboards'), 'Go to dashboards')));
   } catch (e) {
     root.replaceChildren(h('div', { class: 'center' }, h('div', { class: 'auth card' }, h('p', { class: 'error' }, e instanceof Error ? e.message : String(e)), link('/', 'Reload'))));

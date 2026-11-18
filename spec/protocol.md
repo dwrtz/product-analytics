@@ -17,7 +17,9 @@ point to the PostHog MIT source the rule was read from (commit and paths in
 | `/flags`, `/decide` | POST, GET | flag evaluation (`/flags/?v=2` from posthog-js, `?v=4` from posthog-node) | 8 |
 | `/array/<token>/config`, `/array/<token>/config.js` | GET | posthog-js remote config | 9 |
 | `/static/<file>`, `/static/<version>/<file>` | GET | the snippet and lazy-loaded SDK bundles | 9 |
-| `/s`, `/i/v0/s`, `/api/surveys`, `/api/web_experiments`, `/api/early_access_features` | any | out-of-scope products | 9 |
+| `/s`, `/i/v0/s` | POST | posthog-js session recorder snapshots (observed: `/s/`) | 11 |
+| `/api/surveys` | GET | posthog-js surveys (`?token=`) | 12 |
+| `/api/web_experiments`, `/api/early_access_features` | any | out-of-scope products | 9 |
 | any of the above | OPTIONS | CORS preflight: 204 | 1 |
 
 Every response to these paths carries
@@ -304,7 +306,21 @@ A missing property matches only `is_not`, `not_icontains`, `not_regex` and
 ```
 
 `hasFeatureFlags` is whether the project has an active flag.
-`autocapture_opt_out` is the project setting.
+`autocapture_opt_out` is the project setting. `surveys` is `true` while
+the project has a running survey (12). `sessionRecording` is `false`, or,
+when the project records sessions, the recorder config posthog-js reads
+(fields from posthog-js `packages/browser-common/src/types/remote-config.ts`
+`SessionRecordingRemoteConfig`;
+observed working with posthog-js 1.450.1):
+
+```json
+{ "endpoint": "/s/", "consoleLogRecordingEnabled": true, "recorderVersion": "v2", "sampleRate": null,
+  "minimumDurationMilliseconds": null, "linkedFlag": null, "networkPayloadCapture": null, "masking": null,
+  "urlTriggers": [], "urlBlocklist": [], "eventTriggers": [], "triggerMatchType": null, "scriptConfig": null }
+```
+
+The `/flags` response with `config=true` (and `/decide`) carries the same
+two fields.
 
 `/static/<file>` serves the posthog-js `dist/*.js` files of the version the
 build installed (plus its licence), with CORS and a one-hour cache;
@@ -313,10 +329,8 @@ asks for `/static/<its version>/surveys.js` first: observed). posthog-js
 loads extension bundles such as `surveys.js` even when the remote config
 turns the product off, so every bundle must be present.
 
-Stubs: `/api/surveys` → `{"surveys":[]}`, `/api/web_experiments` →
-`{"experiments":[]}`, `/api/early_access_features` →
-`{"earlyAccessFeatures":[]}`, `/s` and `/i/v0/s` → `{"status":1}` (replay
-data is discarded).
+Stubs: `/api/web_experiments` → `{"experiments":[]}`,
+`/api/early_access_features` → `{"earlyAccessFeatures":[]}`.
 
 ## 10. SDK behaviour to expect (informative, observed)
 
@@ -338,3 +352,102 @@ data is discarded).
   `sendBeacon`.
 - posthog-node 6 posts v1 batches (gzip, `application/json`) and calls
   `/flags/?v=4`.
+
+## 11. Session recording snapshots [posthog-js packages/browser/src/extensions/replay; observed]
+
+posthog-js loads the recorder from `/static/<version>/lazy-recorder.js`
+(`scriptConfig.script` would rename it; this instance sends `null`) once
+remote config has a `sessionRecording` object, then POSTs batches to the
+config's `endpoint` (`/s/`). Observed with posthog-js 1.450.1: gzip body,
+`Content-Type: text/plain`, no query string; decode as section 4.
+
+The body is a JSON array of events (a `{"batch": [...]}` object or a single
+event is also accepted):
+
+```json
+[{ "uuid": "01a1ef4e-…", "event": "$snapshot", "timestamp": "2026-…Z",
+   "properties": { "$snapshot_data": [ <rrweb event>, … ], "$snapshot_bytes": 27654,
+     "$session_id": "01a1ef4e-98a2-…", "$window_id": "01a1ef4e-98a2-…", "distinct_id": "user-42",
+     "token": "<project token>", "$lib": "web", "$lib_version": "1.450.1", "$snapshot_host": "…" } }]
+```
+
+- The token is `properties.token` (else the body's `api_key`/`token`, else
+  `?token=`). `$snapshot_items` is accepted as an older name for
+  `$snapshot_data`. Events other than `$snapshot`/`$snapshot_items` are
+  ignored. `$session_id` must match `[A-Za-z0-9._:-]{1,200}`.
+- The answer is always `{"status":1}` (200) once the body decodes, also
+  when the project does not record sessions (the data is dropped); a body
+  that does not decode is 400 `invalid_payload`, over 20 MB 413.
+- rrweb events are `{type, data, timestamp}`: 2 full snapshot, 3
+  incremental (`data.source`: 0 mutation, 1 mouse move, 2 mouse
+  interaction where `data.type` 2 is a click, 3 scroll, 5 input, 8
+  stylesheet rule), 4 meta (`data.href`, `width`, `height`), 5 custom
+  (posthog-js sends `$remote_config_received`, `$session_options`,
+  `$posthog_config`, `$recording_started`, and `$pageview` on navigation), 6
+  plugin (`rrweb/console@1` with `payload.level`).
+- **Field compression** (observed on every full snapshot and mutation):
+  an event with `"cv": "2024-10"` carries some fields as a string whose
+  characters are the bytes (0-255) of a gzip stream of the field's JSON:
+  `data` of a type 2 event; `texts`, `attributes`, `removes` and `adds` of
+  a type 3 source 0 event; `adds` and `removes` of a type 3 source 8 event.
+  Fields that are already arrays or objects are left as they are. A reader
+  gunzips them, parses the JSON and drops `cv`.
+- Inputs are masked by posthog-js before sending (observed: `"text":
+  "*******"` for a password and for text fields); the server stores what it
+  receives.
+- Regular events carry `$session_id` and `$window_id`, which link them to
+  the recording.
+
+## 12. Surveys [posthog-js packages/browser-common/src/types/surveys.ts, packages/core/src/surveys/events.ts; observed]
+
+posthog-js fetches `GET /api/surveys/?token=<token>&_=<ms>` (observed)
+when remote config says `surveys: true`, and lazy-loads
+`/static/<version>/surveys.js`. A missing or malformed token is 401
+`missing_api_key`, an unknown one 401 `invalid_api_key`. The answer:
+
+```json
+{ "surveys": [ { "id": "<uuid>", "name": "NPS", "description": "", "type": "popover",
+  "questions": [
+    { "id": "q-rating", "type": "rating", "question": "How likely…?", "description": "", "optional": false,
+      "display": "number", "scale": 10, "lowerBoundLabel": "Unlikely", "upperBoundLabel": "Very likely" },
+    { "id": "q-choice", "type": "single_choice", "question": "What brought you here?", "choices": ["Search", "Friend", "Ad"],
+      "hasOpenChoice": false, "shuffleOptions": false },
+    { "id": "q-open", "type": "open", "question": "Anything else?" } ],
+  "appearance": { "whiteLabel": true }, "conditions": { "events": { "values": [ { "name": "opened_pricing" } ] } },
+  "start_date": "2026-…Z", "end_date": null, "linked_flag_key": null, "targeting_flag_key": null,
+  "internal_targeting_flag_key": null, "feature_flag_keys": [], "current_iteration": null,
+  "current_iteration_start_date": null, "schedule": "once", "enable_partial_responses": false } ] }
+```
+
+Only running surveys (launched, not stopped, not archived) are listed;
+posthog-js itself applies `conditions` (`url` with `urlMatchType`,
+`selector`, `events`, `deviceTypes`) and remembers per browser which
+surveys it showed. `appearance.whiteLabel: true` hides posthog-js's
+"Survey by PostHog" footer.
+
+Events posthog-js sends (observed), on the normal capture path:
+
+- `survey shown`: `$survey_id`, `$survey_name`, `$survey_iteration`,
+  `$survey_iteration_start_date`.
+- `survey dismissed`: the same, plus `$survey_partially_completed` when
+  some questions were answered.
+- `survey sent`: the same, plus `$survey_submission_id` (one id per
+  person's pass through the survey), `$survey_completed`,
+  `$survey_questions` (`[{id, question, response}]`) and one
+  `$survey_response_<question id>` per answer (a number for ratings, a
+  string for single choice and open, an array for multiple choice), and a
+  top-level `$set: {"$survey_responded/<survey id>": true}`. Older SDKs
+  send `$survey_response` for the first question and
+  `$survey_response_<index>` for later ones; readers accept both.
+
+## 13. Experiment exposure [observed]
+
+`posthog.getFeatureFlag(key)` and `isFeatureEnabled(key)` send
+`$feature_flag_called` the first time a flag is read in a page load (and
+again if its value changes), with `$feature_flag` (the key),
+`$feature_flag_response` (variant string or boolean), `$feature_flag_id`,
+`$feature_flag_version`, `$feature_flag_reason`, `$feature_flag_request_id`,
+`$feature_flag_payload` and `$feature_flag_bootstrapped_response`
+(observed). posthog-node's `getFeatureFlag` / `evaluateFlags().getFlag`
+sends the same event from the server. Experiments use the first such
+event per person as the exposure (design.md "Experiments").

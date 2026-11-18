@@ -4,6 +4,7 @@ import { authenticate, createPersonalKey, login, logout, signup, signupOpen } fr
 import { randomToken } from '../shared/ids';
 import { forgetToken } from './projects';
 import { QueryError } from './query';
+import { chunkPrefix, deletePrefix, readSnapshots } from './replay';
 
 const readJson = async (req: Request) => { try { return await req.json() as any; } catch { throw new HttpError(400, 'bad_request', 'Body must be JSON.'); } };
 const validTz = (tz: string) => { try { new Intl.DateTimeFormat('en', { timeZone: tz }); return true; } catch { return false; } };
@@ -59,12 +60,13 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
       const ret = b.retention_days !== undefined ? Math.max(0, Math.floor(Number(b.retention_days) || 0)) : project.retention_days;
       const anon = b.anonymize_ips !== undefined ? (b.anonymize_ips ? 1 : 0) : project.anonymize_ips;
       const ac = b.autocapture_opt_out !== undefined ? (b.autocapture_opt_out ? 1 : 0) : project.autocapture_opt_out;
-      const r = await env.DB.prepare('UPDATE projects SET name = ?, timezone = ?, retention_days = ?, anonymize_ips = ?, autocapture_opt_out = ? WHERE id = ? RETURNING *').bind(name, tz, ret, anon, ac, pid).first<ProjectRow>();
+      const rec = b.session_recording !== undefined ? (b.session_recording ? 1 : 0) : (project.session_recording ?? 0);
+      const r = await env.DB.prepare('UPDATE projects SET name = ?, timezone = ?, retention_days = ?, anonymize_ips = ?, autocapture_opt_out = ?, session_recording = ? WHERE id = ? RETURNING *').bind(name, tz, ret, anon, ac, rec, pid).first<ProjectRow>();
       forgetToken(project.api_token);
       return json(projectOut(r!));
     }
     if (m === 'DELETE') {
-      await store.destroy(); await env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(pid).run(); forgetToken(project.api_token); return json({ ok: true });
+      await store.destroy(); await deletePrefix(env, chunkPrefix(pid)); await env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(pid).run(); forgetToken(project.api_token); return json({ ok: true });
     }
   }
   if (sub === '/reset_token' && m === 'POST') {
@@ -87,7 +89,11 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
   let s = /^\/persons\/([^/]+)$/.exec(sub);
   if (s) {
     if (m === 'GET') { const p = await store.getPerson(decodeURIComponent(s[1])); if (!p) throw new HttpError(404, 'not_found'); return json(p); }
-    if (m === 'DELETE') { const ok = await store.deletePerson(decodeURIComponent(s[1]), url.searchParams.get('delete_events') === '1'); if (!ok) throw new HttpError(404, 'not_found'); return json({ ok: true }); }
+    if (m === 'DELETE') {
+      const ok = await store.deletePerson(decodeURIComponent(s[1]), url.searchParams.get('delete_events') === '1'); if (!ok) throw new HttpError(404, 'not_found');
+      for (const sid of ok.recordings) await deletePrefix(env, chunkPrefix(pid, sid));
+      return json({ ok: true });
+    }
   }
   if (sub === '/insights') {
     if (m === 'GET') return json(await store.listInsights());
@@ -123,8 +129,41 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
     if (m === 'PATCH') { const r = await store.saveFlag(+s[1], await readJson(req)); if ('error' in r) throw new HttpError(r.error === 'not_found' ? 404 : 400, r.error === 'not_found' ? 'not_found' : 'bad_request', r.error); return json(r); }
     if (m === 'DELETE') { if (!await store.deleteFlag(+s[1])) throw new HttpError(404, 'not_found'); return json({ ok: true }); }
   }
+  if (sub === '/experiments') {
+    if (m === 'GET') return json(await store.listExperiments());
+    if (m === 'POST') { const r = await store.saveExperiment(null, await readJson(req)); if ('error' in r) throw new HttpError(400, 'bad_request', r.error); return json(r, 201); }
+  }
+  s = /^\/experiments\/(\d+)(\/results)?$/.exec(sub);
+  if (s) {
+    if (s[2] && m === 'GET') { const r = await store.experimentResults(+s[1]); if (!r) throw new HttpError(404, 'not_found'); return json(r); }
+    if (!s[2] && m === 'GET') { const e = await store.getExperiment(+s[1]); if (!e) throw new HttpError(404, 'not_found'); return json(e); }
+    if (!s[2] && m === 'PATCH') { const r = await store.saveExperiment(+s[1], await readJson(req)); if ('error' in r) throw new HttpError(r.error === 'not_found' ? 404 : 400, r.error === 'not_found' ? 'not_found' : 'bad_request', r.error); return json(r); }
+    if (!s[2] && m === 'DELETE') { if (!await store.deleteExperiment(+s[1])) throw new HttpError(404, 'not_found'); return json({ ok: true }); }
+  }
+  if (sub === '/surveys') {
+    if (m === 'GET') return json(await store.listSurveys());
+    if (m === 'POST') { const r = await store.saveSurvey(null, await readJson(req)); if ('error' in r) throw new HttpError(400, 'bad_request', r.error); return json(r, 201); }
+  }
+  s = /^\/surveys\/([\w-]+)(\/results)?$/.exec(sub);
+  if (s) {
+    if (s[2] && m === 'GET') { const r = await store.surveyResults(s[1]); if (!r) throw new HttpError(404, 'not_found'); return json(r); }
+    if (!s[2] && m === 'GET') { const e = await store.getSurvey(s[1]); if (!e) throw new HttpError(404, 'not_found'); return json(e); }
+    if (!s[2] && m === 'PATCH') { const r = await store.saveSurvey(s[1], await readJson(req)); if ('error' in r) throw new HttpError(r.error === 'not_found' ? 404 : 400, r.error === 'not_found' ? 'not_found' : 'bad_request', r.error); return json(r); }
+    if (!s[2] && m === 'DELETE') { if (!await store.deleteSurvey(s[1])) throw new HttpError(404, 'not_found'); return json({ ok: true }); }
+  }
+  if (sub === '/session_recordings' && m === 'GET') {
+    const before = url.searchParams.get('before');
+    return json(await store.listRecordings({ personId: url.searchParams.get('person_id'), distinctId: url.searchParams.get('distinct_id'), before: before ? Number(before) : null, limit: Number(url.searchParams.get('limit')) || 50 }));
+  }
+  s = /^\/session_recordings\/([^/]+)(\/snapshots)?$/.exec(sub);
+  if (s) {
+    const sid = decodeURIComponent(s[1]);
+    if (s[2] && m === 'GET') { const r = await store.getRecording(sid); if (!r) throw new HttpError(404, 'not_found'); return json({ snapshots: await readSnapshots(env, pid, sid) }); }
+    if (!s[2] && m === 'GET') { const r = await store.getRecording(sid); if (!r) throw new HttpError(404, 'not_found'); return json(r); }
+    if (!s[2] && m === 'DELETE') { if (!await store.deleteRecording(sid)) throw new HttpError(404, 'not_found'); await deletePrefix(env, chunkPrefix(pid, sid)); return json({ ok: true }); }
+  }
   throw new HttpError(404, 'not_found');
 }
 function projectOut(p: ProjectRow) {
-  return { id: p.id, name: p.name, api_token: p.api_token, timezone: p.timezone, retention_days: p.retention_days, anonymize_ips: !!p.anonymize_ips, autocapture_opt_out: !!p.autocapture_opt_out, created_at: p.created_at };
+  return { id: p.id, name: p.name, api_token: p.api_token, timezone: p.timezone, retention_days: p.retention_days, anonymize_ips: !!p.anonymize_ips, autocapture_opt_out: !!p.autocapture_opt_out, session_recording: !!p.session_recording, created_at: p.created_at };
 }

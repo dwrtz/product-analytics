@@ -68,3 +68,9 @@ code.token { display: inline-block; word-break: break-all; background: var(--bg)
   table:not(.props):not(.retention) { display: block; overflow-x: auto; } td.url { max-width: 160px; }
   .chart .axis { font-size: 16px; } .bold-number { gap: 18px; } .big { font-size: 34px; } .title-input { min-width: 0; width: 100%; }
 }
+.spread { justify-content: space-between; } .pos { color: #047857; } .mono { font-family: ui-monospace, monospace; }
+.tag.status-running { color: #047857; border-color: #a7f3d0; background: #ecfdf5; } .tag.status-complete { color: #374151; background: #f3f4f6; } .tag.status-draft { color: #92400e; border-color: #fde68a; background: #fffbeb; }
+.ci-cell { display: flex; flex-direction: column; gap: 2px; min-width: 160px; } svg.ci { width: 100%; height: 18px; display: block; }
+.replay-link { display: inline-block; margin-right: 6px; font-size: 11px; color: var(--accent); }
+.cols.replay { grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr); } .player { min-height: 200px; } .player .rr-player { box-shadow: none !important; } .player .rr-player__frame { overflow: hidden; }
+[hidden] { display: none !important; }

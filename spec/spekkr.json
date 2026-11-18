@@ -2,23 +2,23 @@
   "spekkr": 1,
   "id": "dwrtz/product-analytics",
   "name": "Product Analytics",
-  "summary": "Self-hosted product analytics on Cloudflare that takes posthog-js unchanged: persons, trends, funnels, retention, dashboards and flags.",
+  "summary": "Self-hosted product analytics on Cloudflare for unmodified posthog-js: trends, funnels, flags, session replay, experiments, surveys.",
   "kind": "web app",
   "keywords": [
     "product analytics",
-    "event tracking",
     "posthog-js compatible",
+    "session replay",
+    "experiments",
+    "surveys",
     "feature flags",
     "funnels",
     "retention",
     "dashboards",
     "self-hosted",
     "cloudflare workers",
-    "durable objects",
-    "d1",
-    "queues"
+    "durable objects"
   ],
-  "version": "0.1.1",
+  "version": "0.2.0",
   "author": {
     "id": "dwrtz",
     "name": "David Wurtz"
@@ -34,9 +34,11 @@
       "Cloudflare Durable Objects (SQLite)",
       "Cloudflare D1",
       "Cloudflare Queues",
+      "Cloudflare R2",
       "Wrangler",
       "lz-string",
       "posthog-js",
+      "rrweb-player",
       "esbuild",
       "Vitest",
       "Playwright",
@@ -62,11 +64,11 @@
   "files": [
     {
       "path": "spec.md",
-      "about": "Requirements R1-R14 with acceptance checks, scope and definition of done."
+      "about": "Requirements R1-R18 (0.2 adds event shards, session replay, experiments and surveys) with acceptance checks, scope and definition of done."
     },
     {
       "path": "protocol.md",
-      "about": "The normative SDK wire format: capture routes, body decoding, tokens, timestamps, v1 capture, persons and merges, feature flags, remote config, error codes."
+      "about": "The normative SDK wire format: capture routes, body decoding, tokens, timestamps, v1 capture, persons and merges, feature flags, remote config, session recording snapshots, surveys, exposure events, error codes."
     },
     {
       "path": "test-vectors.json",
@@ -74,7 +76,7 @@
     },
     {
       "path": "design.md",
-      "about": "Stack, the storage decision, Cloudflare config, deploy, data model, ingestion path, query semantics, owner API, screens, tests and limits."
+      "about": "Stack, storage and event-shard decisions, Cloudflare config, deploy and upgrade, data model, ingestion, query semantics, replay, experiment statistics, surveys, owner API, screens, tests and limits."
     },
     {
       "path": "tasks.md",
@@ -82,7 +84,7 @@
     },
     {
       "path": "research.md",
-      "about": "How the protocol was established with REA, the evidence and obligation ledgers, unknowns, licensing and the 0.1 choices."
+      "about": "How the protocol was established with REA (0.1 and 0.2 captures, conformance runs), evidence and obligation ledgers, unknowns, licensing and choices."
     }
   ],
   "needs": {
@@ -105,6 +107,11 @@
   "lineage": {},
   "changelog": [
     {
+      "version": "0.2.0",
+      "date": "2026-11-18",
+      "note": "Session replay (posthog-js recorder, R2 chunks, rrweb-player), experiments (multivariate flags, Bayesian results), surveys (posthog-js /api/surveys, results) and time-sharded event storage past 10 GB per project with exact counts. Upgrades a 0.1 instance in place."
+    },
+    {
       "version": "0.1.1",
       "date": "2026-11-18",
       "note": "posthog-js is credited with its actual licence (Apache-2.0 and MIT). The e2e flag check waits for the flags reload after identify, so it also passes against a deployed instance over the network."
@@ -121,11 +128,14 @@
       "shots/trends.png",
       "shots/funnel.png",
       "shots/retention.png",
-      "shots/events.png",
-      "shots/person.png",
-      "shots/flag.png",
-      "shots/settings.png",
-      "shots/dashboard-mobile.png"
+      "shots/replay-list.png",
+      "shots/replay-player.png",
+      "shots/person-recordings.png",
+      "shots/experiment-results.png",
+      "shots/experiment-new.png",
+      "shots/survey-results.png",
+      "shots/survey-edit.png",
+      "shots/experiment-mobile.png"
     ]
   }
 }

@@ -5,7 +5,7 @@ the public wire protocol of PostHog's SDKs, so the published `posthog-js` (Apach
 `posthog-node` libraries work against it unchanged. It contains no PostHog
 code and no PostHog branding. This file records how the protocol was
 established, the evidence behind each rule, what is still unknown, and the
-0.1 choices. It is context, not extra requirements.
+0.1 and 0.2 choices. It is context, not extra requirements.
 
 ## Method: REA (reverse engineer anything)
 
@@ -59,6 +59,57 @@ bundled `reverse-engineer-anything` skill. Its method was followed:
 - The final conformance capture against the self-built server: 16 SDK
   transactions, all 2xx, none failed.
 
+### 0.2: session replay, surveys, experiment exposure
+
+The same method was applied to the three new protocols with posthog-js
+1.450.1:
+
+1. **Runtime capture against a recorder.** A second recording server
+   (`recorder2/`) served a page running the unmodified bundles and a
+   remote config with `sessionRecording` set and `surveys: true`, answered
+   `/api/surveys` with an NPS survey (rating, single choice, open) and
+   `/flags` with a multivariate flag, and logged every request decoded.
+   The REA scenario typed into a text field and a password field, clicked,
+   read flags, identified, triggered the survey and answered all three
+   questions through the real popover, then navigated
+   (`capture_browser_scenario`, `ev_64cbe291…`, summary `ev_e4b81384…`, 0
+   failed). What it established (now `protocol.md` 9, 11-13):
+   - the recorder is lazy-loaded from `/static/<version>/lazy-recorder.js`
+     and posts to the config's `endpoint` (`/s/`), gzip with
+     `Content-Type: text/plain` and no query string, a JSON array of
+     `$snapshot` events carrying `$snapshot_data`, `$snapshot_bytes`,
+     `$session_id`, `$window_id`, `distinct_id` and `token`;
+   - full snapshots and mutations arrive **field-compressed** (`cv:
+     "2024-10"`: a field's JSON gzipped and sent as a byte string), which
+     a reader must undo before rrweb can play them; nothing in the
+     request says so except `cv`;
+   - inputs are masked in the browser (the password and the text field
+     arrive as asterisks), and regular events carry `$session_id` and
+     `$window_id`;
+   - surveys are fetched from `/api/surveys/?token=…&_=…`, rendered by
+     `/static/<version>/surveys.js`, and answered with `survey shown`
+     and `survey sent` events whose properties carry the answers per
+     question id, plus a `$survey_submission_id`; without
+     `appearance.whiteLabel` the popover shows a PostHog footer;
+   - `getFeatureFlag` sends `$feature_flag_called` once per flag per page
+     load with the variant in `$feature_flag_response`.
+   The two recorded `/s/` bodies and the survey events are the fixtures of
+   `tests/replay.test.ts` and `tests/experiments.test.ts`.
+2. **Reference source** for names and shapes the traffic cannot show
+   (posthog-js `packages/browser-common/src/types/remote-config.ts` and
+   `types/surveys.ts`, `packages/core/src/surveys/events.ts`,
+   `packages/browser/src/extensions/replay/`), all in the MIT/Apache
+   `posthog-js` repository at `15aef2ce`.
+3. **Conformance.** The same scenario against the self-built server under
+   `wrangler dev` (project with recording on, a launched experiment on a
+   multivariate flag, a launched survey): 22 transactions (config,
+   `/flags`, `/e/`, `/i/v0/e/`, `/s/`, `/api/surveys`, `array.js`,
+   `lazy-recorder.js`, `surveys.js`), all 2xx, none failed
+   (`ev_db418df4…`, summary `ev_49b453af…`). Afterwards the server held one
+   recording (10 clicks, 4 key presses, 2 chunks; snapshots decompressed,
+   with a full snapshot; the typed password absent), the survey's answers
+   (NPS 100, the chosen option, the text) and one experiment exposure.
+
 ## Evidence ledger
 
 Evidence files are kept with the reference build's working notes
@@ -71,6 +122,9 @@ Evidence files are kept with the reference build's working notes
 | `ev_1bf4f557…` (summary `ev_5b4d3a36…`) | capture_browser_scenario | same, with identify/group/alias/flag steps; 2 expected failures (recorder has no flag or survey answers) |
 | `ev_69c9eef3…` (summary `ev_c588dca9…`) | capture_browser_scenario | posthog-js against the self-built server: 18 transactions, 4 failed (`surveys.js` 404) |
 | `ev_d91bc8d5…` (summary `ev_f5fb4a24…`) | capture_browser_scenario | the same after the fix: 16 transactions, 0 failed |
+| `ev_64cbe291…` (summary `ev_e4b81384…`) | capture_browser_scenario | 0.2: posthog-js recorder, surveys and exposure against `recorder2` (port 8798), 0 failed |
+| `ev_db418df4…` (summary `ev_49b453af…`) | capture_browser_scenario | 0.2 conformance: the same scenario against the self-built server, 22 transactions, 0 failed |
+| `recorder2/recorded.jsonl` | recorder | raw 0.2 requests (`/s/` bodies, survey and exposure events) |
 | `sdk-wire.recorded.jsonl` | recorder | raw posthog-js requests (headers, bodies) |
 | `node-sdk-wire.recorded.jsonl` | recorder | raw posthog-node 6.0.3 requests |
 
@@ -96,6 +150,11 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
 | Flags response shape (8) | `rust/feature-flags/src/flags/flag_match_reason.rs`, `api/`; runtime captures |
 | Remote config fields (9) | runtime captures (`config.js`), posthog-js `packages/browser/src/remote-config.ts` |
 | Lazy bundles (9) | runtime captures `ev_69c9eef3…` / `ev_d91bc8d5…` |
+| Recording config fields (9) | posthog-js `packages/browser-common/src/types/remote-config.ts`; `ev_64cbe291…` |
+| Snapshot requests, field compression, masking (11) | `ev_64cbe291…`; posthog-js `packages/browser/src/extensions/replay/` |
+| Survey fetch, survey shape and events (12) | `ev_64cbe291…`; posthog-js `packages/browser-common/src/types/surveys.ts`, `packages/core/src/surveys/events.ts` |
+| Exposure event (13) | `ev_64cbe291…` |
+| Experiment statistics | PostHog's public docs (posthog.com/docs/experiments/statistics-bayesian: flat prior, chance to win, 95% threshold, 50 exposures) for the user-facing rules; conjugate Beta/Gamma/Normal posteriors and Evan Miller's closed form for P(B > A) from standard references; no PostHog code |
 | Ordered funnel semantics | `funnel-udf/src/steps.rs` |
 | Funnel events limited to the date range | `products/product_analytics/backend/hogql_queries/funnels/funnel_event_query.py` |
 
@@ -123,8 +182,19 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
   verified beyond its documentation.
 - **Geo** comes from Cloudflare's request data instead of a MaxMind
   lookup, so `$geoip_*` values follow Cloudflare's naming.
-- Not studied: session replay, surveys, experiments, heatmaps, web
-  analytics, the data warehouse, HogQL.
+- **Replay ingestion** writes one chunk per request and keeps payloads as
+  sent; PostHog's own replay pipeline (blob storage layout, its
+  `/api/.../snapshots` format) was not copied and is not needed by the SDK.
+- **Experiments** use the first exposure per person and exclude persons
+  seen in two variants; PostHog's exact exposure and metric query rules
+  (and its `ee/` code) were not read. Our flags hash the distinct id, so
+  a variant can change at identify without "experience continuity".
+- **Surveys:** targeting flags, iterations, partial-response merging
+  beyond the latest event per submission id, and the feedback widget's
+  server pieces are not implemented; posthog-js applies display
+  conditions itself.
+- Not studied: heatmaps, web analytics, the data warehouse, HogQL, replay
+  triggers and sampling, network and canvas capture.
 
 ## Licensing
 
@@ -138,6 +208,9 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
 - The build ships the unmodified `posthog-js` `dist` files and its
   `LICENSE` (as `posthog-js.LICENSE.txt`) under `/static/`, as its
   licences allow.
+- The replay player is `rrweb-player` 2.2.2 (npm, MIT, from
+  `github.com/rrweb-io/rrweb`; licence checked in its `package.json`
+  and `LICENSE`), bundled unmodified into `/player.js`.
 - The product name, UI and copy are neutral. "PostHog" appears only where
   the protocol is attributed (here and in `protocol.md`).
 
@@ -153,3 +226,15 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
 - Events kept forever by default (as self-hosted PostHog); a deployer can
   set `DEFAULT_RETENTION_DAYS` for new projects, and owners change it per
   project. The daily cron purges when set.
+
+## Choices made for 0.2
+
+- Events split into one Durable Object per project per UTC month, persons
+  stay in the head, queries are two-phase (`design.md`, "Event shards").
+  Exact at every age; Basin remains the path for warehouse-scale data.
+- Session recordings in R2 (one gzip chunk per request), metadata in the
+  head; off per project until enabled; 30 days by default.
+- Bayesian experiment statistics with a fixed seed so results are
+  reproducible; 95% probability to be best and 50 exposures per variant
+  before a winner is named.
+- Surveys are white-label by default.

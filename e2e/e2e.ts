@@ -25,13 +25,21 @@ async function until<T>(what: string, f: () => Promise<T>, ok: (v: T) => boolean
   return v;
 }
 
-// 1. account and a fresh project
+// 1. account and a fresh project (0.2: session recording on, an experiment on checkout-test, a launched NPS survey)
 try { await api('/api/signup', 'POST', { email: EMAIL, password: PASSWORD, name: 'E2E' }); } catch (e: any) { if (e.status !== 403 && e.status !== 409) throw e; }
 await api('/api/login', 'POST', { email: EMAIL, password: PASSWORD });
 const project = await api('/api/projects', 'POST', { name: `e2e ${new Date().toISOString()}`, timezone: 'UTC' });
 const A = `/api/projects/${project.id}`;
 await api(`${A}/feature_flags`, 'POST', { key: 'new-dashboard', filters: { groups: [{ properties: [{ key: 'email', value: ['ada@example.com'], operator: 'exact', type: 'person' }], rollout_percentage: 100 }] } });
 await api(`${A}/feature_flags`, 'POST', { key: 'checkout-test', filters: { groups: [{ properties: [], rollout_percentage: 100 }], multivariate: { variants: [{ key: 'control', rollout_percentage: 50 }, { key: 'test', rollout_percentage: 50 }] }, payloads: { test: '{"color":"green"}', control: '{"color":"blue"}' } } });
+await api(A, 'PATCH', { session_recording: true });
+const experiment = await api(`${A}/experiments`, 'POST', { name: 'Checkout test', feature_flag_key: 'checkout-test', metrics: [{ kind: 'funnel', series: [{ event: 'clicked_cta' }] }] });
+await api(`${A}/experiments/${experiment.id}`, 'PATCH', { action: 'launch' });
+const survey = await api(`${A}/surveys`, 'POST', { name: 'NPS', type: 'popover', conditions: { events: { values: [{ name: 'opened_pricing' }] } }, questions: [
+  { type: 'rating', id: 'q-rating', question: 'How likely are you to recommend us?', display: 'number', scale: 10, lowerBoundLabel: 'Unlikely', upperBoundLabel: 'Very likely' },
+  { type: 'single_choice', id: 'q-choice', question: 'What brought you here?', choices: ['Search', 'Friend', 'Ad'] },
+  { type: 'open', id: 'q-open', question: 'Anything else?' }] });
+await api(`${A}/surveys/${survey.id}`, 'PATCH', { action: 'launch' });
 
 // 2. a customer site on another origin with the install snippet from the Settings page
 const snippet = `!function(t,e){var o,n,p,r;e.__SV||(window.posthog=e,e._i=[],e.init=function(i,s,a){function g(t,e){var o=e.split(".");2==o.length&&(t=t[o[0]],e=o[1]),t[e]=function(){t.push([e].concat(Array.prototype.slice.call(arguments,0)))}}(p=t.createElement("script")).type="text/javascript",p.crossOrigin="anonymous",p.async=!0,p.src=s.api_host+"/static/array.js",(r=t.getElementsByTagName("script")[0]).parentNode.insertBefore(p,r);var u=e;for(void 0!==a?u=e[a]=[]:a="posthog",u.people=u.people||[],u.toString=function(t){var e="posthog";return"posthog"!==a&&(e+="."+a),t||(e+=" (stub)"),e},u.people.toString=function(){return u.toString(1)+".people (stub)"},o="capture identify alias people.set people.set_once set_config register register_once unregister opt_out_capturing has_opted_out_capturing opt_in_capturing reset isFeatureEnabled onFeatureFlags getFeatureFlag getFeatureFlagPayload reloadFeatureFlags group".split(" "),n=0;n<o.length;n++)g(u,o[n]);e._i.push([i,s,a])},e.__SV=1)}(document,window.posthog||[]);`;
@@ -42,7 +50,8 @@ posthog.init(${JSON.stringify(project.api_token)}, { api_host: ${JSON.stringify(
 <button id="identify" onclick="posthog.identify('user-42',{email:'ada@example.com'},{first_plan:'free'})">Identify</button>
 <button id="group" onclick="posthog.group('company','acme',{name:'Acme Inc'})">Group</button>
 <button id="flags" onclick="posthog.reloadFeatureFlags();posthog.onFeatureFlags(()=>{document.getElementById('out').textContent=JSON.stringify([posthog.isFeatureEnabled('new-dashboard'),posthog.getFeatureFlag('checkout-test'),posthog.getFeatureFlagPayload('checkout-test')])})">Flags</button>
-<a id="next" href="/page2">Next</a><pre id="out"></pre></body></html>`;
+<button id="pricing" onclick="posthog.capture('opened_pricing')">Pricing</button> <input id="name" placeholder="name"> <input id="secret" type="password">
+<a id="next" href="/page2">Next</a><pre id="out"></pre><p style="height:900px">Long page</p></body></html>`;
 const site = http.createServer((q, s) => { s.writeHead(200, { 'content-type': 'text/html' }); s.end(page(q.url === '/page2' ? 'Page 2' : 'Home')); });
 await new Promise<void>(r => site.listen(0, '127.0.0.1', r));
 const siteUrl = `http://127.0.0.1:${(site.address() as any).port}`;
@@ -54,6 +63,10 @@ const capturePosts: string[] = [];
 p.on('request', r => { const u = new URL(r.url()); if (u.origin === SITE && r.method() === 'POST') capturePosts.push(u.pathname); });
 await p.goto(siteUrl + '/');
 await p.waitForFunction(() => (window as any).posthog?.__loaded);
+await p.click('#flags'); // reads checkout-test before the CTA click: the experiment exposure
+await until('exposure', () => p.textContent('#out'), v => !!v && v.length > 2, 10000);
+await sleep(1500);
+await p.fill('#name', 'Ada'); await p.fill('#secret', 'hunter2');
 await p.click('#cta');
 await p.click('#identify');
 await p.click('#group');
@@ -64,6 +77,16 @@ const out = await until('flags', () => p.textContent('#out'), v => !!v && v.star
 const [enabled, variant, payload] = JSON.parse(out ?? '[]');
 check('posthog-js reads a person-property flag after identify', enabled === true, out);
 check('posthog-js gets a variant and its payload', ['control', 'test'].includes(variant) && JSON.stringify(payload) === JSON.stringify(variant === 'test' ? { color: 'green' } : { color: 'blue' }), out);
+// The survey: posthog-js loads /api/surveys and surveys.js, shows the popover after opened_pricing, sends 'survey sent'.
+await p.click('#pricing');
+const shown = await p.waitForSelector('.question-0-rating-9', { timeout: 15000 }).then(() => true).catch(() => false);
+check('posthog-js shows the launched survey after its trigger event', shown, null);
+if (shown) {
+  await p.click('.question-0-rating-9'); await p.click('.form-submit');
+  await p.click('#surveyQuestion1Choice1'); await p.click('.form-submit');
+  await p.fill('textarea', 'Great product'); await p.click('.form-submit');
+}
+await sleep(6000); // recorder flush
 await p.click('#next');
 await p.waitForURL(/page2/);
 await p.waitForFunction(() => (window as any).posthog?.__loaded);
@@ -71,6 +94,7 @@ await sleep(1500);
 await p.evaluate(() => (window as any).posthog?._requestQueue?.flush?.());
 await sleep(1500);
 check('posthog-js posts to /e/ or /i/v0/e/ and /flags/', capturePosts.some(x => /^\/(e|i\/v0\/e)\/?$/.test(x)) && capturePosts.some(x => x.startsWith('/flags')), capturePosts);
+check('the recorder posts snapshots to /s/', capturePosts.some(x => /^\/s\/?$/.test(x)), capturePosts);
 
 // 3. posthog-node over /i/v1/analytics/events
 const node = new PostHog(project.api_token, { host: SITE, flushAt: 1, flushInterval: 0 });
@@ -104,6 +128,25 @@ check('funnel: 1 person viewed and clicked, none ordered', JSON.stringify(fu.res
 const re = await q({ kind: 'RetentionQuery', retentionFilter: { targetEntity: { id: '$pageview', type: 'events' }, returningEntity: { id: '$pageview', type: 'events' }, period: 'Day', totalIntervals: 2 } });
 check('retention: today cohort of 1', re.results.at(-1).values[0].count === 1, re.results);
 
+// 5b. 0.2: replay, survey results, experiment exposure
+const recs = await until('recordings', () => api(`${A}/session_recordings`), (v: any) => v.results.length > 0 && v.results[0].click_count > 0);
+const rec = recs.results[0];
+check('a session recording was stored for the identified person', !!rec && rec.person?.name === 'ada@example.com' && rec.recording_duration > 0, rec);
+const snaps = rec ? (await api(`${A}/session_recordings/${encodeURIComponent(rec.id)}/snapshots`)).snapshots : [];
+check('snapshots come back decompressed with a full snapshot', snaps.some((e: any) => e.type === 2 && typeof e.data === 'object') && !snaps.some((e: any) => 'cv' in e), snaps.length);
+check('password input was masked by the recorder', !JSON.stringify(snaps).includes('hunter2'), null);
+const sres = await until('survey', () => api(`${A}/surveys/${survey.id}/results`), (v: any) => v.sent.responses > 0);
+check('survey results: shown, NPS answer, choice and text', sres.shown.persons === 1 && sres.questions[0].nps === 100 && sres.questions[1].choices.find((c: any) => c.choice === 'Friend')?.count === 1 && sres.questions[2].latest[0]?.value === 'Great product', sres);
+const xres = await api(`${A}/experiments/${experiment.id}/results`);
+const exposures = xres.variants.reduce((a: number, v: any) => a + v.exposures, 0);
+const conv = xres.metrics[0].variants.reduce((a: number, v: any) => a + v.conversions, 0);
+// Exposures: Ada in the browser (posthog-js) and server-1 (posthog-node's evaluateFlags also sends $feature_flag_called).
+// Flags hash the distinct_id, so Ada's variant can change at identify (PostHog's ensure_experience_continuity is not
+// implemented); a person seen with two variants is excluded, as PostHog does. Only Ada clicked the CTA after exposure.
+const adaCounted = xres.multiple_variant_persons === 0;
+check('experiment: exposures from $feature_flag_called (browser and server), conversion only after exposure',
+  exposures + xres.multiple_variant_persons === 2 && conv === (adaCounted ? 1 : 0), { variants: xres.variants, multiple: xres.multiple_variant_persons, conv });
+
 // 6. the owner UI renders the data
 const ui = await browser.newContext();
 const up = await ui.newPage();
@@ -116,6 +159,15 @@ check('insight editor draws a chart', (await up.locator('svg.chart').count()) ==
 await up.goto(`${SITE}/project/${project.id}/persons`);
 await up.waitForSelector('text=ada@example.com', { timeout: 10000 }).catch(() => null);
 check('persons list shows the identified person', (await up.locator('text=ada@example.com').count()) > 0, null);
+if (rec) {
+  await up.goto(`${SITE}/project/${project.id}/replay/${encodeURIComponent(rec.id)}`);
+  const played = await up.waitForSelector('.rr-player iframe', { timeout: 15000 }).then(() => true).catch(() => false);
+  check('replay page mounts rrweb-player with the recording', played, null);
+}
+await up.goto(`${SITE}/project/${project.id}/experiments/${experiment.id}`);
+check('experiment page shows the metric table', await up.waitForSelector('text=Chance to be best', { timeout: 10000 }).then(() => true).catch(() => false), null);
+await up.goto(`${SITE}/project/${project.id}/surveys/${survey.id}`);
+check('survey page shows the NPS', await up.waitForSelector('text=Promoters', { timeout: 10000 }).then(() => true).catch(() => false), null);
 
 await browser.close(); site.close();
 await api(A, 'DELETE');

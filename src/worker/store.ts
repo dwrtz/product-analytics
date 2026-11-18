@@ -1,18 +1,32 @@
-// ProjectStore: one SQLite-backed Durable Object per project (design.md "Event store").
-// Holds events, persons, groups, definitions, insights, dashboards and feature flags.
+// ProjectStore: the head SQLite Durable Object of a project (design.md "Event store").
+// Holds persons, groups, definitions, insights, dashboards, flags, experiments, surveys, recordings metadata and the
+// shard registry. Events live in EventShard objects, one per period; the head's own legacy `events` table (0.1 data) is
+// queried as one more shard, so upgrades move no data.
 import { DurableObject } from 'cloudflare:workers';
 import type { Env, NormEvent } from './env';
 import { isIllegalDistinctId, uuidv7 } from '../shared/ids';
 import { evaluateFlag, FlagDef, FlagResult } from '../shared/flags';
-import { runQuery, QueryContext } from './query';
+import { runQuery, QueryContext, Engine, ShardApi, PersonRef } from './query';
+import * as X from './eventsql';
+import type { EventShard } from './shard';
+import { experimentResults, validateMetric, Experiment } from './experiments';
+import { cleanSurvey, publicSurvey, surveyResults } from './surveys';
 
 const SCHEMA = [
-  `CREATE TABLE IF NOT EXISTS events (
-     id INTEGER PRIMARY KEY, uuid TEXT NOT NULL UNIQUE, event TEXT NOT NULL, distinct_id TEXT NOT NULL,
-     timestamp INTEGER NOT NULL, properties TEXT NOT NULL, created_at INTEGER NOT NULL)`,
-  `CREATE INDEX IF NOT EXISTS events_ts ON events (timestamp)`,
-  `CREATE INDEX IF NOT EXISTS events_event_ts ON events (event, timestamp)`,
-  `CREATE INDEX IF NOT EXISTS events_did_ts ON events (distinct_id, timestamp)`,
+  ...X.EVENTS_SCHEMA,
+  `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS shards (key TEXT PRIMARY KEY, start INTEGER NOT NULL, end INTEGER NOT NULL, events INTEGER NOT NULL DEFAULT 0)`,
+  `CREATE TABLE IF NOT EXISTS session_recordings (session_id TEXT PRIMARY KEY, distinct_id TEXT NOT NULL, start_ts INTEGER NOT NULL, end_ts INTEGER NOT NULL,
+     click_count INTEGER NOT NULL DEFAULT 0, keypress_count INTEGER NOT NULL DEFAULT 0, console_error_count INTEGER NOT NULL DEFAULT 0,
+     first_url TEXT, size INTEGER NOT NULL DEFAULT 0, chunks INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS recordings_start ON session_recordings (start_ts)`,
+  `CREATE INDEX IF NOT EXISTS recordings_did ON session_recordings (distinct_id, start_ts)`,
+  `CREATE TABLE IF NOT EXISTS experiments (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', feature_flag_key TEXT NOT NULL,
+     metrics TEXT NOT NULL DEFAULT '[]', filters TEXT NOT NULL DEFAULT '[]', start_date INTEGER, end_date INTEGER, archived INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS surveys (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', type TEXT NOT NULL, questions TEXT NOT NULL, appearance TEXT NOT NULL,
+     conditions TEXT, linked_flag_key TEXT, enable_partial_responses INTEGER NOT NULL DEFAULT 0, start_date INTEGER, end_date INTEGER, archived INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS ingest_log (uuid TEXT PRIMARY KEY, at INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS ingest_log_at ON ingest_log (at)`,
   `CREATE TABLE IF NOT EXISTS persons (
      id INTEGER PRIMARY KEY AUTOINCREMENT, uuid TEXT NOT NULL UNIQUE, properties TEXT NOT NULL DEFAULT '{}',
      is_identified INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_seen_at INTEGER)`,
@@ -46,24 +60,89 @@ export class ProjectStore extends DurableObject<Env> {
   private all<T = Row>(q: string, ...b: unknown[]): T[] { return this.sql.exec(q, ...(b as SqlStorageValue[])).toArray() as T[]; }
   private one<T = Row>(q: string, ...b: unknown[]): T | null { return (this.all<T>(q, ...b)[0] ?? null); }
 
+  // ---------- shards ----------
+  private period(): 'month' | 'day' {
+    let r = this.one<{ value: string }>("SELECT value FROM meta WHERE key = 'shard_period'")?.value;
+    if (!r) { r = this.env.SHARD_PERIOD === 'day' ? 'day' : 'month'; this.sql.exec("INSERT OR IGNORE INTO meta (key, value) VALUES ('shard_period', ?)", r); }
+    return r as 'month' | 'day';
+  }
+  /** The period key and bounds holding a timestamp (UTC months, or UTC days when SHARD_PERIOD=day). */
+  private periodOf(ts: number): { key: string; start: number; end: number } {
+    const d = new Date(ts); const y = d.getUTCFullYear(), m = d.getUTCMonth();
+    if (this.period() === 'day') { const start = Date.UTC(y, m, d.getUTCDate()); return { key: new Date(start).toISOString().slice(0, 10), start, end: start + 86400_000 }; }
+    return { key: new Date(Date.UTC(y, m, 1)).toISOString().slice(0, 7), start: Date.UTC(y, m, 1), end: Date.UTC(y, m + 1, 1) };
+  }
+  private shardStub(key: string) {
+    const ns = this.env.SHARDS; return ns.get(ns.idFromName(`${this.ctx.id.toString()}:${key}`)) as unknown as EventShard;
+  }
+  private legacyRows: boolean | null = null;
+  private hasLegacy(): boolean {
+    if (this.legacyRows === null) this.legacyRows = !!this.one('SELECT 1 AS x FROM events LIMIT 1');
+    return this.legacyRows;
+  }
+  private local(): ShardApi {
+    const q = this.sql;
+    return { trend: async s => X.trendRows(q, s), funnel: async s => X.funnelRows(q, s), periods: async s => X.periodRows(q, s), firsts: async s => X.firstRows(q, s), events: async s => X.eventRows(q, s) };
+  }
+  private shardsFor(from: number, to: number): { key: string; api: ShardApi }[] {
+    const out: { key: string; api: ShardApi }[] = [];
+    if (this.hasLegacy()) out.push({ key: 'legacy', api: this.local() });
+    for (const r of this.all<{ key: string }>('SELECT key FROM shards WHERE start <= ? AND end > ? ORDER BY start', to, from)) out.push({ key: r.key, api: this.shardStub(r.key) as unknown as ShardApi });
+    return out;
+  }
+  private engine(): Engine {
+    return {
+      shards: async (from, to) => this.shardsFor(from, to).map(s => s.api),
+      resolve: dids => {
+        const m = new Map<string, PersonRef>();
+        for (let i = 0; i < dids.length; i += 5000) {
+          for (const r of this.all<{ d: string; id: number; uuid: string; properties: string }>('SELECT d.distinct_id AS d, p.id, p.uuid, p.properties FROM json_each(?) j JOIN person_distinct_ids d ON d.distinct_id = j.value JOIN persons p ON p.id = d.person_id', JSON.stringify(dids.slice(i, i + 5000))))
+            m.set(r.d, { pk: 'p' + r.id, uuid: r.uuid, props: parse(r.properties) });
+        }
+        return m;
+      },
+      groupTypeName: idx => this.one<{ name: string }>('SELECT name FROM group_types WHERE idx = ?', idx)?.name ?? null,
+      firstEventAt: () => this.firstEventAt(),
+      distinctIdsOfPerson: uuid => this.all<{ d: string }>('SELECT distinct_id AS d FROM person_distinct_ids WHERE person_id = (SELECT id FROM persons WHERE uuid = ? OR CAST(id AS TEXT) = ?)', uuid, uuid).map(r => r.d),
+    };
+  }
+
   // ---------- ingestion ----------
+  private inflight = new Set<string>();
+  /**
+   * Exactly-once person processing: an event is new when its uuid is not in ingest_log (kept 7 days). New events go to
+   * their period's shard (INSERT OR IGNORE, so a retry after a crash cannot duplicate them), then persons, groups and
+   * definitions are updated in one head transaction that also records the uuids.
+   */
   async ingest(events: NormEvent[]): Promise<{ inserted: number; duplicates: number }> {
-    let inserted = 0, duplicates = 0;
-    this.ctx.storage.transactionSync(() => {
-      const lastSeen = new Map<string, number>();
-      for (const ev of events) {
-        const r = this.sql.exec('INSERT OR IGNORE INTO events (uuid, event, distinct_id, timestamp, properties, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-          ev.uuid, ev.event, ev.distinct_id, ev.ts, JSON.stringify(ev.properties), ev.received_at);
-        if (r.rowsWritten === 0) { duplicates++; continue; }
-        inserted++;
-        this.define(ev);
-        if (ev.event === '$groupidentify') this.groupIdentify(ev);
-        if (ev.person) this.processPerson(ev);
-        lastSeen.set(ev.distinct_id, Math.max(lastSeen.get(ev.distinct_id) ?? 0, ev.ts));
-      }
-      for (const [did, ts] of lastSeen) this.sql.exec('UPDATE persons SET last_seen_at = MAX(COALESCE(last_seen_at, 0), ?) WHERE id = (SELECT person_id FROM person_distinct_ids WHERE distinct_id = ?)', ts, did);
-    });
-    return { inserted, duplicates };
+    const fresh: NormEvent[] = []; const batch = new Set<string>();
+    const legacy = this.hasLegacy();
+    for (const ev of events) {
+      if (batch.has(ev.uuid) || this.inflight.has(ev.uuid)) continue;
+      if (this.one('SELECT 1 AS x FROM ingest_log WHERE uuid = ?', ev.uuid)) continue;
+      if (legacy && this.one('SELECT 1 AS x FROM events WHERE uuid = ?', ev.uuid)) continue;
+      batch.add(ev.uuid); fresh.push(ev);
+    }
+    for (const u of batch) this.inflight.add(u);
+    try {
+      const groups = new Map<string, { start: number; end: number; evs: NormEvent[] }>();
+      for (const ev of fresh) { const p = this.periodOf(ev.ts); let g = groups.get(p.key); if (!g) groups.set(p.key, g = { start: p.start, end: p.end, evs: [] }); g.evs.push(ev); }
+      const counts = await Promise.all([...groups].map(async ([key, g]) => [key, g, await this.shardStub(key).insert(g.evs)] as const));
+      const now = Date.now();
+      this.ctx.storage.transactionSync(() => {
+        for (const [key, g, n] of counts) this.sql.exec('INSERT INTO shards (key, start, end, events) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET events = events + excluded.events', key, g.start, g.end, n);
+        const lastSeen = new Map<string, number>();
+        for (const ev of fresh) {
+          this.sql.exec('INSERT OR IGNORE INTO ingest_log (uuid, at) VALUES (?, ?)', ev.uuid, now);
+          this.define(ev);
+          if (ev.event === '$groupidentify') this.groupIdentify(ev);
+          if (ev.person) this.processPerson(ev);
+          lastSeen.set(ev.distinct_id, Math.max(lastSeen.get(ev.distinct_id) ?? 0, ev.ts));
+        }
+        for (const [did, ts] of lastSeen) this.sql.exec('UPDATE persons SET last_seen_at = MAX(COALESCE(last_seen_at, 0), ?) WHERE id = (SELECT person_id FROM person_distinct_ids WHERE distinct_id = ?)', ts, did);
+      });
+    } finally { for (const u of batch) this.inflight.delete(u); }
+    return { inserted: fresh.length, duplicates: events.length - fresh.length };
   }
 
   private define(ev: NormEvent) {
@@ -168,7 +247,7 @@ export class ProjectStore extends DurableObject<Env> {
   async hasActiveFlags(): Promise<boolean> { return !!this.one('SELECT 1 FROM feature_flags WHERE active = 1 LIMIT 1'); }
 
   // ---------- queries ----------
-  async query(q: unknown, qc: QueryContext): Promise<unknown> { return runQuery(this.sql, q, qc); }
+  async query(q: unknown, qc: QueryContext): Promise<unknown> { return runQuery(this.engine(), q, qc); }
 
   async definitions() {
     return {
@@ -178,11 +257,11 @@ export class ProjectStore extends DurableObject<Env> {
     };
   }
   async propertyValues(kind: string, key: string): Promise<string[]> {
-    const path = '$.' + JSON.stringify(key);
-    const rows = kind === 'person'
-      ? this.all<{ v: string }>('SELECT DISTINCT CAST(json_extract(properties, ?) AS TEXT) AS v FROM persons WHERE json_extract(properties, ?) IS NOT NULL LIMIT 50', path, path)
-      : this.all<{ v: string }>('SELECT DISTINCT CAST(json_extract(properties, ?) AS TEXT) AS v FROM (SELECT properties FROM events ORDER BY timestamp DESC LIMIT 5000) WHERE json_extract(properties, ?) IS NOT NULL LIMIT 50', path, path);
-    return rows.map(r => r.v);
+    const path = X.pathOf(key);
+    if (kind === 'person') return this.all<{ v: string }>('SELECT DISTINCT CAST(json_extract(properties, ?) AS TEXT) AS v FROM persons WHERE json_extract(properties, ?) IS NOT NULL LIMIT 50', path, path).map(r => r.v);
+    const newest = this.one<{ key: string }>('SELECT key FROM shards ORDER BY start DESC LIMIT 1');
+    if (newest) return this.shardStub(newest.key).propertyValues(key);
+    return X.propertyValueRows(this.sql, key);
   }
 
   // ---------- persons ----------
@@ -199,15 +278,28 @@ export class ProjectStore extends DurableObject<Env> {
     const r = this.one<any>(`SELECT p.*, (SELECT group_concat(distinct_id, char(31)) FROM person_distinct_ids WHERE person_id = p.id) AS dids FROM persons p WHERE p.uuid = ? OR CAST(p.id AS TEXT) = ?`, id, id);
     return r ? personOut(r) : null;
   }
-  async deletePerson(id: string, deleteEvents: boolean) {
+  /** Deletes a person (and with deleteEvents their events and recordings); returns the deleted recordings' session ids. */
+  async deletePerson(id: string, deleteEvents: boolean): Promise<false | { recordings: string[] }> {
     const p = this.one<{ id: number }>('SELECT id FROM persons WHERE uuid = ? OR CAST(id AS TEXT) = ?', id, id);
     if (!p) return false;
+    let recordings: string[] = [];
+    if (deleteEvents) recordings = this.sql.exec('DELETE FROM session_recordings WHERE distinct_id IN (SELECT distinct_id FROM person_distinct_ids WHERE person_id = ?) RETURNING session_id', p.id).toArray().map(r => String(r.session_id));
+    if (deleteEvents) {
+      const dids = this.all<{ d: string }>('SELECT distinct_id AS d FROM person_distinct_ids WHERE person_id = ?', p.id).map(r => r.d);
+      for (let i = 0; i < dids.length; i += 1000) {
+        const part = dids.slice(i, i + 1000);
+        X.deleteDistinctIds(this.sql, part);
+        for (const sh of this.all<{ key: string }>('SELECT key FROM shards')) {
+          const n = await this.shardStub(sh.key).deleteDistinctIds(part);
+          if (n) this.sql.exec('UPDATE shards SET events = MAX(0, events - ?) WHERE key = ?', n, sh.key);
+        }
+      }
+    }
     this.ctx.storage.transactionSync(() => {
-      if (deleteEvents) this.sql.exec('DELETE FROM events WHERE distinct_id IN (SELECT distinct_id FROM person_distinct_ids WHERE person_id = ?)', p.id);
       this.sql.exec('DELETE FROM person_distinct_ids WHERE person_id = ?', p.id);
       this.sql.exec('DELETE FROM persons WHERE id = ?', p.id);
     });
-    return true;
+    return { recordings };
   }
 
   // ---------- saved objects ----------
@@ -276,20 +368,170 @@ export class ProjectStore extends DurableObject<Env> {
   }
   async deleteFlag(id: number) { return this.sql.exec('DELETE FROM feature_flags WHERE id = ?', id).rowsWritten > 0; }
 
+  // ---------- experiments ----------
+  private expOut(r: any) {
+    const flag = this.one<any>('SELECT * FROM feature_flags WHERE key = ?', r.feature_flag_key);
+    const f = flag ? parse(flag.filters) : {};
+    return { id: r.id, name: r.name, description: r.description, feature_flag_key: r.feature_flag_key, feature_flag_id: flag?.id ?? null,
+      variants: (f.multivariate?.variants ?? []).map((v: any) => ({ key: v.key, rollout_percentage: v.rollout_percentage })),
+      metrics: parse(r.metrics), filters: parse(r.filters), archived: !!r.archived,
+      start_date: r.start_date ? new Date(r.start_date).toISOString() : null, end_date: r.end_date ? new Date(r.end_date).toISOString() : null,
+      status: r.end_date ? 'complete' : r.start_date ? 'running' : 'draft', created_at: r.created_at, updated_at: r.updated_at };
+  }
+  async listExperiments() { return this.all<any>('SELECT * FROM experiments ORDER BY id DESC').map(r => this.expOut(r)); }
+  async getExperiment(id: number) { const r = this.one<any>('SELECT * FROM experiments WHERE id = ?', id); return r ? this.expOut(r) : null; }
+  /**
+   * Create or update. A new experiment creates its multivariate flag (inactive until launch) unless one with that key
+   * exists; an existing flag must be multivariate. `action: launch` sets start_date and turns the flag on; `stop` ends it.
+   */
+  async saveExperiment(id: number | null, b: any): Promise<{ error: string } | ReturnType<ProjectStore['expOut']>> {
+    const now = Date.now();
+    let metrics: unknown[] | undefined;
+    try { if (b.metrics !== undefined) { if (!Array.isArray(b.metrics) || b.metrics.length > 10) return { error: 'metrics must be a list of at most 10' }; metrics = b.metrics.map(validateMetric); } }
+    catch (e) { return { error: e instanceof Error ? e.message : String(e) }; }
+    const filters = b.filters !== undefined ? (Array.isArray(b.filters) ? b.filters : []) : undefined;
+    if (!id) {
+      const name = String(b.name ?? '').trim().slice(0, 200); if (!name) return { error: 'name is required' };
+      const key = String(b.feature_flag_key ?? '').trim(); if (!/^[A-Za-z0-9_-]{1,200}$/.test(key)) return { error: 'feature_flag_key: letters, numbers, - and _ only' };
+      const flag = this.one<any>('SELECT * FROM feature_flags WHERE key = ?', key);
+      if (flag) { if (!parse(flag.filters).multivariate?.variants?.length) return { error: 'that flag has no variants; use a multivariate flag' }; }
+      else {
+        const variants = Array.isArray(b.variants) && b.variants.length >= 2 ? b.variants.map((v: any) => ({ key: String(v.key), rollout_percentage: Number(v.rollout_percentage) }))
+          : [{ key: 'control', rollout_percentage: 50 }, { key: 'test', rollout_percentage: 50 }];
+        if (variants[0].key !== 'control') return { error: 'the first variant must be control' };
+        const r = await this.saveFlag(null, { key, name: `Experiment: ${name}`, active: false, filters: { groups: [{ properties: [], rollout_percentage: 100 }], multivariate: { variants } } });
+        if ('error' in r) return r;
+      }
+      const r = this.one<{ id: number }>('INSERT INTO experiments (name, description, feature_flag_key, metrics, filters, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id',
+        name, String(b.description ?? ''), key, JSON.stringify(metrics ?? []), JSON.stringify(filters ?? []), now, now)!;
+      id = r.id;
+    } else {
+      const cur = this.one<any>('SELECT * FROM experiments WHERE id = ?', id); if (!cur) return { error: 'not_found' };
+      this.sql.exec('UPDATE experiments SET name = ?, description = ?, metrics = ?, filters = ?, archived = ?, updated_at = ? WHERE id = ?',
+        b.name !== undefined ? String(b.name).trim().slice(0, 200) || cur.name : cur.name, b.description !== undefined ? String(b.description) : cur.description,
+        metrics ? JSON.stringify(metrics) : cur.metrics, filters ? JSON.stringify(filters) : cur.filters, b.archived !== undefined ? (b.archived ? 1 : 0) : cur.archived, now, id);
+    }
+    const cur = this.one<any>('SELECT * FROM experiments WHERE id = ?', id)!;
+    if (b.action === 'launch' && !cur.start_date) {
+      this.sql.exec('UPDATE experiments SET start_date = ?, updated_at = ? WHERE id = ?', now, now, id);
+      this.sql.exec('UPDATE feature_flags SET active = 1, version = version + 1, updated_at = ? WHERE key = ?', now, cur.feature_flag_key);
+    }
+    if (b.action === 'stop' && cur.start_date && !cur.end_date) this.sql.exec('UPDATE experiments SET end_date = ?, updated_at = ? WHERE id = ?', now, now, id);
+    return (await this.getExperiment(id))!;
+  }
+  async deleteExperiment(id: number) { return this.sql.exec('DELETE FROM experiments WHERE id = ? RETURNING id', id).toArray().length > 0; }
+  async experimentResults(id: number, now = Date.now()) {
+    const r = this.one<any>('SELECT * FROM experiments WHERE id = ?', id); if (!r) return null;
+    const e = this.expOut(r);
+    const exp: Experiment = { id: r.id, name: r.name, feature_flag_key: r.feature_flag_key, start_date: r.start_date, end_date: r.end_date, metrics: parse(r.metrics), filters: parse(r.filters) };
+    return experimentResults(this.engine(), exp, e.variants.map((v: any) => v.key), now);
+  }
+
+  // ---------- surveys ----------
+  private surveyRow(r: any) {
+    return { id: r.id, name: r.name, description: r.description, type: r.type, questions: parse(r.questions), appearance: parse(r.appearance), conditions: r.conditions ? parse(r.conditions) : null,
+      linked_flag_key: r.linked_flag_key, enable_partial_responses: !!r.enable_partial_responses, start_date: r.start_date, end_date: r.end_date, archived: !!r.archived, created_at: r.created_at, updated_at: r.updated_at };
+  }
+  private surveyOut(r: any) { const s = this.surveyRow(r); return { ...publicSurvey(s), archived: s.archived, status: s.end_date ? 'complete' : s.start_date ? 'running' : 'draft', created_at: s.created_at, updated_at: s.updated_at }; }
+  async listSurveys() { return this.all<any>('SELECT * FROM surveys ORDER BY created_at DESC').map(r => this.surveyOut(r)); }
+  async getSurvey(id: string) { const r = this.one<any>('SELECT * FROM surveys WHERE id = ?', id); return r ? this.surveyOut(r) : null; }
+  /** `action: launch` sets start_date, `stop` sets end_date, `resume` clears it. */
+  async saveSurvey(id: string | null, b: any): Promise<{ error: string } | ReturnType<ProjectStore['surveyOut']>> {
+    const now = Date.now();
+    const prev = id ? this.one<any>('SELECT * FROM surveys WHERE id = ?', id) : null;
+    if (id && !prev) return { error: 'not_found' };
+    let c: ReturnType<typeof cleanSurvey>;
+    try { c = cleanSurvey(b, prev ? this.surveyRow(prev) : undefined); } catch (e) { return { error: e instanceof Error ? e.message : String(e) }; }
+    const sid = id ?? crypto.randomUUID();
+    let start = prev?.start_date ?? null, end = prev?.end_date ?? null;
+    if (b.action === 'launch' && !start) start = now;
+    if (b.action === 'stop' && start && !end) end = now;
+    if (b.action === 'resume') end = null;
+    this.sql.exec(`INSERT INTO surveys (id, name, description, type, questions, appearance, conditions, linked_flag_key, enable_partial_responses, start_date, end_date, archived, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, description = excluded.description, type = excluded.type, questions = excluded.questions,
+        appearance = excluded.appearance, conditions = excluded.conditions, linked_flag_key = excluded.linked_flag_key, enable_partial_responses = excluded.enable_partial_responses,
+        start_date = excluded.start_date, end_date = excluded.end_date, archived = excluded.archived, updated_at = excluded.updated_at`,
+      sid, c.name, c.description, c.type, JSON.stringify(c.questions), JSON.stringify(c.appearance), c.conditions ? JSON.stringify(c.conditions) : null, c.linked_flag_key, c.enable_partial_responses ? 1 : 0,
+      start, end, b.archived !== undefined ? (b.archived ? 1 : 0) : (prev?.archived ?? 0), prev?.created_at ?? now, now);
+    return (await this.getSurvey(sid))!;
+  }
+  async deleteSurvey(id: string) { return this.sql.exec('DELETE FROM surveys WHERE id = ? RETURNING id', id).toArray().length > 0; }
+  /** Launched, unfinished, unarchived surveys in posthog-js shape. */
+  async activeSurveys() { return this.all<any>('SELECT * FROM surveys WHERE start_date IS NOT NULL AND end_date IS NULL AND archived = 0 ORDER BY created_at').map(r => publicSurvey(this.surveyRow(r))); }
+  async hasActiveSurveys(): Promise<boolean> { return !!this.one('SELECT 1 AS x FROM surveys WHERE start_date IS NOT NULL AND end_date IS NULL AND archived = 0 LIMIT 1'); }
+  async surveyResults(id: string) { const r = this.one<any>('SELECT * FROM surveys WHERE id = ?', id); return r ? surveyResults(this.engine(), this.surveyRow(r)) : null; }
+
+  // ---------- session recordings ----------
+  async recordReplay(metas: import('./replay').ReplayMeta[]) {
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      for (const m of metas) this.sql.exec(`INSERT INTO session_recordings (session_id, distinct_id, start_ts, end_ts, click_count, keypress_count, console_error_count, first_url, size, chunks, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET start_ts = MIN(start_ts, excluded.start_ts), end_ts = MAX(end_ts, excluded.end_ts),
+          click_count = click_count + excluded.click_count, keypress_count = keypress_count + excluded.keypress_count, console_error_count = console_error_count + excluded.console_error_count,
+          first_url = CASE WHEN excluded.start_ts < start_ts OR first_url IS NULL THEN COALESCE(excluded.first_url, first_url) ELSE first_url END,
+          distinct_id = CASE WHEN distinct_id = '' THEN excluded.distinct_id ELSE distinct_id END, size = size + excluded.size, chunks = chunks + excluded.chunks`,
+        m.session_id, m.distinct_id, m.start_ts, m.end_ts, m.clicks, m.keypresses, m.console_errors, m.first_url, m.size, m.chunks, now);
+    });
+  }
+  private recordingOut(r: any, ref?: PersonRef) {
+    return { id: r.session_id, distinct_id: r.distinct_id, start_time: new Date(r.start_ts).toISOString(), end_time: new Date(r.end_ts).toISOString(),
+      recording_duration: Math.round((r.end_ts - r.start_ts) / 1000), click_count: r.click_count, keypress_count: r.keypress_count, console_error_count: r.console_error_count,
+      start_url: r.first_url, size: r.size, chunks: r.chunks,
+      person: ref?.uuid ? { id: ref.uuid, name: (ref.props.email ?? ref.props.name ?? r.distinct_id) as string } : null };
+  }
+  async listRecordings(o: { personId?: string | null; distinctId?: string | null; before?: number | null; limit?: number }) {
+    const limit = Math.min(Math.max(o.limit ?? 50, 1), 200);
+    let dids: string[] | null = null;
+    if (o.personId) dids = this.engine().distinctIdsOfPerson(o.personId);
+    if (o.distinctId) dids = [o.distinctId];
+    const rows = this.all<any>(`SELECT * FROM session_recordings WHERE (? IS NULL OR distinct_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR start_ts < ?) ORDER BY start_ts DESC LIMIT ?`,
+      dids ? 1 : null, JSON.stringify(dids ?? []), o.before ?? null, o.before ?? null, limit + 1);
+    const page = rows.slice(0, limit); const people = this.engine().resolve(page.map(r => r.distinct_id));
+    return { results: page.map(r => this.recordingOut(r, people.get(r.distinct_id))), next: rows.length > limit ? page[page.length - 1].start_ts : null };
+  }
+  async getRecording(sid: string) {
+    const r = this.one<any>('SELECT * FROM session_recordings WHERE session_id = ?', sid);
+    return r ? this.recordingOut(r, this.engine().resolve([r.distinct_id]).get(r.distinct_id)) : null;
+  }
+  async deleteRecording(sid: string) { return this.sql.exec('DELETE FROM session_recordings WHERE session_id = ? RETURNING session_id', sid).toArray().length > 0; }
+  /** Drops recordings that ended before the cutoff; returns their session ids so the caller can delete the R2 chunks. */
+  async expireRecordings(before: number): Promise<string[]> {
+    return this.sql.exec('DELETE FROM session_recordings WHERE end_ts < ? RETURNING session_id', before).toArray().map(r => String(r.session_id));
+  }
+  async recordingIds(): Promise<string[]> { return this.all<{ s: string }>('SELECT session_id AS s FROM session_recordings').map(r => r.s); }
+
   // ---------- housekeeping ----------
   async stats() {
-    const c = (q: string) => this.one<{ c: number }>(q)!.c;
-    return { events: c('SELECT COUNT(*) AS c FROM events'), persons: c('SELECT COUNT(*) AS c FROM persons'),
-      events_24h: this.one<{ c: number }>('SELECT COUNT(*) AS c FROM events WHERE timestamp > ?', Date.now() - 86400_000)!.c,
-      last_event_at: this.one<{ m: number | null }>('SELECT MAX(created_at) AS m FROM events')!.m, database_bytes: this.sql.databaseSize };
+    const since = Date.now() - 86400_000;
+    const parts = [this.hasLegacy() ? { ...X.eventStats(this.sql, since), bytes: 0 } : null,
+      ...await Promise.all(this.all<{ key: string }>('SELECT key FROM shards').map(r => this.shardStub(r.key).stats(since)))].filter(Boolean) as { events: number; events_24h: number; last_event_at: number | null; bytes: number }[];
+    return { events: parts.reduce((a, p) => a + p.events, 0), persons: this.one<{ c: number }>('SELECT COUNT(*) AS c FROM persons')!.c,
+      events_24h: parts.reduce((a, p) => a + p.events_24h, 0),
+      last_event_at: parts.reduce<number | null>((a, p) => p.last_event_at !== null && (a === null || p.last_event_at > a) ? p.last_event_at : a, null),
+      database_bytes: this.sql.databaseSize + parts.reduce((a, p) => a + p.bytes, 0), shards: parts.length };
   }
-  async firstEventAt(): Promise<number | null> { return this.one<{ m: number | null }>('SELECT MIN(timestamp) AS m FROM events')!.m; }
+  async firstEventAt(): Promise<number | null> {
+    let m: number | null = this.hasLegacy() ? (this.one<{ m: number | null }>('SELECT MIN(timestamp) AS m FROM events')!.m) : null;
+    for (const r of this.all<{ key: string }>('SELECT key FROM shards WHERE events > 0 ORDER BY start LIMIT 3')) {
+      const s = await this.shardStub(r.key).stats(0); if (s.min_ts !== null && (m === null || s.min_ts < m)) m = s.min_ts; if (s.min_ts !== null) break;
+    }
+    return m;
+  }
+  /** Retention: whole shards before the cutoff are deleted; the boundary shard and the legacy table are trimmed. */
   async purge(beforeMs: number) {
-    let total = 0;
-    for (;;) { const n = this.sql.exec('DELETE FROM events WHERE id IN (SELECT id FROM events WHERE timestamp < ? LIMIT 5000)', beforeMs).rowsWritten; total += n; if (n < 5000) break; }
+    let total = X.purgeBefore(this.sql, beforeMs); this.legacyRows = null;
+    for (const r of this.all<{ key: string; end: number; events: number }>('SELECT key, end, events FROM shards WHERE start < ?', beforeMs)) {
+      const st = this.shardStub(r.key);
+      if (r.end <= beforeMs) { await st.destroy(); this.sql.exec('DELETE FROM shards WHERE key = ?', r.key); total += r.events; }
+      else { const n = await st.purge(beforeMs); total += n; this.sql.exec('UPDATE shards SET events = MAX(0, events - ?) WHERE key = ?', n, r.key); }
+    }
+    this.sql.exec('DELETE FROM ingest_log WHERE at < ?', Date.now() - 7 * 86400_000);
     return total;
   }
-  async destroy() { await this.ctx.storage.deleteAll(); }
+  async destroy() {
+    for (const r of this.all<{ key: string }>('SELECT key FROM shards')) await this.shardStub(r.key).destroy();
+    await this.ctx.storage.deleteAll();
+  }
 }
 
 function personOut(r: any) {

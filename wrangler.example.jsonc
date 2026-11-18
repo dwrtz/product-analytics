@@ -6,8 +6,9 @@
   "workers_dev": false,
   "preview_urls": false,
   "d1_databases": [{ "binding": "DB", "database_name": "product-analytics", "database_id": "00000000-0000-0000-0000-000000000000", "migrations_dir": "migrations" }],
-  "durable_objects": { "bindings": [{ "name": "STORE", "class_name": "ProjectStore" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectStore"] }],
+  "durable_objects": { "bindings": [{ "name": "STORE", "class_name": "ProjectStore" }, { "name": "SHARDS", "class_name": "EventShard" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectStore"] }, { "tag": "v2", "new_sqlite_classes": ["EventShard"] }],
+  "r2_buckets": [{ "binding": "REPLAY", "bucket_name": "product-analytics-replay" }],
   "queues": {
     "producers": [{ "binding": "INGEST", "queue": "product-analytics-ingest" }],
     "consumers": [{ "queue": "product-analytics-ingest", "max_batch_size": 100, "max_batch_timeout": 2, "max_retries": 10, "dead_letter_queue": "product-analytics-ingest-dlq" }]

@@ -4,20 +4,22 @@ import { cors } from './capture';
 import { decodeBody } from '../shared/decode';
 import { projectByToken, validToken } from './projects';
 import { uuidv7 } from '../shared/ids';
+import { recordingConfig } from './replay';
 
-export function remoteConfig(p: ProjectRow, hasFlags: boolean) {
+export function remoteConfig(p: ProjectRow, hasFlags: boolean, hasSurveys = false) {
   return {
     token: p.api_token, supportedCompression: ['gzip', 'gzip-js'], hasFeatureFlags: hasFlags,
     analytics: { endpoint: '/i/v0/e/' }, elementsChainAsString: true, defaultIdentifiedOnly: true,
     autocapture_opt_out: !!p.autocapture_opt_out, autocaptureExceptions: false, captureDeadClicks: false, capturePerformance: false,
-    sessionRecording: false, heatmaps: false, surveys: false, productTours: false, siteApps: [],
+    sessionRecording: recordingConfig(p), heatmaps: false, surveys: hasSurveys, productTours: false, siteApps: [],
   };
 }
 
 export async function handleConfig(req: Request, env: Env, token: string, js: boolean): Promise<Response> {
   const p = validToken(token) ? await projectByToken(env, token) : null;
   if (!p) return js ? new Response('/* unknown project */', { status: 404, headers: { 'content-type': 'application/javascript', ...cors(req) } }) : json({ type: 'authentication_error', code: 'invalid_api_key', detail: 'Unknown project token.' }, 404, cors(req));
-  const cfg = remoteConfig(p, await storeFor(env, p.id).hasActiveFlags());
+  const st = storeFor(env, p.id);
+  const cfg = remoteConfig(p, await st.hasActiveFlags(), await st.hasActiveSurveys());
   const headers = { ...cors(req), 'cache-control': 'public, max-age=300' };
   if (!js) return json(cfg, 200, headers);
   const body = `(function(){window._POSTHOG_REMOTE_CONFIG=window._POSTHOG_REMOTE_CONFIG||{};window._POSTHOG_REMOTE_CONFIG[${JSON.stringify(p.api_token)}]={config:${JSON.stringify(cfg)},siteApps:[]}})();`;
@@ -46,15 +48,22 @@ export async function handleFlags(req: Request, env: Env, url: URL, legacyDecide
     if (f.enabled && f.metadata.payload !== null) featureFlagPayloads[f.key] = f.metadata.payload;
   }
   const out: Record<string, unknown> = { flags: byKey, featureFlags, featureFlagPayloads, errorsWhileComputingFlags: typeof did !== 'string' || !did, requestId: uuidv7(), evaluatedAt: Date.now() };
-  if (legacyDecide || url.searchParams.get('config') === 'true') Object.assign(out, remoteConfig(p, flags.length > 0), { config: { enable_collect_everything: !p.autocapture_opt_out } });
+  if (legacyDecide || url.searchParams.get('config') === 'true') Object.assign(out, remoteConfig(p, flags.length > 0, await store.hasActiveSurveys()), { config: { enable_collect_everything: !p.autocapture_opt_out } });
   return json(out, 200, cors(req));
 }
 
 /** Endpoints for products this build does not have: answer empty so SDKs stay quiet. */
 export function handleStub(req: Request, path: string): Response | null {
-  if (path.startsWith('/api/surveys')) return json({ surveys: [] }, 200, cors(req));
   if (path.startsWith('/api/web_experiments')) return json({ experiments: [] }, 200, cors(req));
   if (path.startsWith('/api/early_access_features')) return json({ earlyAccessFeatures: [] }, 200, cors(req));
-  if (path === '/s' || path === '/s/' || path.startsWith('/i/v0/s')) return json({ status: 1 }, 200, cors(req));
   return null;
+}
+
+/** posthog-js surveys: GET /api/surveys/?token=<project token> -> { surveys: [...] } (protocol.md "Surveys"). */
+export async function handleSurveys(req: Request, env: Env, url: URL): Promise<Response> {
+  const token = url.searchParams.get('token') ?? url.searchParams.get('api_key');
+  if (!validToken(token)) return json({ type: 'authentication_error', code: 'missing_api_key', detail: 'API key not provided.' }, 401, cors(req));
+  const p = await projectByToken(env, token);
+  if (!p) return json({ type: 'authentication_error', code: 'invalid_api_key', detail: 'Project API key invalid.' }, 401, cors(req));
+  return json({ surveys: await storeFor(env, p.id).activeSurveys() }, 200, { ...cors(req), 'cache-control': 'no-cache' });
 }

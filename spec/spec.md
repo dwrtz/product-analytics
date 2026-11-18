@@ -8,7 +8,9 @@ snippet with `api_host` set to this instance (or a server uses posthog-node
 with `host` set to it), and events, identified people, groups and feature
 flags work as they do against PostHog Cloud. The owner signs in to a small
 web app to explore events and people, build trends, funnels and retention
-insights, pin them to dashboards, and manage feature flags.
+insights, pin them to dashboards, manage feature flags, watch session
+recordings, run A/B experiments on multivariate flags and run surveys that
+posthog-js shows to visitors.
 
 Every deploy is one *instance* on one domain. An instance holds one or more
 *projects*; each project has a public *project API key* (`phc_…`) that SDKs
@@ -17,10 +19,14 @@ its projects (one team per instance).
 
 The design keeps PostHog's wire format exactly and replaces its storage:
 the capture endpoint checks and normalizes events and puts them on a
-Cloudflare Queue; the queue consumer writes them into one SQLite-backed
-Durable Object per project, which also holds the project's people, groups,
-saved insights, dashboards and flags, and answers every query with SQL.
-D1 holds only instance data (users, sessions, keys, projects).
+Cloudflare Queue; the queue consumer hands them to the project's *head*
+SQLite-backed Durable Object, which processes persons and groups and writes
+each event into an *event shard*: one more SQLite Durable Object per project
+and calendar month (UTC). The head holds the project's people, groups,
+saved insights, dashboards, flags, experiments, surveys and recording
+metadata; queries fan out to the shards a date range touches and are
+finished in the head, exactly. Session recording chunks live in R2. D1
+holds only instance data (users, sessions, keys, projects).
 
 This is not PostHog and uses no PostHog code. The wire format and the
 analytics semantics were reconstructed from PostHog's MIT-licensed code and
@@ -57,13 +63,22 @@ unknown; it is context, not extra requirements.
   own, short and plain. Icons are inline SVG or text; no images or fonts are
   copied from anywhere.
 
-## Out of scope for 0.1
+## Out of scope for 0.2
 
-- Session replay (`/s`), heatmaps, surveys, experiments, web experiments,
-  product tours, early access features, error tracking, logs, LLM
-  analytics, data warehouse, CDP destinations, notebooks and actions. The
-  SDK endpoints for these answer "nothing configured" (`protocol.md` 9) so
-  the SDKs stay quiet.
+- Heatmaps, web experiments, product tours, early access features, error
+  tracking, logs, LLM analytics, data warehouse, CDP destinations,
+  notebooks and actions. The SDK endpoints for these answer "nothing
+  configured" (`protocol.md` 9) so the SDKs stay quiet.
+- Replay: network payload capture, canvas recording, recording triggers
+  (URL, event or linked-flag triggers, sampling, minimum duration),
+  playlists, comments and a recordings filter UI beyond person and date.
+- Experiments: holdouts, secondary metric dashboards over time, sample
+  size calculator, experience continuity across identify, frequentist
+  statistics, group-aggregated experiments, web (no-code) experiments.
+- Surveys: targeting flags and internal targeting flags (posthog-js's own
+  once-per-person memory still applies), iterations/schedules, translations,
+  branching logic editor (stored and served if sent through the API),
+  widget and hosted (external) survey pages, survey templates.
 - HogQL / SQL editor, cohorts, lifecycle, stickiness and paths insights,
   group analytics screens (groups are stored and usable in maths and
   filters, but there is no groups list), funnel trends and time-to-convert
@@ -83,15 +98,19 @@ Each requirement has an id. Tests name the id they cover.
 
 - One Cloudflare Worker, TypeScript, Web APIs only (no `node:*` modules, no
   `nodejs_compat`). It serves the capture and SDK endpoints, the owner API
-  and the web app (from a generated module, not Assets). An Assets binding
-  serves only `/static/*`: the posthog-js browser bundles, copied from the
+  and the web app (from a generated module, not Assets; rrweb-player is a
+  second generated module served as `/player.js` and `/player.css`). An
+  Assets binding serves only `/static/*`: the posthog-js browser bundles,
+  copied from the
   npm package at build time.
-- Bindings: D1 `DB`; Durable Object namespace `STORE` (class
-  `ProjectStore`, SQLite storage); Queue `INGEST` (producer and consumer on
-  the same Worker, with a dead-letter queue); Assets `ASSETS`. Vars
-  `SITE_URL`, `ALLOWED_EMAILS` and `DEFAULT_RETENTION_DAYS`. No secrets. A daily cron trigger applies
-  data retention. Exact config in `design.md`; no domain, account id or
-  resource id is hard-coded anywhere.
+- Bindings: D1 `DB`; Durable Object namespaces `STORE` (class
+  `ProjectStore`) and `SHARDS` (class `EventShard`), both SQLite storage;
+  R2 bucket `REPLAY` (recording chunks); Queue `INGEST` (producer and
+  consumer on the same Worker, with a dead-letter queue); Assets `ASSETS`.
+  Vars `SITE_URL`, `ALLOWED_EMAILS`, `DEFAULT_RETENTION_DAYS` and
+  `REPLAY_RETENTION_DAYS` (`SHARD_PERIOD` exists for tests only). No
+  secrets. A daily cron trigger applies data retention. Exact config in
+  `design.md`; no domain, account id or resource id is hard-coded anywhere.
 - `npm run dev` builds, applies local D1 migrations and runs `wrangler dev`
   on port 8787. `npm test` runs the Vitest suites inside the Workers
   runtime. `npm run e2e` runs the end-to-end test against a running
@@ -161,8 +180,10 @@ payload; posthog-node evaluates a flag.
 ### R5. Remote config and the SDK files
 
 - `GET /array/<token>/config` and `/array/<token>/config.js` answer the
-  remote config in `protocol.md` 9 (session replay, surveys, heatmaps and
-  the other out-of-scope products off; autocapture as the project setting).
+  remote config in `protocol.md` 9: `sessionRecording` is the recorder
+  config when the project records sessions (else `false`), `surveys` is
+  `true` while the project has a running survey, autocapture follows the
+  project setting, and heatmaps and the other out-of-scope products are off.
 - `GET /static/<file>` and `/static/<version>/<file>` serve the posthog-js
   bundles (`array.js`, `array.full.js`, the lazy extensions such as
   `surveys.js`) with CORS, so the standard snippet loads from the instance.
@@ -184,7 +205,8 @@ requests.
 - `$groupidentify` creates or updates a group (`$group_type`, `$group_key`,
   `$group_set`); at most 5 group types per project. Events carry their
   groups in `$groups`.
-- Events with the same `uuid` are stored once.
+- Events with the same `uuid` are stored once, and their person updates
+  are applied once (R15).
 
 Check: the `persons` scenarios in `test-vectors.json` give the expected
 persons; in the e2e, the anonymous pageview and the identified one belong
@@ -204,7 +226,8 @@ Check: the e2e finds `$pageview`, `$autocapture`, `$identify`,
 
 - Persons list (newest first, search by email, name or distinct id, with a
   total), person page (properties, distinct ids, first and last seen,
-  recent events) and "Delete person and events".
+  recent events, their recordings) and "Delete person and events" (which
+  also deletes their recordings).
 
 Check: searching the identified email finds one person with both distinct
 ids.
@@ -247,14 +270,18 @@ Check: invalid variant percentages or payload JSON are refused with 400.
 ### R12. Projects and retention
 
 - Projects have a name, a time zone (IANA), a data retention in days (0
-  keeps everything), "Discard client IP addresses" and "Turn off
-  autocapture". The project API key can be reset. Deleting a project
-  deletes its store.
+  keeps everything), "Discard client IP addresses", "Turn off
+  autocapture" and "Record sessions" (off by default). The project API key
+  can be reset. Deleting a project deletes its store, its event shards and
+  its recordings.
 - A new project's retention is the `retention_days` sent when it is
   created, else the instance var `DEFAULT_RETENTION_DAYS`; empty or `0`
   means forever (as self-hosted PostHog). Deployers choose; owners can
   change it per project in Settings.
-- The daily cron deletes events older than each project's retention.
+- The daily cron deletes events older than each project's retention
+  (whole shards at a time where it can) and recordings older than
+  `REPLAY_RETENTION_DAYS` (default 30) or the project's retention, whichever
+  is shorter.
 
 Check: the store test purges events before a cutoff; deleting a project
 makes its token unknown; with `DEFAULT_RETENTION_DAYS` set, a new project
@@ -263,27 +290,121 @@ gets it and an explicit `retention_days: 0` overrides it.
 ### R13. Web app
 
 Signed-in screens (layout in `design.md`): Dashboards, Dashboard, Insights,
-Insight editor (trends, funnel, retention), Events, Persons, Person,
-Feature flags, Flag editor, Settings (install snippet, project API key,
-project settings, other projects, danger zone) and Account (personal API
-keys, sign out). Usable on a phone (390 px wide).
+Insight editor (trends, funnel, retention), Events (with a replay link per
+event that has a `$session_id`), Persons, Person (with recordings), Session
+replay list, Recording (player and the session's events), Feature flags,
+Flag editor, Experiments, New experiment, Experiment (results), Surveys,
+Survey editor, Survey (results), Settings (install snippet, project API
+key, project settings, other projects, danger zone) and Account (personal
+API keys, sign out). Usable on a phone (390 px wide).
 
 Check: the screenshots in `shots/` are taken from the reference build.
 
 ### R14. Quality
 
 - Unit tests cover every vector in `test-vectors.json`; store tests check
-  person processing and insight maths on a fixed dataset; HTTP tests cover
-  accounts, capture, flags and remote config. `npm test` passes.
+  person processing and insight maths on a fixed dataset; shard tests check
+  that day shards, month shards and legacy data answer every query kind
+  identically; HTTP tests cover accounts, capture, flags, remote config,
+  replay (with recorded posthog-js `/s/` bodies), surveys (with recorded
+  survey events) and experiments (statistics checked against a closed
+  form). `npm test` passes.
 - The e2e (`npm run e2e`) loads the real posthog-js snippet in Chromium on
-  a separate origin and drives capture, identify, group and flags, sends
-  posthog-node events, aliases and a flag call, then checks stored events,
-  merged persons, insight numbers and two UI screens.
+  a separate origin and drives capture, identify, group, flags, a session
+  recording and a survey popover, sends posthog-node events, aliases and a
+  flag call, then checks stored events, merged persons, insight numbers,
+  the recording (decompressed, password masked), survey results,
+  experiment exposures and the UI screens, including the replay player.
 - Logs never contain project tokens, personal keys, session tokens,
   passwords or event bodies. `tsc --noEmit` passes for the Worker and UI.
+
+### R15. Event shards (more events)
+
+- Events are stored in `EventShard` Durable Objects, one per project and
+  UTC calendar month (`design.md`, "Event shards"), so a project is not
+  bound by one Durable Object's 10 GB; each month may hold up to 10 GB.
+  Events stored by 0.1 in the head's own table stay where they are and are
+  queried as one more shard; upgrading moves no data.
+- Every query result is exact and identical to one-store SQL: shards
+  return event-level rows keyed by distinct id; the head resolves persons,
+  applies person filters and breakdowns, and aggregates.
+- Ingestion is exactly-once for person processing: the head keeps the
+  uuids it has processed for 7 days and inserts into shards with
+  `INSERT OR IGNORE`.
+- `wrangler dev` and the tests run the same code (local Durable Objects).
+
+Check: the shard tests (600 events over 50 days) give identical trends,
+funnels, retention and event pages for day shards, month shards and
+legacy + shards; purge drops whole shards; deleting a person deletes their
+events from every shard.
+
+### R16. Session replay
+
+- `POST /s/` (also `/s` and `/i/v0/s`) accepts posthog-js recorder
+  batches of `$snapshot` events in every body encoding of `protocol.md` 4
+  and answers `{"status":1}` (`protocol.md` 11). Snapshots for projects
+  with recording off, or unknown tokens, are dropped.
+- Each request's rrweb events are stored per session as one gzip JSON
+  chunk in R2; per-session metadata (person, start, end, clicks, key
+  presses, console errors, first URL, size, chunk count) is kept in the
+  head through the queue.
+- `GET /api/projects/:id/session_recordings[/:session]` list and describe
+  recordings; `…/snapshots` returns every rrweb event in time order with
+  posthog-js's field compression (`cv: "2024-10"`) undone, ready for
+  rrweb-player. Recordings can be deleted.
+- The Recording screen plays the session with rrweb-player (MIT), loaded
+  only on that screen, beside the session's events.
+
+Check: the recorded `/s/` bodies give one recording with 10 clicks and 4
+key presses whose snapshots contain a decompressed full snapshot and no
+`cv` marker; in the e2e the recorder posts to `/s/`, the password field is
+masked, and the player mounts.
+
+### R17. Experiments
+
+- An experiment has a name, a multivariate feature flag (created off with
+  `control` and `test` at 50/50 unless an existing multivariate flag is
+  named), and 1-10 metrics: conversion (a funnel of 1-10 steps within a
+  window), event count per person, or the sum of a numeric property per
+  person. Launch turns the flag on and starts the clock; stop ends it.
+- A person's exposure is their first `$feature_flag_called` event for the
+  flag (variant = `$feature_flag_response`) between start and end; persons
+  seen with two variants are excluded. Metrics count only events at or
+  after the person's exposure.
+- Statistics are Bayesian (`design.md`, "Experiments"): Beta-Binomial for
+  conversion, Gamma-Poisson for counts, Normal approximation for sums;
+  probability to be best, 95% credible intervals, uplift against control
+  and expected loss from 20,000 seeded Monte Carlo draws. A metric is
+  significant when one variant's probability to be best is at least 95%
+  and every variant has at least 50 exposures.
+
+Check: the Monte Carlo probability agrees with the closed form for two
+Beta posteriors within 0.012; the experiment test gives the hand-counted
+exposures and conversions and ignores events before exposure.
+
+### R18. Surveys
+
+- Create, edit, launch, stop, resume and delete surveys: popover or API
+  type, 1-20 questions (open, link, rating 3/5/7/10-point, single and
+  multiple choice), and display conditions (URL contains, triggering
+  events). New surveys default to `appearance.whiteLabel: true`.
+- `GET /api/surveys/?token=<project token>` answers posthog-js with the
+  running surveys (`protocol.md` 12), and remote config says `surveys:
+  true` while any runs, so posthog-js loads `surveys.js` and shows them.
+- Results come from the SDK's `survey shown`, `survey dismissed` and
+  `survey sent` events: persons shown, responses (one per
+  `$survey_submission_id`), dismissals, response rate, and per question a
+  rating distribution with NPS for 0-10 scales, choice counts, or the
+  latest text answers.
+
+Check: with the recorded survey events, results show one NPS answer of 9
+(NPS 100), "Friend" once and the text "Great product"; in the e2e
+posthog-js shows the popover after the trigger event and the answers
+arrive.
 
 ## Definition of done
 
 `npm test` and `npm run e2e` pass, and a deploy following `design.md`
 ("Deploy") ingests the snippet's events from a real site and shows them in
-Events within a few seconds.
+Events within a few seconds, records and plays back a session, shows a
+running survey and reports an experiment's exposures.

@@ -21,6 +21,7 @@
     "playwright": "^1.65.1",
     "posthog-js": "^1.450.1",
     "posthog-node": "^6.0.3",
+    "rrweb-player": "^2.2.2",
     "typescript": "^7.0.2",
     "vitest": "^5.1.1",
     "wrangler": "^4.164.0"
