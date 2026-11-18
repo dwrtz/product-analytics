@@ -1,0 +1,181 @@
+// Capture endpoints (spec R3, protocol.md): legacy /e /batch /capture /i/v0/e /engage /track, and /i/v1/analytics/events.
+import { Env, NormEvent, ProjectRow, IngestMsg, json, storeFor } from './env';
+import { decodeBody, DecodeError } from '../shared/decode';
+import { parseDate, parseEventTimestamp } from '../shared/timestamp';
+import { isUuid, uuidv7 } from '../shared/ids';
+import { projectByToken, validToken } from './projects';
+
+export const LEGACY_PATHS = new Set(['/e', '/batch', '/capture', '/track', '/engage', '/i/v0/e', '/i/v0/ai/batch']);
+export const V1_PATH = '/i/v1/analytics/events';
+const DROPPED_EVENTS = new Set(['$performance_event', '$snapshot', '$snapshot_items']);
+const MSG_BUDGET = 100_000; // bytes of JSON per queue message (queue limit is 128 KB)
+
+export function cors(req: Request): Record<string, string> {
+  const o = req.headers.get('origin');
+  return {
+    'access-control-allow-origin': o ?? '*',
+    ...(o ? { 'access-control-allow-credentials': 'true', vary: 'Origin' } : {}),
+    'access-control-allow-methods': 'GET, POST, OPTIONS',
+    'access-control-allow-headers': req.headers.get('access-control-request-headers') ?? 'content-type',
+    'access-control-max-age': '86400',
+  };
+}
+const err = (req: Request, status: number, code: string, detail: string, type = 'validation_error') =>
+  json({ type, code, detail, attr: null }, status, cors(req));
+
+const obj = (v: unknown): Record<string, unknown> | undefined => v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : undefined;
+const bool = (v: unknown): boolean | undefined => {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') return v !== 0;
+  if (typeof v === 'string') { const s = v.toLowerCase(); if (['true', '1', 'on', 'yes'].includes(s)) return true; if (['false', '0', 'off', 'no'].includes(s)) return false; }
+  return undefined;
+};
+
+/** Request-level facts shared by every event in it. */
+type Ctx = { now: number; sentAt: number | null; ip: string | null; geo: Record<string, unknown>; libHeader?: [string, string] };
+
+function geoProps(req: Request): Record<string, unknown> {
+  const cf = (req as any).cf as Record<string, any> | undefined;
+  if (!cf?.country) return {};
+  let countryName: string | undefined;
+  try { countryName = new Intl.DisplayNames(['en'], { type: 'region' }).of(cf.country); } catch { /* optional */ }
+  const g: Record<string, unknown> = {
+    $geoip_country_code: cf.country, $geoip_country_name: countryName, $geoip_city_name: cf.city,
+    $geoip_subdivision_1_name: cf.region, $geoip_subdivision_1_code: cf.regionCode, $geoip_postal_code: cf.postalCode,
+    $geoip_continent_code: cf.continent, $geoip_time_zone: cf.timezone,
+    $geoip_latitude: cf.latitude !== undefined ? Number(cf.latitude) : undefined, $geoip_longitude: cf.longitude !== undefined ? Number(cf.longitude) : undefined,
+  };
+  for (const k of Object.keys(g)) if (g[k] === undefined || g[k] === '') delete g[k];
+  return g;
+}
+
+/** Normalizes one raw event; returns null to drop it (with a reason). */
+export function normalize(raw: unknown, ctx: Ctx, opts: { v1: boolean; anonymizeIps: boolean; ignoreSentAt?: boolean }): NormEvent | { drop: string } {
+  const e = obj(raw); if (!e) return { drop: 'invalid_event' };
+  const event = e.event;
+  if (typeof event !== 'string' || !event || event.length > 200) return { drop: 'invalid_event_name' };
+  if (DROPPED_EVENTS.has(event)) return { drop: 'filtered' };
+  const properties: Record<string, unknown> = { ...(obj(e.properties) ?? {}) };
+  let did = e.distinct_id ?? properties.distinct_id ?? e.$distinct_id;
+  if (typeof did === 'number') did = String(did);
+  if (typeof did !== 'string' || !did.trim() || did.length > 200) return { drop: 'invalid_distinct_id' };
+  const options = obj(e.options) ?? {};
+  // Settings: v1 options win over legacy $ properties.
+  const ppOpt = bool(options.process_person_profile);
+  const person = ppOpt ?? (properties.$process_person_profile === false ? false : true);
+  properties.$process_person_profile = person;
+  const ignoreSentAt = bool(options.disable_skew_correction) ?? (opts.v1 ? false : properties.$ignore_sent_at === true);
+  if (typeof e.session_id === 'string' && !properties.$session_id) properties.$session_id = e.session_id;
+  if (typeof e.window_id === 'string' && !properties.$window_id) properties.$window_id = e.window_id;
+  // Person property updates may be top level or in properties; top level wins.
+  const set = { ...(obj(properties.$set) ?? {}), ...(obj(e.$set) ?? {}) };
+  const setOnce = { ...(obj(properties.$set_once) ?? {}), ...(obj(e.$set_once) ?? {}) };
+  const unset = Array.isArray(properties.$unset) ? properties.$unset.filter((x): x is string => typeof x === 'string') : [];
+  if (Object.keys(set).length) properties.$set = set;
+  if (Object.keys(setOnce).length) properties.$set_once = setOnce;
+  delete properties.token; delete properties.distinct_id;
+  if (ctx.libHeader && (typeof properties.$lib !== 'string' || !properties.$lib)) { properties.$lib = ctx.libHeader[0]; properties.$lib_version = ctx.libHeader[1]; }
+  if (ctx.ip && !opts.anonymizeIps && properties.$ip === undefined) properties.$ip = ctx.ip;
+  if (opts.anonymizeIps) delete properties.$ip;
+  // Location comes from Cloudflare's view of the request, unless the client opted out or already sent its own $geoip_* values (imports).
+  if (properties.$geoip_disable !== true && !Object.keys(properties).some(k => k.startsWith('$geoip_'))) Object.assign(properties, ctx.geo);
+  const { ts } = parseEventTimestamp(e.timestamp, opts.v1 ? undefined : e.offset, ctx.sentAt, ignoreSentAt, ctx.now);
+  const uuid = isUuid(e.uuid) ? e.uuid.toLowerCase() : uuidv7(ts);
+  const out: NormEvent = { uuid, event, distinct_id: did, ts, properties, person, received_at: ctx.now };
+  if (Object.keys(set).length) out.set = set;
+  if (Object.keys(setOnce).length) out.set_once = setOnce;
+  if (unset.length) out.unset = unset;
+  return out;
+}
+
+/** Sends normalized events onward: queue messages under the size budget; an event too big for a message goes straight to the store. */
+export async function enqueue(env: Env, pid: number, events: NormEvent[]): Promise<void> {
+  const msgs: IngestMsg[] = []; let cur: NormEvent[] = []; let size = 0; const direct: NormEvent[] = [];
+  for (const ev of events) {
+    const n = JSON.stringify(ev).length;
+    if (n > MSG_BUDGET) { direct.push(ev); continue; }
+    if (size + n > MSG_BUDGET && cur.length) { msgs.push({ pid, events: cur }); cur = []; size = 0; }
+    cur.push(ev); size += n;
+  }
+  if (cur.length) msgs.push({ pid, events: cur });
+  for (let i = 0; i < msgs.length; i += 2) await env.INGEST.sendBatch(msgs.slice(i, i + 2).map(body => ({ body, contentType: 'json' as const })));
+  if (direct.length) await storeFor(env, pid).ingest(direct);
+}
+
+function reqCtx(req: Request, sentAt: number | null): Ctx {
+  return { now: Date.now(), sentAt, ip: req.headers.get('cf-connecting-ip'), geo: geoProps(req) };
+}
+
+export async function handleLegacyCapture(req: Request, env: Env, url: URL): Promise<Response> {
+  let bytes: Uint8Array;
+  if (req.method === 'GET') {
+    const d = url.searchParams.get('data');
+    if (!d) return err(req, 400, 'no_data', 'No data found. Make sure to use a POST request when sending the payload in the body.');
+    bytes = new TextEncoder().encode(d);
+  } else bytes = new Uint8Array(await req.arrayBuffer());
+  if (!bytes.length) return err(req, 400, 'no_data', 'Empty request body.');
+  let payload: any;
+  try {
+    const text = await decodeBody(bytes, { compression: url.searchParams.get('compression'), contentType: req.headers.get('content-type'), contentEncoding: req.headers.get('content-encoding') });
+    payload = JSON.parse(text);
+  } catch (e) {
+    if (e instanceof DecodeError && e.code === 'payload_too_large') return err(req, 413, 'payload_too_large', 'Payload too large.');
+    return err(req, 400, 'invalid_payload', 'Malformed request data: ' + (e instanceof Error ? e.message : 'invalid'));
+  }
+  let rawEvents: unknown[]; let token: unknown; let sentAt: number | null = null; const path = url.pathname.replace(/\/$/, '');
+  if (Array.isArray(payload)) rawEvents = payload;
+  else if (obj(payload) && Array.isArray(payload.batch)) { rawEvents = payload.batch; token = payload.api_key ?? payload.token; sentAt = parseDate(payload.sent_at); }
+  else if (obj(payload) && typeof payload.event === 'string') rawEvents = [payload];
+  else if (obj(payload) && path === '/engage' && (payload.$set || payload.$set_once)) rawEvents = [{ ...payload, event: '$identify' }];
+  else return err(req, 400, 'invalid_payload', 'Malformed request data: no events.');
+  if (!rawEvents.length) return err(req, 400, 'empty_batch', 'request holds no event');
+  const first = obj(rawEvents[0]) ?? {};
+  token ??= first.api_key ?? first.token ?? obj(first.properties)?.token ?? url.searchParams.get('token') ?? url.searchParams.get('api_key');
+  if (token === undefined || token === null || token === '') return err(req, 401, 'no_token', 'event submitted without an api_key', 'authentication_error');
+  if (!validToken(token)) return err(req, 401, 'invalid_token', 'API key is not valid', 'authentication_error');
+  if (sentAt === null) { const q = Number(url.searchParams.get('_')); if (Number.isFinite(q) && q > Date.UTC(2021, 0, 1)) sentAt = q; }
+  const project = await projectByToken(env, token);
+  const beacon = url.searchParams.get('beacon') === '1';
+  const ok = () => beacon ? new Response(null, { status: 204, headers: cors(req) }) : json({ status: 1 }, 200, cors(req));
+  if (!project) return ok(); // unknown project: accepted and dropped, as the reference service does
+  const ctx = reqCtx(req, sentAt);
+  const events: NormEvent[] = [];
+  for (const r of rawEvents) { const n = normalize(r, ctx, { v1: false, anonymizeIps: !!project.anonymize_ips }); if (!('drop' in n)) events.push(n); }
+  if (events.length) await enqueue(env, project.id, events);
+  return ok();
+}
+
+export async function handleV1Capture(req: Request, env: Env): Promise<Response> {
+  const auth = req.headers.get('authorization') ?? '';
+  const m = /^(\S+)\s+(.+)$/.exec(auth);
+  if (!m) return err(req, 401, 'invalid_api_key', 'Missing Authorization header.', 'authentication_error');
+  if (m[1].toLowerCase() !== 'bearer') return err(req, 400, 'invalid_auth_scheme', 'Use Authorization: Bearer <project token>.');
+  const token = m[2].trim();
+  if (!validToken(token)) return err(req, 401, 'invalid_api_key', 'Project token invalid.', 'authentication_error');
+  const ce = (req.headers.get('content-encoding') ?? '').toLowerCase().trim();
+  if (ce && ce !== 'gzip' && ce !== 'deflate') return err(req, 415, 'unsupported_encoding', `Content-Encoding ${ce} is not supported.`);
+  let body: any;
+  try { body = JSON.parse(await decodeBody(new Uint8Array(await req.arrayBuffer()), { contentEncoding: ce })); }
+  catch (e) { return err(req, e instanceof DecodeError && e.code === 'payload_too_large' ? 413 : 400, 'invalid_payload', 'Body is not valid JSON.'); }
+  if (!obj(body) || !Array.isArray(body.batch) || !body.batch.length) return err(req, 400, 'invalid_payload', 'Body needs a non-empty batch.');
+  for (const ev of body.batch) if (obj(ev)?.uuid !== undefined && !isUuid(obj(ev)!.uuid)) return err(req, 400, 'invalid_uuid', 'Every uuid must be a UUID.');
+  const sdk = /^([^/\s]+)\/(\S+)$/.exec(req.headers.get('posthog-sdk-info') ?? '');
+  const ctx = { ...reqCtx(req, parseDate(body.created_at)), libHeader: sdk ? [sdk[1], sdk[2]] as [string, string] : undefined };
+  if (body.capture_internal === true) ctx.ip = '127.0.0.1';
+  const project = await projectByToken(env, token);
+  const results: Record<string, { result: string; details?: string; duplicates_dropped?: number }> = {};
+  const seen = new Map<string, number>();
+  const events: NormEvent[] = [];
+  for (const raw of body.batch) {
+    const id = String(obj(raw)?.uuid ?? '').toLowerCase();
+    if (id && seen.has(id)) { seen.set(id, seen.get(id)! + 1); results[id].duplicates_dropped = seen.get(id)! - 1; continue; }
+    const n = normalize(raw, ctx, { v1: true, anonymizeIps: !!project?.anonymize_ips });
+    const key = id || ('drop' in n ? uuidv7() : n.uuid);
+    seen.set(key, 1);
+    if ('drop' in n) { results[key] = { result: 'drop', details: n.drop }; continue; }
+    results[key] = { result: 'ok' };
+    if (project) events.push(n);
+  }
+  if (project && events.length) await enqueue(env, project.id, events);
+  return json({ results }, 200, cors(req));
+}

@@ -1,0 +1,131 @@
+{
+  "spekkr": 1,
+  "id": "dwrtz/product-analytics",
+  "name": "Product Analytics",
+  "summary": "Self-hosted product analytics on Cloudflare that takes posthog-js unchanged: persons, trends, funnels, retention, dashboards and flags.",
+  "kind": "web app",
+  "keywords": [
+    "product analytics",
+    "event tracking",
+    "posthog-js compatible",
+    "feature flags",
+    "funnels",
+    "retention",
+    "dashboards",
+    "self-hosted",
+    "cloudflare workers",
+    "durable objects",
+    "d1",
+    "queues"
+  ],
+  "version": "0.1.1",
+  "author": {
+    "id": "dwrtz",
+    "name": "David Wurtz"
+  },
+  "targets": {
+    "platforms": [
+      "web",
+      "backend"
+    ],
+    "stack": [
+      "TypeScript",
+      "Cloudflare Workers",
+      "Cloudflare Durable Objects (SQLite)",
+      "Cloudflare D1",
+      "Cloudflare Queues",
+      "Wrangler",
+      "lz-string",
+      "posthog-js",
+      "esbuild",
+      "Vitest",
+      "Playwright",
+      "posthog-node"
+    ]
+  },
+  "customize": {
+    "settings": [
+      {
+        "key": "app_name",
+        "label": "Product name",
+        "default": "Analytics",
+        "help": "Shown in the web app's title, nav and sign-in screen."
+      },
+      {
+        "key": "brand_color",
+        "label": "Accent colour",
+        "default": "#1d4ed8",
+        "help": "As #rrggbb. Primary buttons, links and the first chart series."
+      }
+    ]
+  },
+  "files": [
+    {
+      "path": "spec.md",
+      "about": "Requirements R1-R14 with acceptance checks, scope and definition of done."
+    },
+    {
+      "path": "protocol.md",
+      "about": "The normative SDK wire format: capture routes, body decoding, tokens, timestamps, v1 capture, persons and merges, feature flags, remote config, error codes."
+    },
+    {
+      "path": "test-vectors.json",
+      "about": "Worked examples for decoding, tokens, timestamps, distinct ids, flag hashing and matching, capture responses and person scenarios."
+    },
+    {
+      "path": "design.md",
+      "about": "Stack, the storage decision, Cloudflare config, deploy, data model, ingestion path, query semantics, owner API, screens, tests and limits."
+    },
+    {
+      "path": "tasks.md",
+      "about": "Build order, each step with a check."
+    },
+    {
+      "path": "research.md",
+      "about": "How the protocol was established with REA, the evidence and obligation ledgers, unknowns, licensing and the 0.1 choices."
+    }
+  ],
+  "needs": {
+    "permissions": [
+      "shell",
+      "network"
+    ]
+  },
+  "safety": {
+    "commands": [
+      "npm install",
+      "npx wrangler d1 migrations apply DB --local",
+      "npx wrangler dev",
+      "npm test",
+      "npm run e2e",
+      "npx playwright install chromium"
+    ],
+    "secrets": []
+  },
+  "lineage": {},
+  "changelog": [
+    {
+      "version": "0.1.1",
+      "date": "2026-11-18",
+      "note": "posthog-js is credited with its actual licence (Apache-2.0 and MIT). The e2e flag check waits for the flags reload after identify, so it also passes against a deployed instance over the network."
+    },
+    {
+      "version": "0.1.0",
+      "date": "2026-11-18",
+      "note": "First version."
+    }
+  ],
+  "demo": {
+    "screenshots": [
+      "shots/dashboard.png",
+      "shots/trends.png",
+      "shots/funnel.png",
+      "shots/retention.png",
+      "shots/events.png",
+      "shots/person.png",
+      "shots/flag.png",
+      "shots/settings.png",
+      "shots/dashboard-mobile.png"
+    ]
+  }
+}

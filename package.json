@@ -1,0 +1,38 @@
+{
+  "name": "product-analytics",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build-ui.mjs && node scripts/copy-sdk.mjs",
+    "db:migrate:local": "node scripts/ensure-config.mjs && wrangler d1 migrations apply DB --local",
+    "dev": "npm run build && npm run db:migrate:local && wrangler dev",
+    "test": "node scripts/ensure-config.mjs && vitest run",
+    "e2e": "esbuild e2e/e2e.ts --bundle --platform=node --format=esm --target=node22 --outfile=.e2e/e2e.mjs --external:playwright --external:posthog-node --log-level=warning && node .e2e/e2e.mjs",
+    "typecheck": "node scripts/ensure-config.mjs && node scripts/build-ui.mjs && tsc -p tsconfig.json && tsc -p tsconfig.ui.json",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "dependencies": {
+    "lz-string": "^1.5.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.8.4",
+    "@cloudflare/workers-types": "^5.20261118.1",
+    "esbuild": "^0.28.2",
+    "playwright": "^1.65.1",
+    "posthog-js": "^1.450.1",
+    "posthog-node": "^6.0.3",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.1",
+    "wrangler": "^4.164.0"
+  },
+  "license": "MIT",
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "esbuild@0.28.2": true,
+    "workerd@1.20260815.1": true,
+    "workerd@1.20261117.1": true
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

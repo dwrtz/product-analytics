@@ -1,0 +1,9 @@
+node_modules
+.wrangler
+.dev.vars
+wrangler.jsonc
+public/static
+src/worker/ui.gen.ts
+.e2e
+test-results
+wrangler.deploy*.jsonc

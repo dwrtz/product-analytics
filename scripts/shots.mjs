@@ -1,0 +1,31 @@
+// Screenshots for the spec. Usage: node scripts/shots.mjs <site> <email> <password> <projectId> <outDir>
+import { chromium } from 'playwright';
+const [site, email, password, pid, out, dash = '1'] = process.argv.slice(2);
+const b = await chromium.launch();
+const shoot = async (ctx, path, file, wait = 1200, act) => {
+  const p = await ctx.newPage(); await p.goto(site + path); await p.waitForLoadState('networkidle'); if (act) await act(p); await p.waitForTimeout(wait);
+  await p.screenshot({ path: `${out}/${file}`, fullPage: false }); await p.close(); console.log('shot', file);
+};
+const desk = await b.newContext({ viewport: { width: 1360, height: 860 }, deviceScaleFactor: 1 });
+await shoot(desk, '/login', 'login.png', 300);
+const lp = await desk.newPage(); await lp.goto(site + '/login'); await lp.fill('input[type=email]', email); await lp.fill('input[type=password]', password); await lp.click('button[type=submit]'); await lp.waitForURL(/project/); await lp.close();
+await shoot(desk, `/project/${pid}/dashboards/${dash}`, 'dashboard.png', 2000);
+await shoot(desk, `/project/${pid}/insights`, 'insights.png');
+const ins = await (await desk.request.get(`${site}/api/projects/${pid}/insights`)).json();
+const by = (n) => ins.find((i) => i.name === n).short_id;
+await shoot(desk, `/project/${pid}/insights/${by('Daily visitors')}`, 'trends.png', 1500);
+await shoot(desk, `/project/${pid}/insights/${by('Signup to purchase')}`, 'funnel.png', 1500);
+await shoot(desk, `/project/${pid}/insights/${by('Weekly retention')}`, 'retention.png', 1500);
+await shoot(desk, `/project/${pid}/events`, 'events.png', 800, async (p) => { await p.locator('tr.clickable').nth(1).click(); });
+await shoot(desk, `/project/${pid}/persons`, 'persons.png');
+const persons = await (await desk.request.get(`${site}/api/projects/${pid}/persons?search=user-1`)).json();
+await shoot(desk, `/project/${pid}/persons/${persons.results.at(-1).id}`, 'person.png');
+await shoot(desk, `/project/${pid}/feature_flags`, 'flags.png');
+const flags = await (await desk.request.get(`${site}/api/projects/${pid}/feature_flags`)).json();
+await shoot(desk, `/project/${pid}/feature_flags/${flags.find((f) => f.key === 'new-checkout').id}`, 'flag.png');
+await shoot(desk, `/project/${pid}/settings`, 'settings.png');
+const st = await desk.storageState();
+const mob = await b.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, storageState: st });
+await shoot(mob, `/project/${pid}/dashboards/${dash}`, 'dashboard-mobile.png', 2000);
+await shoot(mob, `/project/${pid}/insights/${by('Signup to purchase')}`, 'funnel-mobile.png', 1500);
+await b.close();
