@@ -6,12 +6,16 @@ import { projectByToken, validToken } from './projects';
 import { uuidv7 } from '../shared/ids';
 import { recordingConfig, performanceConfig } from './replay';
 import { authenticate } from './auth';
+import { eventsQuotaLimited } from './usage';
 
 export function remoteConfig(p: ProjectRow, hasFlags: boolean, hasSurveys = false) {
+  // Exception autocapture (protocol.md "Exceptions"): posthog-js turns on window.onerror / unhandledrejection capture when
+  // `autocaptureExceptions` is truthy; `errorTracking` is the newer home of the same switch. Off while events are capped.
+  const exc = !!p.error_tracking && !eventsQuotaLimited(p);
   return {
     token: p.api_token, supportedCompression: ['gzip', 'gzip-js'], hasFeatureFlags: hasFlags,
     analytics: { endpoint: '/i/v0/e/' }, elementsChainAsString: true, defaultIdentifiedOnly: true,
-    autocapture_opt_out: !!p.autocapture_opt_out, autocaptureExceptions: false, captureDeadClicks: !!p.heatmaps, capturePerformance: performanceConfig(p),
+    autocapture_opt_out: !!p.autocapture_opt_out, autocaptureExceptions: exc, errorTracking: { autocaptureExceptions: exc, suppressionRules: [], captureExtensionExceptions: false }, captureDeadClicks: !!p.heatmaps, capturePerformance: performanceConfig(p),
     sessionRecording: recordingConfig(p), heatmaps: !!p.heatmaps, surveys: hasSurveys, productTours: false, siteApps: [],
   };
 }

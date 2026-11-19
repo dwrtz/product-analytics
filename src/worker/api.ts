@@ -7,6 +7,10 @@ import { QueryError } from './query';
 import { chunkPrefix, deletePrefix, readSnapshots, readSnapshotsPage, cleanReplayConfig, ReplayConfigError } from './replay';
 import { handleLocalEvaluation } from './sdk';
 import { coldEnabled, runColdSql } from './cold';
+import { cleanLimits, limitsOf, capStateOf, LimitsError, NEW_PROJECT_LIMITS, NEW_PROJECT_REPLAY_SAMPLE_RATE } from './usage';
+import { validateMap } from '../shared/sourcemap';
+import { refOf } from './errors';
+import { uuidv7 } from '../shared/ids';
 
 const readJson = async (req: Request) => { try { return await req.json() as any; } catch { throw new HttpError(400, 'bad_request', 'Body must be JSON.'); } };
 const validTz = (tz: string) => { try { new Intl.DateTimeFormat('en', { timeZone: tz }); return true; } catch { return false; } };
@@ -41,7 +45,9 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
       const tz = String(b.timezone ?? 'UTC'); if (!validTz(tz)) throw new HttpError(400, 'bad_request', 'Unknown time zone.');
       const days = (v: unknown) => Math.max(0, Math.floor(Number(v) || 0));
       const ret = b.retention_days !== undefined ? days(b.retention_days) : days(env.DEFAULT_RETENTION_DAYS);
-      const r = await env.DB.prepare('INSERT INTO projects (name, api_token, timezone, retention_days, created_at) VALUES (?, ?, ?, ?, ?) RETURNING *').bind(name, randomToken('phc_', 43), tz, ret, nowIso()).first<ProjectRow>();
+      // 0.5 defaults (design.md "Usage limits"): monthly caps, autocapture and replay sampling, exception autocapture on.
+      const r = await env.DB.prepare('INSERT INTO projects (name, api_token, timezone, retention_days, created_at, limits, replay_config, error_tracking) VALUES (?, ?, ?, ?, ?, ?, ?, 1) RETURNING *')
+        .bind(name, randomToken('phc_', 43), tz, ret, nowIso(), JSON.stringify(NEW_PROJECT_LIMITS), JSON.stringify(cleanReplayConfig({ sample_rate: NEW_PROJECT_REPLAY_SAMPLE_RATE }))).first<ProjectRow>();
       return json(projectOut(r!), 201);
     }
   }
@@ -66,12 +72,16 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
       const hm = b.heatmaps !== undefined ? (b.heatmaps ? 1 : 0) : (project.heatmaps ?? 0);
       let rc = project.replay_config ?? null;
       if (b.replay_config !== undefined) { try { rc = b.replay_config === null ? null : JSON.stringify(cleanReplayConfig(b.replay_config)); } catch (e) { if (e instanceof ReplayConfigError) throw new HttpError(400, 'bad_request', e.message); throw e; } }
-      const r = await env.DB.prepare('UPDATE projects SET name = ?, timezone = ?, retention_days = ?, anonymize_ips = ?, autocapture_opt_out = ?, session_recording = ?, heatmaps = ?, replay_config = ? WHERE id = ? RETURNING *').bind(name, tz, ret, anon, ac, rec, hm, rc, pid).first<ProjectRow>();
+      let lim = project.limits ?? null;
+      if (b.limits !== undefined) { try { lim = b.limits === null ? null : JSON.stringify(cleanLimits(b.limits, limitsOf(project))); } catch (e) { if (e instanceof LimitsError) throw new HttpError(400, 'bad_request', e.message); throw e; } }
+      const et = b.error_tracking !== undefined ? (b.error_tracking ? 1 : 0) : (project.error_tracking ?? 0);
+      let r = await env.DB.prepare('UPDATE projects SET name = ?, timezone = ?, retention_days = ?, anonymize_ips = ?, autocapture_opt_out = ?, session_recording = ?, heatmaps = ?, replay_config = ?, limits = ?, error_tracking = ? WHERE id = ? RETURNING *').bind(name, tz, ret, anon, ac, rec, hm, rc, lim, et, pid).first<ProjectRow>();
+      if (b.limits !== undefined) { await store.refreshCaps(pid); r = await env.DB.prepare('SELECT * FROM projects WHERE id = ?').bind(pid).first<ProjectRow>(); }
       forgetToken(project.api_token);
       return json(projectOut(r!));
     }
     if (m === 'DELETE') {
-      await store.destroy(); await deletePrefix(env, chunkPrefix(pid)); await env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(pid).run(); forgetToken(project.api_token); return json({ ok: true });
+      await store.destroy(); await deletePrefix(env, chunkPrefix(pid)); await deletePrefix(env, `sourcemaps/${pid}/`); await env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(pid).run(); forgetToken(project.api_token); return json({ ok: true });
     }
   }
   if (sub === '/reset_token' && m === 'POST') {
@@ -194,6 +204,36 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
     if (!s[2] && m === 'PATCH') { const r = await store.saveSurvey(s[1], await readJson(req)); if ('error' in r) throw new HttpError(r.error === 'not_found' ? 404 : 400, r.error === 'not_found' ? 'not_found' : 'bad_request', r.error); return json(r); }
     if (!s[2] && m === 'DELETE') { if (!await store.deleteSurvey(s[1])) throw new HttpError(404, 'not_found'); return json({ ok: true }); }
   }
+  // ---------- 0.5: usage, alerts, error tracking ----------
+  if (sub === '/usage' && m === 'GET') return json(await store.usage(pid, Number(url.searchParams.get('days')) || 30));
+  if (sub === '/alerts' && m === 'GET') return json(await store.listAlerts(Number(url.searchParams.get('limit')) || 50));
+  if (sub === '/alerts/read' && m === 'POST') return json(await store.markAlertsRead());
+  if (sub === '/alerts/test' && m === 'POST') return json(await store.testAlert(pid));
+  if (sub === '/error_issues' && m === 'GET') return json(await store.listIssues({ status: url.searchParams.get('status'), search: url.searchParams.get('search'), order: url.searchParams.get('order'), limit: Number(url.searchParams.get('limit')) || 100 }));
+  s = /^\/error_issues\/([0-9a-f-]{36})$/.exec(sub);
+  if (s) {
+    if (m === 'GET') { const r = await store.getIssue(s[1]); if (!r) throw new HttpError(404, 'not_found'); return json(r); }
+    if (m === 'PATCH') { const r = await store.updateIssue(s[1], await readJson(req)); if (!r) throw new HttpError(404, 'not_found'); if ('error' in r) throw new HttpError(400, 'bad_request', r.error as string); return json(r); }
+  }
+  // Source maps (design.md "Source maps"): PUT/POST ?url=<URL of the minified file> with the map JSON as the body.
+  if (sub === '/symbol_sets') {
+    if (m === 'GET') return json(await store.listSymbolSets());
+    if (m === 'POST' || m === 'PUT') {
+      const ref = refOf(url.searchParams.get('url') ?? '');
+      if (!ref || ref.length > 2000) throw new HttpError(400, 'bad_request', 'url (the minified file URL or path the stack frames show) is required.');
+      const text = await req.text();
+      if (text.length > 25 * 1024 * 1024) throw new HttpError(413, 'payload_too_large', 'Source map over 25 MB.');
+      let map: unknown; try { map = JSON.parse(text); } catch { throw new HttpError(400, 'bad_request', 'Body must be the source map JSON.'); }
+      const bad = validateMap(map); if (bad) throw new HttpError(400, 'bad_request', bad);
+      const key = `sourcemaps/${pid}/${uuidv7()}.map`;
+      await env.REPLAY.put(key, text, { httpMetadata: { contentType: 'application/json' } });
+      const r = await store.addSymbolSet(ref, key, text.length);
+      if (r.replaced) await env.REPLAY.delete(r.replaced);
+      return json({ id: r.id, url: ref, size: text.length, replaced: !!r.replaced }, 201);
+    }
+  }
+  s = /^\/symbol_sets\/([0-9a-f-]{36})$/.exec(sub);
+  if (s && m === 'DELETE') { const key = await store.deleteSymbolSet(s[1]); if (!key) throw new HttpError(404, 'not_found'); await env.REPLAY.delete(key); return json({ ok: true }); }
   if (sub === '/session_recordings' && m === 'GET') {
     const before = url.searchParams.get('before');
     return json(await store.listRecordings({ personId: url.searchParams.get('person_id'), distinctId: url.searchParams.get('distinct_id'), before: before ? Number(before) : null, limit: Number(url.searchParams.get('limit')) || 50 }));
@@ -215,7 +255,7 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
 function projectOut(p: ProjectRow) {
   let rc: unknown = null; try { rc = p.replay_config ? JSON.parse(p.replay_config) : null; } catch { rc = null; }
   return { id: p.id, name: p.name, api_token: p.api_token, timezone: p.timezone, retention_days: p.retention_days, anonymize_ips: !!p.anonymize_ips, autocapture_opt_out: !!p.autocapture_opt_out,
-    session_recording: !!p.session_recording, replay_config: rc, heatmaps: !!p.heatmaps, created_at: p.created_at };
+    session_recording: !!p.session_recording, replay_config: rc, heatmaps: !!p.heatmaps, limits: p.limits ? limitsOf(p) : null, cap_state: capStateOf(p), error_tracking: !!p.error_tracking, created_at: p.created_at };
 }
 /** Cohort bodies are JSON, or a CSV upload (text/csv) of distinct ids or emails for a static cohort. */
 async function readCohortBody(req: Request) {

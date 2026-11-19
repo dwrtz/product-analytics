@@ -5,12 +5,13 @@ send to unchanged. Point the usual posthog-js snippet (or posthog-node) at
 your instance and you get events, identified people, groups, trends,
 funnels, retention, dashboards, feature flags (also evaluated locally by
 posthog-node), session replay with console and network logs, heatmaps and
-scroll depth, actions, cohorts, a read-only SQL editor, experiments and
-targeted surveys. Events live in SQLite Durable Objects sharded by
+scroll depth, actions, cohorts, a read-only SQL editor, experiments,
+targeted surveys, error tracking with source maps, and per-project usage
+caps with a usage page, cost estimate and alerts. Events live in SQLite Durable Objects sharded by
 month, so a project is not limited to 10 GB and every count stays exact.
 
 **Spec:** [spekkr.com/dwrtz/product-analytics](https://spekkr.com/dwrtz/product-analytics/)
-(version 0.4.0, also in [`spec/`](spec/)). This repo is the reference
+(version 0.5.0, also in [`spec/`](spec/)). This repo is the reference
 implementation of that spec.
 
 This is not PostHog and contains no PostHog code. The wire format was
@@ -81,6 +82,23 @@ reconstructed from PostHog's MIT-licensed sources and recorded SDK traffic
 
 ![SQL over the Iceberg cold tier](shots04/sql-cold.png)
 
+- **0.5**: error tracking: `$exception` events from posthog-js (exception
+  autocapture is switched on through remote config) and posthog-node are
+  grouped into issues by fingerprint, with status, occurrences, affected
+  users, symbolicated stack traces (upload maps with
+  `scripts/upload-sourcemaps.mjs` and a personal API key), person and
+  replay links, and new-issue / regression alerts. Usage limits: monthly
+  caps on events, recordings and replay bytes, drop or sample past a cap
+  (posthog-js is told `quota_limited` and pauses), autocapture and replay
+  sampling defaults for new projects, a Usage page with events per day by
+  type, replay volume and an estimated Cloudflare cost, and alerts at
+  50/80/100% of a cap and on spikes, in the app and optionally by email
+  (Cloudflare Email Sending).
+
+![Error issue with a symbolicated stack trace](shots05/error-issue.png)
+
+![Usage page](shots05/usage.png)
+
 Full, normative detail: [`spec/protocol.md`](spec/protocol.md), with worked
 examples in [`spec/test-vectors.json`](spec/test-vectors.json).
 
@@ -89,9 +107,9 @@ examples in [`spec/test-vectors.json`](spec/test-vectors.json).
 | Path | What |
 |---|---|
 | `src/shared/` | Pure wire library: body decoding, tokens, timestamps, ids, flag hashing and matching, date buckets |
-| `src/worker/` | The Worker: capture, flags and remote config, queue consumer, owner API, auth, `ProjectStore` (head) and `EventShard` Durable Objects, queries, replay, experiments, surveys |
+| `src/worker/` | The Worker: capture, flags and remote config, queue consumer, owner API, auth, `ProjectStore` (head) and `EventShard` Durable Objects, queries, replay, experiments, surveys, error tracking, usage limits and alerts |
 | `src/ui/` | Web app (no framework, SVG charts), bundled into the Worker by `scripts/build-ui.mjs` |
-| `migrations/` | D1 schema (instance data: users, sessions, keys, projects; 0002 adds the recording switch) |
+| `migrations/` | D1 schema (instance data: users, sessions, keys, projects; 0002 adds the recording switch, 0004 usage limits and error tracking) |
 | `tests/`, `e2e/` | Vitest in workerd on the spec vectors and a fixed dataset; end-to-end with posthog-js in Chromium and posthog-node |
 | `scripts/` | UI build, SDK copy, demo data, screenshots |
 | `spec/` | The Spekkr spec this was built from |
@@ -103,7 +121,7 @@ Node 22 or later.
 ```sh
 npm install
 npm run dev          # builds, creates wrangler.jsonc, applies local D1 migrations, runs wrangler dev on :8787
-npm test             # 103 tests: spec vectors, store and insight maths, HTTP, shards, replay, experiments, surveys
+npm test             # 163 tests: spec vectors, store and insight maths, HTTP, shards, replay, experiments, surveys, cold tier, errors, usage
 npx playwright install chromium
 E2E_EMAIL=you@example.com npm run e2e   # against the running dev server
 ```
@@ -138,7 +156,14 @@ and R2, and a zone for the hostname.
    endpoints, `/static/*`, `/_health` and personal API key calls, and
    dashboard pages redirect to `SITE_URL` (off by default; 0.4.2).
 
-No secrets are needed. Upgrading from 0.2: run step 4 again (migration
+8. Optional alert email: onboard a sender domain to Cloudflare Email
+   Sending, then add `"send_email": [{ "name": "EMAIL" }]` and the
+   `ALERT_EMAIL_FROM` var (see `wrangler.example.jsonc`). Without them
+   alerts appear in the app only.
+
+No secrets are needed. Upgrading from 0.4: run step 4 again (migration
+0004) and `npm run deploy`; existing projects keep no caps and exception
+autocapture off until changed in Settings. Upgrading from 0.2: run step 4 again (migration
 0003) and `npm run deploy` (adds the hourly cohort cron). Upgrading from 0.1: create the R2 bucket, run step
 4 again (migration 0002) and `npm run deploy`; existing events stay where
 they are and new ones go to monthly shards.
@@ -157,9 +182,9 @@ Settings shows the full snippet for your instance. With posthog-node:
 
 ## Test status
 
-- `npm test`: 130/130 pass (0.4 adds the cold-tier compiler tests, 0.4.1/0.4.2 the ingest-only hostname tests).
+- `npm test`: 163/163 pass (0.5 adds error tracking, source map, usage cap, sampling and alert tests plus their vectors; 0.4 the cold-tier compiler tests, 0.4.1/0.4.2 the ingest-only hostname tests).
 - `npm run typecheck`: passes.
-- `npm run e2e`: 49/49 checks pass (0.3 adds actions, cohorts, SQL,
+- `npm run e2e`: 57/57 checks pass (0.5 adds exception autocapture with real posthog-js, a posthog-node exception, the issues and issue pages, the usage page, and posthog-js pausing after `quota_limited`; 0.3 adds actions, cohorts, SQL,
   heatmaps, scroll depth, console/network capture, continuity, partial
   survey responses, posthog-node local evaluation and their screens; earlier: (posthog-js snippet on a separate
   origin, posthog-node capture, identify, alias and flags; stored events,

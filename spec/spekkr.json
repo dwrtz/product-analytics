@@ -2,15 +2,15 @@
   "spekkr": 1,
   "id": "dwrtz/product-analytics",
   "name": "Product Analytics",
-  "summary": "Self-hosted posthog-js analytics on Cloudflare: insights, flags, replay, heatmaps, cohorts, SQL, experiments, surveys, Iceberg cold tier.",
+  "summary": "Self-hosted posthog-js analytics on Cloudflare: insights, flags, replay, heatmaps, SQL, experiments, surveys, error tracking, usage caps.",
   "kind": "web app",
   "keywords": [
     "product analytics",
     "posthog-js compatible",
     "session replay",
     "heatmaps",
-    "cohorts",
-    "sql editor",
+    "usage limits",
+    "error tracking",
     "experiments",
     "surveys",
     "feature flags",
@@ -18,7 +18,7 @@
     "self-hosted",
     "cloudflare workers"
   ],
-  "version": "0.4.2",
+  "version": "0.5.0",
   "author": {
     "id": "dwrtz",
     "name": "David Wurtz"
@@ -43,7 +43,8 @@
       "esbuild",
       "Vitest",
       "Playwright",
-      "posthog-node"
+      "posthog-node",
+      "Cloudflare Email Sending (optional)"
     ]
   },
   "customize": {
@@ -65,19 +66,19 @@
   "files": [
     {
       "path": "spec.md",
-      "about": "Requirements R1-R27 (0.2: event shards, replay, experiments, surveys; 0.3: actions, cohorts, heatmaps, SQL, local evaluation, continuity, survey targeting, replay settings, no row limits; 0.4: optional Basin / Iceberg cold tier queried from SQL) with acceptance checks, scope and definition of done."
+      "about": "Requirements R1-R30 (0.2: event shards, replay, experiments, surveys; 0.3: actions, cohorts, heatmaps, SQL, local evaluation, continuity, survey targeting, replay settings, no row limits; 0.4: optional Basin / Iceberg cold tier queried from SQL; 0.5: error tracking with source maps, usage caps, sampling, usage page, cost estimate and alerts) with acceptance checks, scope and definition of done."
     },
     {
       "path": "protocol.md",
-      "about": "The normative SDK wire format: capture routes, body decoding, tokens, timestamps, v1 capture, persons and merges, feature flags, remote config, replay snapshots and settings, surveys and targeting, exposure, heatmaps, local evaluation, experience continuity, error codes."
+      "about": "The normative SDK wire format: capture routes, body decoding, tokens, timestamps, v1 capture, persons and merges, feature flags, remote config, replay snapshots and settings, surveys and targeting, exposure, heatmaps, local evaluation, experience continuity, exceptions, quota limiting, error codes."
     },
     {
       "path": "test-vectors.json",
-      "about": "Worked examples for decoding, tokens, timestamps, distinct ids, flag hashing and matching, capture responses and person scenarios."
+      "about": "Worked examples for decoding, tokens, timestamps, distinct ids, flag hashing and matching, capture responses person scenarios, sampling, quota_limited answers, source-map decoding and exception fingerprints."
     },
     {
       "path": "design.md",
-      "about": "Stack, storage and event-shard decisions, Cloudflare config, deploy and upgrade, data model, ingestion, query semantics, actions, cohorts, SQL, heatmaps, streaming funnels, replay, experiment statistics, surveys, owner API, screens, tests, limits and the Basin cold tier (stream, Iceberg sink, Basin SQL compiler, retention)."
+      "about": "Stack, storage and event-shard decisions, Cloudflare config, deploy and upgrade, data model, ingestion, query semantics, actions, cohorts, SQL, heatmaps, streaming funnels, replay, experiment statistics, surveys, owner API, screens, tests, limits and the Basin cold tier (stream, Iceberg sink, Basin SQL compiler, retention), usage limits, cost estimate, alerts, error tracking and symbolication."
     },
     {
       "path": "tasks.md",
@@ -85,7 +86,7 @@
     },
     {
       "path": "research.md",
-      "about": "How the protocol was established with REA (0.1-0.3 captures, 0.4 Basin findings, and conformance runs), evidence and obligation ledgers, unknowns, licensing and choices."
+      "about": "How the protocol was established with REA (0.1-0.3 captures, 0.4 Basin findings, 0.5 exception and quota captures, and conformance runs), evidence and obligation ledgers, unknowns, licensing and choices."
     }
   ],
   "needs": {
@@ -107,6 +108,11 @@
   },
   "lineage": {},
   "changelog": [
+    {
+      "version": "0.5.0",
+      "date": "2026-11-19",
+      "note": "Error tracking: $exception events from posthog-js and posthog-node are grouped into issues by fingerprint (type plus top in-app frames, or $exception_fingerprint), with status, first/last seen, occurrences, affected users, stack traces symbolicated from uploaded source maps (API plus upload script), person and replay links, new-issue and regression alerts, and exception autocapture served in remote config. Usage: per-project monthly caps on events, recordings and replay bytes with drop or sample past the cap and quota_limited answers so posthog-js pauses; autocapture and replay sampling defaults for new projects; a Usage page with events per day by type, replay volume and an estimated Cloudflare cost; alerts at 50/80/100% of a cap and on daily spikes, in the app and optionally by Cloudflare Email Sending. D1 migration 0004_v05.sql."
+    },
     {
       "version": "0.4.2",
       "date": "2026-11-19",
@@ -147,6 +153,8 @@
     "screenshots": [
       "shots/dashboard.png",
       "shots/trends.png",
+      "shots05/error-issue.png",
+      "shots05/usage.png",
       "shots/funnel.png",
       "shots/replay-player.png",
       "shots/experiment-results.png",
@@ -154,9 +162,7 @@
       "shots03/heatmap-clicks.png",
       "shots03/cohort-edit.png",
       "shots04/sql-cold.png",
-      "shots03/replay-console-network.png",
-      "shots03/action-edit.png",
-      "shots03/survey-targeting.png"
+      "shots03/replay-console-network.png"
     ]
   }
 }

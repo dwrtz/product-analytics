@@ -36,7 +36,7 @@ describe('persons (test-vectors.json persons)', () => {
   });
   it('drops duplicate uuids', async () => {
     const s = store(); const e = norm({ event: 'x', distinct_id: 'd', uuid: '01890000-0000-7000-8000-0000000000aa' }, '2026-03-01T00:00:00Z');
-    expect(await s.ingest([e, e])).toEqual({ inserted: 1, duplicates: 1 });
+    expect(await s.ingest([e, e])).toMatchObject({ inserted: 1, duplicates: 1 });
   });
 });
 

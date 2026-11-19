@@ -2,7 +2,7 @@
 import settings from '../../spekkr.inputs.json';
 
 const APP = settings.app_name;
-type Project = { id: number; name: string; api_token: string; timezone: string; retention_days: number; anonymize_ips: boolean; autocapture_opt_out: boolean; session_recording: boolean; replay_config: any; heatmaps: boolean; created_at: string };
+type Project = { id: number; name: string; api_token: string; timezone: string; retention_days: number; anonymize_ips: boolean; autocapture_opt_out: boolean; session_recording: boolean; replay_config: any; heatmaps: boolean; limits: any; cap_state: { month: string; events: boolean; replay: boolean }; error_tracking: boolean; created_at: string };
 type Me = { id: number; email: string; name: string };
 let me: Me | null = null;
 let projects: Project[] = [];
@@ -82,7 +82,8 @@ function shell(title: Child | Child[], actions: Child[], ...content: Child[]) {
       h('div', { class: 'proj' }, picker),
       h('div', { class: 'side-links' },
         item('/dashboards', 'Dashboards'), item('/insights', 'Insights'), item('/sql', 'SQL'), item('/events', 'Events'), item('/actions', 'Actions'), item('/persons', 'Persons'), item('/cohorts', 'Cohorts'),
-        item('/replay', 'Session replay'), item('/heatmaps', 'Heatmaps'), item('/feature_flags', 'Feature flags'), item('/experiments', 'Experiments'), item('/surveys', 'Surveys'), item('/settings', 'Settings'),
+        item('/replay', 'Session replay'), item('/heatmaps', 'Heatmaps'), item('/errors', 'Error tracking'), item('/feature_flags', 'Feature flags'), item('/experiments', 'Experiments'), item('/surveys', 'Surveys'),
+        usageItem(item('/usage', 'Usage')), item('/settings', 'Settings'),
         link('/account', 'Account', here === '/account' ? 'active' : ''))),
     h('main', {}, h('header', { class: 'top' }, h('h1', {}, title), h('div', { class: 'row' }, actions)), ...content)));
 }
@@ -547,11 +548,12 @@ async function settingsPage() {
       h('h3', {}, 'Project API key'), h('div', { class: 'row' }, h('code', { class: 'token' }, p.api_token), copy(p.api_token)),
       h('p', { class: 'muted small' }, 'This key is public: it can only send events and read flags.'),
       stats ? h('p', { class: 'small' }, h('b', {}, fmt(stats.events)), ' events · ', h('b', {}, fmt(stats.persons)), ' persons · last event ', ago(stats.last_event_at), ` · ${(stats.database_bytes / 1048576).toFixed(1)} MB stored`) : null),
-    form, replaySettings(p),
+    form, limitsSettings(p), errorTrackingSettings(p), replaySettings(p),
     h('section', { class: 'card' }, h('h2', {}, 'Other projects'), h('ul', {}, projects.map(x => h('li', {}, link(`/project/${x.id}/settings`, x.name)))), newProjectForm(np => nav(`/project/${np.id}/settings`))),
     h('section', { class: 'card danger-zone' }, h('h2', {}, 'Danger zone'),
       h('div', { class: 'row' }, h('button', { onclick: async () => { if (!confirm('Reset the project API key? Sites using the old key stop sending events.')) return; const r = await api<Project>(apiP('/reset_token'), { body: {} }); projects = projects.map(x => x.id === r.id ? r : x); settingsPage(); } }, 'Reset project API key'),
         h('button', { class: 'danger', onclick: async () => { if (prompt(`Type the project name (${p.name}) to delete it and all its data.`) !== p.name) return; await api(apiP(''), { method: 'DELETE' }); projects = projects.filter(x => x.id !== p.id); nav('/'); } }, 'Delete project'))));
+  if (location.hash) document.getElementById(location.hash.slice(1))?.scrollIntoView();
 }
 
 // ---------- account ----------
@@ -1181,6 +1183,208 @@ function replaySettings(p: Project): HTMLElement {
   return form;
 }
 
+// ---------- usage, alerts (design.md "Usage limits", "Alerts") ----------
+const unread = new Map<number, { at: number; n: number }>();
+function usageItem(a: HTMLElement) {
+  const badge = h('span', { class: 'badge', hidden: true });
+  a.append(badge);
+  const show = (n: number) => { badge.textContent = n > 99 ? '99+' : String(n); badge.hidden = !n; badge.title = `${n} unread alert${n === 1 ? '' : 's'}`; };
+  const c = unread.get(pid);
+  if (c && Date.now() - c.at < 60_000) show(c.n);
+  else { const p0 = pid; api<any>(`/api/projects/${p0}/alerts?limit=1`).then(r => { unread.set(p0, { at: Date.now(), n: r.unread }); if (p0 === pid) show(r.unread); }).catch(() => {}); }
+  return a;
+}
+const bytes = (n: number) => n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(1)} KB` : n < 1024 ** 3 ? `${(n / 1024 ** 2).toFixed(1)} MB` : `${(n / 1024 ** 3).toFixed(2)} GB`;
+const usd = (n: number) => n === 0 ? '$0.00' : n < 0.01 ? '<$0.01' : '$' + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+function stackedBars(labels: string[], series: { name: string; data: number[] }[]): HTMLElement {
+  const W = 720, H = 240, L = 44, R = 12, T = 12, B = 30;
+  const totals = labels.map((_, i) => series.reduce((a, sr) => a + (sr.data[i] ?? 0), 0));
+  const max = niceMax(Math.max(0, ...totals)); const n = Math.max(labels.length, 1);
+  const bw = (W - L - R) / n; const y = (v: number) => T + (H - T - B) * (1 - v / max);
+  const svg = s('svg', { viewBox: `0 0 ${W} ${H}`, class: 'chart', role: 'img', 'aria-label': 'Events per day by event type' });
+  for (let k = 0; k <= 4; k++) { const v = max * k / 4; svg.append(s('line', { x1: L, x2: W - R, y1: y(v), y2: y(v), class: 'grid' }), s('text', { x: L - 6, y: y(v) + 4, 'text-anchor': 'end', class: 'axis' }, fmt(v))); }
+  const step = Math.ceil(n / 10);
+  labels.forEach((l, i) => {
+    if (i % step === 0) svg.append(s('text', { x: L + (i + 0.5) * bw, y: H - 10, 'text-anchor': 'middle', class: 'axis' }, l.slice(5)));
+    let acc = 0;
+    series.forEach((sr, si) => { const v = sr.data[i] ?? 0; if (!v) return; svg.append(s('rect', { x: L + i * bw + 1, y: y(acc + v), width: Math.max(1, bw - 2), height: Math.max(0, y(acc) - y(acc + v)), fill: color(si) }, s('title', {}, `${sr.name} · ${l}: ${fmt(v)}`))); acc += v; });
+  });
+  return h('div', { class: 'chart-wrap' }, svg as unknown as Node, h('ul', { class: 'legend' }, series.map((sr, i) => h('li', {}, h('span', { class: 'swatch', style: `background:${color(i)}` }), sr.name, h('b', {}, fmt(sr.data.reduce((a, b) => a + b, 0)))))));
+}
+function meter(label: string, used: number, cap: number | null, show: (n: number) => string, capped: boolean, mode: string) {
+  const pct = cap === null ? null : cap === 0 ? 100 : Math.min(100, 100 * used / cap);
+  return h('div', { class: 'meter' }, h('div', { class: 'row spread' }, h('b', {}, label), capped ? h('span', { class: 'tag lvl-error' }, mode) : pct !== null && pct >= 80 ? h('span', { class: 'tag lvl-warn' }, 'near cap') : null),
+    h('div', { class: 'big' }, show(used), h('span', { class: 'muted small' }, cap === null ? ' · no cap' : ` of ${show(cap)} · ${(cap === 0 ? 100 : 100 * used / cap).toFixed(1)}%`)),
+    h('div', { class: 'track' }, h('span', { class: 'fill', style: `width:${pct ?? 0}%;background:${pct !== null && pct >= 100 ? 'var(--danger)' : pct !== null && pct >= 80 ? '#f59e0b' : 'var(--accent)'}` })));
+}
+const ALERT_KIND: Record<string, string> = { usage_threshold: 'Usage', usage_spike: 'Spike', error_new: 'New issue', error_regression: 'Regression', test: 'Test' };
+function alertsList(list: any[]) {
+  if (!list.length) return h('p', { class: 'muted empty' }, 'No alerts yet. Usage alerts fire at 50%, 80% and 100% of a cap and on daily spikes; error alerts on new issues and regressions.');
+  return h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'When'), h('th', {}, 'Alert'), h('th', {}, 'Email'))),
+    h('tbody', {}, list.map(a => h('tr', { class: a.read ? '' : 'unread' }, h('td', { class: 'nowrap muted' }, when(a.created_at)),
+      h('td', {}, h('span', { class: `tag kind-${a.kind}` }, ALERT_KIND[a.kind] ?? a.kind), ' ', a.link && a.link.startsWith('/project/') ? link(a.link, a.title) : a.title, h('div', { class: 'muted small' }, a.body)),
+      h('td', { class: 'muted small' }, a.email_status ?? '–')))));
+}
+async function usagePage() {
+  shell('Usage', [], loading());
+  const days = Number(new URLSearchParams(location.search).get('days')) || 30;
+  const [u, al] = await Promise.all([api<any>(apiP(`/usage?days=${days}`)), api<any>(apiP('/alerts?limit=50'))]);
+  const L = u.caps.limits; const st = u.caps.cap_state && u.caps.cap_state.month === u.month ? u.caps.cap_state : { events: false, replay: false };
+  const mode = L ? (L.over_cap === 'drop' ? 'capped · dropping' : `capped · sampling ${Math.round(L.over_cap_sample_rate * 100)}%`) : '';
+  // Days axis (UTC) and the top event types.
+  const labels: string[] = []; for (let i = days - 1; i >= 0; i--) labels.push(new Date(Date.now() - i * 86400_000).toISOString().slice(0, 10));
+  const byName = new Map<string, number>(); for (const d of u.daily) byName.set(d.event, (byName.get(d.event) ?? 0) + d.count);
+  const top = [...byName].sort((a, b) => b[1] - a[1]).slice(0, 8).map(x => x[0]);
+  const series = top.map(name => ({ name: eventLabel(name), data: labels.map(day => u.daily.filter((d: any) => d.day === day && d.event === name).reduce((a: number, d: any) => a + d.count, 0)) }));
+  const rest = labels.map(day => u.daily.filter((d: any) => d.day === day && !top.includes(d.event)).reduce((a: number, d: any) => a + d.count, 0));
+  if (rest.some(v => v)) series.push({ name: 'Other events', data: rest });
+  const total = [...byName.values()].reduce((a, b) => a + b, 0);
+  const dropped = new Map<string, number>(); for (const d of u.daily) dropped.set(d.event, (dropped.get(d.event) ?? 0) + d.dropped);
+  const eventsTable = h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Event'), h('th', { class: 'num' }, `Events (${days} d)`), h('th', { class: 'num' }, 'Share'), h('th', { class: 'num' }, 'Size'), h('th', { class: 'num' }, 'Dropped'))),
+    h('tbody', {}, [...byName].sort((a, b) => b[1] - a[1]).slice(0, 25).map(([name, c]) => h('tr', {}, h('td', {}, eventLabel(name), name !== eventLabel(name) ? h('span', { class: 'muted small' }, ` ${name}`) : null), h('td', { class: 'num' }, fmt(c)),
+      h('td', { class: 'num' }, total ? `${(100 * c / total).toFixed(1)}%` : '–'), h('td', { class: 'num' }, bytes(u.daily.filter((d: any) => d.event === name).reduce((a: number, d: any) => a + d.bytes, 0))), h('td', { class: 'num' }, fmt(dropped.get(name) ?? 0))))));
+  const rmap = new Map<string, any>(u.replay.map((r: any) => [r.day, r]));
+  const replaySeries = [{ name: 'New recordings', data: labels.map(d => rmap.get(d)?.recordings ?? 0) }];
+  const rtotal = u.replay.reduce((a: any, r: any) => ({ recordings: a.recordings + r.recordings, bytes: a.bytes + r.bytes, chunks: a.chunks + r.chunks, dropped: a.dropped + r.dropped }), { recordings: 0, bytes: 0, chunks: 0, dropped: 0 });
+  const c = u.cost;
+  const costTable = h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Item'), h('th', { class: 'num' }, 'Projected quantity'), h('th', { class: 'num' }, 'List price'), h('th', { class: 'num' }, 'After included usage'))),
+    h('tbody', {}, c.lines.map((l: any) => h('tr', {}, h('td', {}, l.label), h('td', { class: 'num' }, `${fmt(l.quantity < 100 ? Math.round(l.quantity * 1000) / 1000 : Math.round(l.quantity))} ${l.unit}`), h('td', { class: 'num' }, usd(l.list_usd)), h('td', { class: 'num' }, usd(l.after_included_usd))))),
+    h('tfoot', {}, h('tr', {}, h('th', {}, 'Estimated total for ', u.month), h('th', {}), h('th', { class: 'num' }, usd(c.list_usd)), h('th', { class: 'num' }, usd(c.after_included_usd)))));
+  const daysSel = h('select', { 'aria-label': 'Days', onchange: (e: Event) => nav(P(`/usage?days=${(e.target as HTMLSelectElement).value}`)) }, [7, 30, 90].map(d => opt(String(d), `Last ${d} days`, String(days))));
+  const err = errBox();
+  const testBtn = h('button', { onclick: async () => { err.textContent = ''; try { const r = await api<any>(apiP('/alerts/test'), { body: {} }); err.textContent = `Test alert created · email: ${r.email_status}`; } catch (e) { err.textContent = e instanceof Error ? e.message : String(e); } } }, 'Send test alert');
+  const readBtn = h('button', { onclick: async () => { await api(apiP('/alerts/read'), { body: {} }); unread.set(pid, { at: Date.now(), n: 0 }); usagePage(); } }, 'Mark all read');
+  shell('Usage', [daysSel, link(P('/settings#limits'), 'Limits and alerts')],
+    h('section', { class: 'card' }, h('h2', {}, `This month (${u.month}, UTC)`),
+      h('div', { class: 'meters' }, meter('Events', u.caps.events.used, u.caps.events.cap, fmt, st.events, mode),
+        meter('Session recordings', u.caps.recordings.used, u.caps.recordings.cap, fmt, st.replay, mode),
+        meter('Replay storage', u.caps.replay_bytes.used, u.caps.replay_bytes.cap, bytes, st.replay, mode)),
+      L ? h('p', { class: 'muted small' }, `Past a cap new data is ${L.over_cap === 'drop' ? 'dropped and SDKs are told to pause (quota_limited)' : `sampled: ${Math.round(L.over_cap_sample_rate * 100)}% of people (events) and sessions (replay) are kept`}. Autocapture is sampled at ${Math.round(L.autocapture_sample_rate * 100)}% of sessions. Events dropped at the edge after a cap is hit are not counted.`)
+        : h('p', { class: 'muted small' }, 'This project has no usage limits. ', link(P('/settings#limits'), 'Set caps and sampling'), '.')),
+    h('section', { class: 'card' }, h('h2', {}, 'Events per day by event type'), total ? stackedBars(labels, series) : h('p', { class: 'muted empty' }, 'No events in this range.'), total ? eventsTable : null),
+    h('section', { class: 'card' }, h('h2', {}, 'Session replay'), h('p', { class: 'small' }, h('b', {}, fmt(rtotal.recordings)), ' new recordings · ', h('b', {}, bytes(rtotal.bytes)), ' stored (gzip) · ', h('b', {}, fmt(rtotal.chunks)), ' uploads', rtotal.dropped ? ` · ${fmt(rtotal.dropped)} uploads refused over the cap` : '', ` in the last ${days} days`),
+      rtotal.recordings || rtotal.chunks ? stackedBars(labels, replaySeries) : h('p', { class: 'muted empty' }, 'No recordings in this range.')),
+    h('section', { class: 'card' }, h('h2', {}, 'Estimated Cloudflare cost ', h('span', { class: 'tag lvl-warn' }, 'estimate')),
+      h('p', { class: 'muted small' }, `Month-to-date usage (${u.days_elapsed} of ${u.days_in_month} days) projected to the full month, priced at Cloudflare's public list prices. Stored data: ${bytes(u.storage.database_bytes)} SQLite, ${bytes(u.storage.r2_bytes)} R2.`),
+      costTable, h('ul', { class: 'muted small' }, c.notes.map((n: string) => h('li', {}, n)))),
+    h('section', { class: 'card' }, h('div', { class: 'row spread' }, h('h2', {}, 'Alerts'), h('div', { class: 'row' }, readBtn, testBtn)),
+      h('p', { class: 'muted small' }, u.email.configured ? `Email alerts on: sent from ${u.email.from} to ${Array.isArray(u.email.recipients) ? u.email.recipients.join(', ') : u.email.recipients}.` : 'Email alerts are off on this instance (no Email Sending binding or ALERT_EMAIL_FROM); alerts appear here only.'), err,
+      alertsList(al.results)));
+}
+function limitsSettings(p: Project): HTMLElement {
+  const L = p.limits ?? { events_monthly: null, replay_recordings_monthly: null, replay_bytes_monthly: null, over_cap: 'drop', over_cap_sample_rate: 0.1, autocapture_sample_rate: 1, alert_emails: [], spike_alerts: true, spike_factor: 3 };
+  const num = (v: unknown, attrs: any = {}) => h('input', { type: 'number', value: v ?? '', class: 'narrow', ...attrs }) as HTMLInputElement;
+  const ev = num(L.events_monthly, { min: 0, placeholder: 'no cap' }), rec = num(L.replay_recordings_monthly, { min: 0, placeholder: 'no cap' });
+  const gb = num(L.replay_bytes_monthly === null ? '' : Math.round(L.replay_bytes_monthly / 1024 ** 3 * 100) / 100, { min: 0, step: 0.01, placeholder: 'no cap' });
+  const mode = h('select', {}, opt('drop', 'Drop new data (SDKs pause sending)', L.over_cap), opt('sample', 'Keep a sample', L.over_cap)) as HTMLSelectElement;
+  const rate = num(Math.round(L.over_cap_sample_rate * 100), { min: 0, max: 100 }); const ac = num(Math.round(L.autocapture_sample_rate * 100), { min: 0, max: 100 });
+  const emails = h('input', { value: (L.alert_emails ?? []).join(', '), placeholder: 'empty = every user of this instance' }) as HTMLInputElement;
+  const spike = h('input', { type: 'checkbox', checked: L.spike_alerts !== false }) as HTMLInputElement; const factor = num(L.spike_factor ?? 3, { min: 1.5, max: 100, step: 0.5 });
+  const err = errBox(); const btn = h('button', { class: 'primary', type: 'submit' }, 'Save limits') as HTMLButtonElement;
+  const form = h('form', { class: 'card', id: 'limits' }, h('h2', {}, 'Usage limits and alerts'),
+    h('p', { class: 'muted small' }, 'Monthly caps per UTC month. Alerts fire at 50%, 80% and 100% of each cap. ', link(P('/usage'), 'See usage'), '.'),
+    h('div', { class: 'row opts' }, h('label', {}, 'Events per month', ev), h('label', {}, 'Recordings per month', rec), h('label', {}, 'Replay storage per month (GB)', gb)),
+    h('div', { class: 'row opts' }, h('label', {}, 'Past a cap', mode), h('label', {}, 'Sample kept %', rate), h('label', {}, 'Autocapture sample %', ac)),
+    h('label', {}, 'Alert emails (comma-separated)', emails),
+    h('div', { class: 'row' }, h('label', { class: 'switch' }, spike, 'Alert on daily spikes over'), factor, h('span', { class: 'muted small' }, 'times the 7-day average')),
+    err, h('div', { class: 'row' }, btn, p.limits ? h('button', { type: 'button', class: 'link danger', onclick: async () => { if (!confirm('Remove all caps and sampling for this project?')) return; const r = await api<Project>(apiP(''), { method: 'PATCH', body: { limits: null } }); projects = projects.map(x => x.id === r.id ? r : x); settingsPage(); } }, 'Remove limits') : null));
+  form.addEventListener('submit', busy(btn, async () => {
+    const n = (i: HTMLInputElement) => i.value.trim() === '' ? null : Number(i.value);
+    const body = { events_monthly: n(ev), replay_recordings_monthly: n(rec), replay_bytes_monthly: gb.value.trim() === '' ? null : Math.round(Number(gb.value) * 1024 ** 3), over_cap: mode.value,
+      over_cap_sample_rate: Number(rate.value) / 100, autocapture_sample_rate: Number(ac.value) / 100, alert_emails: emails.value, spike_alerts: spike.checked, spike_factor: Number(factor.value) };
+    const r = await api<Project>(apiP(''), { method: 'PATCH', body: { limits: body } });
+    projects = projects.map(x => x.id === r.id ? r : x); btn.textContent = 'Saved';
+  }, err));
+  return form;
+}
+
+// ---------- error tracking (design.md "Error tracking") ----------
+function errorTrackingSettings(p: Project): HTMLElement {
+  const on = h('input', { type: 'checkbox', checked: p.error_tracking }) as HTMLInputElement;
+  const list = h('div', {}, loading());
+  const load = async () => {
+    const sets = await api<any[]>(apiP('/symbol_sets'));
+    list.replaceChildren(sets.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Minified file'), h('th', { class: 'num' }, 'Size'), h('th', {}, 'Uploaded'), h('th', {}, 'Last used'), h('th', {}))),
+      h('tbody', {}, sets.map(x => h('tr', {}, h('td', { class: 'url' }, h('code', {}, x.ref)), h('td', { class: 'num' }, bytes(x.size)), h('td', { class: 'muted nowrap' }, ago(x.created_at)), h('td', { class: 'muted nowrap' }, ago(x.last_used_at)),
+        h('td', {}, h('button', { type: 'button', class: 'link danger', onclick: async () => { if (!confirm('Delete this source map?')) return; await api(apiP(`/symbol_sets/${x.id}`), { method: 'DELETE' }); load(); } }, 'Delete')))))) : h('p', { class: 'muted small' }, 'No source maps uploaded.'));
+  };
+  load().catch(e => list.replaceChildren(h('p', { class: 'error' }, String(e))));
+  on.addEventListener('change', async () => { const r = await api<Project>(apiP(''), { method: 'PATCH', body: { error_tracking: on.checked } }); projects = projects.map(x => x.id === r.id ? r : x); });
+  const cli = `node upload-sourcemaps.mjs --host ${location.origin} --project ${p.id} \\\n  --dir dist/assets --url-prefix https://your-site.com/assets/\n# reads the personal API key from PA_PERSONAL_API_KEY`;
+  return h('section', { class: 'card', id: 'error-tracking' }, h('h2', {}, 'Error tracking'),
+    h('label', { class: 'switch' }, on, 'Capture unhandled errors and promise rejections (posthog-js exception autocapture, via remote config)'),
+    h('p', { class: 'muted small' }, 'posthog.captureException(error) and posthog-node captureException always work. Exceptions are grouped into issues by type and top stack frames, or by a $exception_fingerprint you send. ', link(P('/errors'), 'Open error tracking'), '.'),
+    h('h3', {}, 'Source maps'),
+    h('p', { class: 'muted small' }, 'Upload the map for each minified file so stack traces show original files, lines and function names. New exceptions are symbolicated at ingest. Use a personal API key (Account page) with the upload script from the repo (scripts/upload-sourcemaps.mjs):'),
+    h('pre', { class: 'code' }, cli), list);
+}
+const STATUS_TAG: Record<string, string> = { active: 'status-running', resolved: 'status-complete', suppressed: 'status-draft' };
+function spark(data: number[]) {
+  const W = 84, H = 22; const max = Math.max(1, ...data); const bw = W / data.length;
+  const svg = s('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H, class: 'spark', 'aria-hidden': 'true' });
+  data.forEach((v, i) => svg.append(s('rect', { x: i * bw + 0.5, y: H - Math.max(v ? 2 : 0, H * v / max), width: bw - 1, height: Math.max(v ? 2 : 0, H * v / max), fill: 'var(--danger)' })));
+  return svg as unknown as Node;
+}
+async function errorsPage() {
+  const q = new URLSearchParams(location.search); const status = q.get('status') ?? 'active'; const order = q.get('order') ?? 'last_seen';
+  shell('Error tracking', [], loading());
+  const r = await api<any>(apiP(`/error_issues?status=${status === 'all' ? '' : status}&order=${order}&search=${encodeURIComponent(q.get('search') ?? '')}`));
+  const go = (k: string, v: string) => { const n = new URLSearchParams(location.search); n.set(k, v); nav(P('/errors?' + n.toString())); };
+  const tab = (v: string, label: string) => h('button', { class: status === v ? 'tab active' : 'tab', onclick: () => go('status', v) }, label, v !== 'all' ? h('span', { class: 'muted small' }, ` ${fmt(r.counts[v] ?? 0)}`) : null);
+  const search = h('input', { placeholder: 'Search type, message or frame', value: q.get('search') ?? '', 'aria-label': 'Search issues', onkeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') go('search', (e.target as HTMLInputElement).value); } });
+  const sort = h('select', { 'aria-label': 'Sort', onchange: (e: Event) => go('order', (e.target as HTMLSelectElement).value) }, opt('last_seen', 'Last seen', order), opt('first_seen', 'First seen', order), opt('occurrences', 'Occurrences', order), opt('users', 'Users', order));
+  const p = project();
+  shell('Error tracking', [],
+    !p.error_tracking ? h('p', { class: 'muted small' }, 'Exception autocapture is off for this project; only manual captureException calls arrive. ', link(P('/settings#error-tracking'), 'Turn it on in Settings'), '.') : null,
+    h('section', { class: 'card' }, h('div', { class: 'row spread' }, h('div', { class: 'row tabs' }, tab('active', 'Active'), tab('resolved', 'Resolved'), tab('suppressed', 'Suppressed'), tab('all', 'All')), h('div', { class: 'row' }, search, sort)),
+      r.results.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Issue'), h('th', {}, '14 days'), h('th', { class: 'num' }, 'Occurrences'), h('th', { class: 'num' }, 'Users'), h('th', {}, 'Last seen'), h('th', {}, 'First seen'))),
+        h('tbody', {}, r.results.map((i: any) => h('tr', { class: 'clickable', onclick: () => nav(P(`/errors/${i.id}`)) },
+          h('td', {}, link(P(`/errors/${i.id}`), [h('b', {}, i.type), i.message ? `: ${i.message.length > 140 ? i.message.slice(0, 140) + '…' : i.message}` : '']), status === 'all' ? h('span', { class: `tag ${STATUS_TAG[i.status]}` }, i.status) : null, i.regressions ? h('span', { class: 'tag lvl-warn' }, 'regressed') : null,
+            h('div', { class: 'muted small mono' }, i.top_frame ?? 'no stack trace')),
+          h('td', {}, spark(i.last_14_days)), h('td', { class: 'num' }, fmt(i.occurrences)), h('td', { class: 'num' }, fmt(i.users)), h('td', { class: 'muted nowrap' }, ago(i.last_seen)), h('td', { class: 'muted nowrap' }, ago(i.first_seen))))))
+        : h('p', { class: 'muted empty' }, status === 'active' ? 'No active issues. Exceptions from posthog-js and posthog-node appear here grouped into issues.' : 'Nothing here.')));
+}
+function frameView(f: any, open: boolean) {
+  const loc = `${f.filename ?? f.abs_path ?? '?'}${f.lineno ? ':' + f.lineno : ''}${f.colno ? ':' + f.colno : ''}`;
+  const hasCtx = typeof f.context_line === 'string';
+  const head = h('div', { class: 'fhead' }, h('span', { class: 'mono' }, h('b', {}, f.function ?? '?'), h('span', { class: 'muted' }, ' in '), loc), f.in_app === false ? h('span', { class: 'tag' }, 'library') : null,
+    f.minified ? h('span', { class: 'muted small mono', title: 'Minified location' }, ` ← ${f.minified.function ?? '?'} ${(f.minified.filename ?? '').replace(/^https?:\/\/[^/]+/, '')}:${f.minified.lineno}:${f.minified.colno}`) : null);
+  if (!hasCtx) return h('div', { class: `frame${f.in_app === false ? ' lib' : ''}` }, head);
+  const first = (f.lineno ?? 1) - (f.pre_context?.length ?? 0);
+  const lines = [...(f.pre_context ?? []), f.context_line, ...(f.post_context ?? [])];
+  const code = h('pre', { class: 'ctx' }, lines.map((l: string, i: number) => h('div', { class: first + i === f.lineno ? 'hl' : '' }, h('span', { class: 'ln' }, String(first + i)), l)));
+  const d = h('details', { class: `frame${f.in_app === false ? ' lib' : ''}`, open }, h('summary', {}, head), code);
+  return d;
+}
+async function errorPage(id: string) {
+  shell('Issue', [], loading());
+  const i = await api<any>(apiP(`/error_issues/${id}`));
+  const setStatus = async (st: string) => { await api(apiP(`/error_issues/${id}`), { method: 'PATCH', body: { status: st } }); errorPage(id); };
+  const actions = i.status === 'active' ? [h('button', { class: 'primary', onclick: () => setStatus('resolved') }, 'Resolve'), h('button', { onclick: () => setStatus('suppressed') }, 'Suppress')]
+    : [h('button', { onclick: () => setStatus('active') }, 'Reopen')];
+  const ex: any[] = Array.isArray(i.exception_list) ? i.exception_list : [];
+  const traces = ex.map((e, k) => {
+    const frames: any[] = (e.stacktrace?.frames ?? []).slice().reverse(); let opened = false;
+    return h('div', { class: 'exception' }, h('h3', {}, k ? 'Caused by ' : '', h('span', { class: 'mono' }, e.type ?? 'Error'), e.value ? `: ${e.value}` : ''),
+      e.mechanism ? h('p', { class: 'muted small' }, e.mechanism.handled === false ? 'Unhandled' : 'Handled', e.stacktrace?.type === 'resolved' ? ' · symbolicated with an uploaded source map' : '') : null,
+      frames.length ? frames.map(f => { const o = !opened && f.in_app !== false && typeof f.context_line === 'string'; if (o) opened = true; return frameView(f, o); }) : h('p', { class: 'muted' }, 'No stack trace.'));
+  });
+  const daily = i.daily.length ? lineChart([{ label: 'Occurrences', data: i.daily.map((d: any) => d.c), labels: i.daily.map((d: any) => d.d), count: i.occurrences }], true) : null;
+  shell(h('span', {}, h('span', { class: 'mono' }, i.type), i.message ? `: ${i.message.length > 90 ? i.message.slice(0, 90) + '…' : i.message}` : ''), actions,
+    h('div', { class: 'cols' },
+      h('section', { class: 'card' }, h('h2', {}, 'Stack trace'), traces.length ? traces : h('p', { class: 'muted' }, 'No exception details.')),
+      h('section', {}, h('div', { class: 'card' }, h('h2', {}, 'Issue'), h('dl', { class: 'facts' },
+          h('dt', {}, 'Status'), h('dd', {}, h('span', { class: `tag ${STATUS_TAG[i.status]}` }, i.status), i.resolved_at ? h('span', { class: 'muted small' }, ` since ${when(i.resolved_at)}`) : null),
+          h('dt', {}, 'First seen'), h('dd', {}, when(i.first_seen)), h('dt', {}, 'Last seen'), h('dd', {}, when(i.last_seen)),
+          h('dt', {}, 'Occurrences'), h('dd', {}, fmt(i.occurrences)), h('dt', {}, 'Affected users'), h('dd', {}, fmt(i.users)),
+          h('dt', {}, 'Regressions'), h('dd', {}, fmt(i.regressions)), h('dt', {}, 'Fingerprint'), h('dd', {}, h('code', { class: 'small' }, i.fingerprint)))),
+        daily ? h('div', { class: 'card' }, h('h2', {}, 'Last 30 days'), daily) : null,
+        h('div', { class: 'card' }, h('h2', {}, 'Recent occurrences'), h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'When'), h('th', {}, 'Person'), h('th', {}, 'Replay'))),
+          h('tbody', {}, i.occurrences_list.map((o: any) => h('tr', {}, h('td', { class: 'nowrap' }, when(o.timestamp), h('div', { class: 'muted small url' }, o.url ?? '')),
+            h('td', {}, o.person ? link(P(`/persons/${encodeURIComponent(o.person.id)}`), o.person.name) : h('span', { class: 'muted' }, o.distinct_id)),
+            h('td', {}, o.has_recording ? link(P(`/replay/${encodeURIComponent(o.session_id)}`), 'Watch') : h('span', { class: 'muted small' }, o.session_id ? 'not recorded' : '–'))))))))));
+}
+
 // ---------- router ----------
 async function render() {
   const path = location.pathname;
@@ -1210,6 +1414,9 @@ async function render() {
     if (sub === '/feature_flags/new') return await flagPage(null);
     if ((r = /^\/feature_flags\/(\d+)$/.exec(sub))) return await flagPage(+r[1]);
     if (sub === '/settings') return await settingsPage();
+    if (sub === '/usage') return await usagePage();
+    if (sub === '/errors') return await errorsPage();
+    if ((r = /^\/errors\/([0-9a-f-]{36})$/.exec(sub))) return await errorPage(r[1]);
     if (sub === '/replay') return await replayListPage();
     if ((r = /^\/replay\/([^/]+)$/.exec(sub))) return await replayPage(decodeURIComponent(r[1]));
     if (sub === '/experiments') return await experimentsPage();

@@ -4,6 +4,7 @@ import { decodeBody, DecodeError } from '../shared/decode';
 import { parseDate, parseEventTimestamp } from '../shared/timestamp';
 import { isUuid, uuidv7 } from '../shared/ids';
 import { projectByToken, validToken } from './projects';
+import { gateEvents } from './usage';
 
 export const LEGACY_PATHS = new Set(['/e', '/batch', '/capture', '/track', '/engage', '/i/v0/e', '/i/v0/ai/batch']);
 export const V1_PATH = '/i/v1/analytics/events';
@@ -99,7 +100,7 @@ export async function enqueue(env: Env, pid: number, events: NormEvent[]): Promi
   }
   if (cur.length) msgs.push({ pid, events: cur });
   for (let i = 0; i < msgs.length; i += 2) await env.INGEST.sendBatch(msgs.slice(i, i + 2).map(body => ({ body, contentType: 'json' as const })));
-  if (direct.length) await storeFor(env, pid).ingest(direct);
+  if (direct.length) await storeFor(env, pid).ingest(direct, pid);
 }
 
 function reqCtx(req: Request, sentAt: number | null): Ctx {
@@ -136,12 +137,16 @@ export async function handleLegacyCapture(req: Request, env: Env, url: URL): Pro
   if (sentAt === null) { const q = Number(url.searchParams.get('_')); if (Number.isFinite(q) && q > Date.UTC(2021, 0, 1)) sentAt = q; }
   const project = await projectByToken(env, token);
   const beacon = url.searchParams.get('beacon') === '1';
-  const ok = () => beacon ? new Response(null, { status: 204, headers: cors(req) }) : json({ status: 1 }, 200, cors(req));
+  let quota: string[] | null = null;
+  // Over the monthly cap in drop mode, answer with posthog-js's `quota_limited` list so the SDK pauses those batch
+  // types for a minute (protocol.md "Quota limiting").
+  const ok = () => beacon ? new Response(null, { status: 204, headers: cors(req) }) : json(quota ? { status: 1, quota_limited: quota } : { status: 1 }, 200, cors(req));
   if (!project) return ok(); // unknown project: accepted and dropped, as the reference service does
   const ctx = reqCtx(req, sentAt);
   const events: NormEvent[] = [];
   for (const r of rawEvents) { const n = normalize(r, ctx, { v1: false, anonymizeIps: !!project.anonymize_ips }); if (!('drop' in n)) events.push(n); }
-  if (events.length) await enqueue(env, project.id, events);
+  const g = gateEvents(project, events, ctx.now); quota = g.quotaLimited;
+  if (g.keep.length) await enqueue(env, project.id, g.keep);
   return ok();
 }
 
@@ -176,6 +181,10 @@ export async function handleV1Capture(req: Request, env: Env): Promise<Response>
     results[key] = { result: 'ok' };
     if (project) events.push(n);
   }
-  if (project && events.length) await enqueue(env, project.id, events);
-  return json({ results }, 200, cors(req));
+  let quota: string[] | null = null;
+  if (project && events.length) {
+    const g = gateEvents(project, events, ctx.now); quota = g.quotaLimited;
+    if (g.keep.length) await enqueue(env, project.id, g.keep);
+  }
+  return json(quota ? { results, quota_limited: quota } : { results }, 200, cors(req));
 }

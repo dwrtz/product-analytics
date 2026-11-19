@@ -269,6 +269,14 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
 - The replay player is `rrweb-player` 2.2.2 (npm, MIT, from
   `github.com/rrweb-io/rrweb`; licence checked in its `package.json`
   and `LICENSE`), bundled unmodified into `/player.js`.
+- 0.5 error tracking and usage limits were built from: the posthog-js
+  exception autocapture extension and rate limiter (Apache-2.0 / MIT), the
+  posthog-node error-tracking extension (MIT), recorded SDK traffic, the
+  public Source Map Revision 3 specification (tc39.es/ecma426) and
+  Cloudflare's public pricing and Email Sending documentation. PostHog's
+  error tracking backend (Rust cymbal, grouping rules, ee/ billing and
+  quota limiting) was not read; grouping, symbolication, caps and the cost
+  model are our own design.
 - The product name, UI and copy are neutral. "PostHog" appears only where
   the protocol is attributed (here and in `protocol.md`).
 
@@ -310,3 +318,28 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
   recording's first full snapshot; no server-side screenshots.
 - Basin cold tier (0.4): stream binding, Iceberg sink, Basin SQL queries from the SQL editor (was: export hook only; needed operator-created Basin and R2
   credentials).
+
+## Choices made for 0.5
+
+- REA recording (`/workspace/analytics/recorder5`-style harness, kept out of
+  the repo): an esbuild-minified demo app with its source map served to
+  real posthog-js 1.450.1 in Chromium against a recorder that logs every
+  request; scenarios: unhandled TypeError, unhandled rejection,
+  `captureException`, custom `$exception_fingerprint`, a `quota_limited`
+  reply followed by more clicks; plus posthog-node 6.0.3
+  `captureException`. Saved as `tests/fixtures/v05-errors.json`.
+  Observations: frames innermost last; node frames already carry context
+  lines and `in_app`; one `quota_limited` reply silences that batch key
+  for 60 s.
+- Caps are enforced exactly in the project store and short-cut at the
+  edge from a D1 cap state, instead of a global counter service: one
+  writer per project already exists, and a lag of up to 30 s past a cap
+  is acceptable. Edge drops are not counted.
+- Fingerprints ignore line numbers so a rebuild does not split issues;
+  build hashes are removed from filenames for the same reason.
+- Symbolication happens at ingest (the stored event is symbolicated);
+  exceptions received before their map was uploaded stay minified.
+- Email alerts use Cloudflare Email Sending through a `send_email`
+  binding (no secret, no extra credential); in-app alerts work without it.
+- The cost estimate uses list prices and simple per-event assumptions and
+  is labelled an estimate; it is not billing data.

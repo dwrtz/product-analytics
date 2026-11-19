@@ -32,7 +32,8 @@ const project = await api('/api/projects', 'POST', { name: `e2e ${new Date().toI
 const A = `/api/projects/${project.id}`;
 await api(`${A}/feature_flags`, 'POST', { key: 'new-dashboard', filters: { groups: [{ properties: [{ key: 'email', value: ['ada@example.com'], operator: 'exact', type: 'person' }], rollout_percentage: 100 }] } });
 await api(`${A}/feature_flags`, 'POST', { key: 'checkout-test', filters: { groups: [{ properties: [], rollout_percentage: 100 }], multivariate: { variants: [{ key: 'control', rollout_percentage: 50 }, { key: 'test', rollout_percentage: 50 }] }, payloads: { test: '{"color":"green"}', control: '{"color":"blue"}' } } });
-await api(A, 'PATCH', { session_recording: true, heatmaps: true, replay_config: { console: true, network: { timing: true } } });
+// New projects sample autocapture at 50% (0.5 default); the action and cohort checks below need every click.
+await api(A, 'PATCH', { session_recording: true, heatmaps: true, replay_config: { console: true, network: { timing: true } }, limits: { autocapture_sample_rate: 1 } });
 // 0.3: the experiment flag keeps its variant across identify ($anon_distinct_id -> hash key override)
 const flags0 = await api(`${A}/feature_flags`);
 await api(`${A}/feature_flags/${flags0.find((f: any) => f.key === 'checkout-test').id}`, 'PATCH', { ensure_experience_continuity: true });
@@ -54,7 +55,8 @@ setTimeout(() => console.warn('e2e-console-marker'), 1500)</script></head>
 <button id="identify" onclick="posthog.identify('user-42',{email:'ada@example.com'},{first_plan:'free'})">Identify</button>
 <button id="group" onclick="posthog.group('company','acme',{name:'Acme Inc'})">Group</button>
 <button id="flags" onclick="posthog.reloadFeatureFlags();posthog.onFeatureFlags(()=>{document.getElementById('out').textContent=JSON.stringify([posthog.isFeatureEnabled('new-dashboard'),posthog.getFeatureFlag('checkout-test'),posthog.getFeatureFlagPayload('checkout-test')])})">Flags</button>
-<button id="pricing" onclick="posthog.capture('opened_pricing')">Pricing</button> <input id="name" placeholder="name"> <input id="secret" type="password">
+<button id="pricing" onclick="posthog.capture('opened_pricing')">Pricing</button>
+<button id="boom" onclick="setTimeout(function priceLabel(){ return null.toFixed(2) })">Boom</button> <input id="name" placeholder="name"> <input id="secret" type="password">
 <a id="next" href="/page2">Next</a><pre id="out"></pre><p style="height:900px">Long page</p></body></html>`;
 const site = http.createServer((q, s) => { s.writeHead(200, { 'content-type': 'text/html' }); s.end(page(q.url === '/page2' ? 'Page 2' : 'Home')); });
 await new Promise<void>(r => site.listen(0, '127.0.0.1', r));
@@ -91,6 +93,7 @@ if (shown) {
   await p.click('#surveyQuestion1Choice1'); await p.click('.form-submit');
   await p.fill('textarea', 'Great product'); await p.click('.form-submit');
 }
+await p.click('#boom'); // 0.5: unhandled error, captured by exception autocapture switched on in remote config
 await p.mouse.wheel(0, 600); await sleep(300); await p.mouse.wheel(0, -600);
 await sleep(6000); // recorder and heatmap flush
 await p.click('#next');
@@ -108,6 +111,7 @@ node.capture({ distinctId: 'server-1', event: 'order_completed', properties: { a
 node.identify({ distinctId: 'server-1', properties: { email: 'server@example.com' } });
 node.alias({ distinctId: 'server-1', alias: 'legacy-9' });
 const nodeFlag = (await node.evaluateFlags('server-1')).getFlag('checkout-test');
+node.captureException(new RangeError('e2e node failure'), 'server-1', { route: '/checkout' });
 await node.shutdown();
 check('posthog-node evaluates a flag', ['control', 'test'].includes(String(nodeFlag)), nodeFlag);
 
@@ -223,6 +227,31 @@ if (rec) {
   await up.goto(`${SITE}/project/${project.id}/replay/${encodeURIComponent(rec.id)}`);
   check('replay page shows the console panel', await up.waitForSelector('text=e2e-console-marker', { timeout: 15000 }).then(() => true).catch(() => false), null);
 }
+
+// 0.5: error tracking, usage, caps (quota_limited stops the real SDK)
+const issues = await until('issues', () => api(`${A}/error_issues`), (v: any) => v.results.length >= 2, 20000);
+const web = issues.results.find((i: any) => i.type === 'TypeError');
+check('posthog-js exception autocapture groups an unhandled error into an issue', !!web && web.occurrences >= 1 && web.users === 1, issues.results);
+check('posthog-node captureException groups into an issue', issues.results.some((i: any) => i.type === 'RangeError' && i.message === 'e2e node failure'), issues.results);
+const issue = web ? await api(`${A}/error_issues/${web.id}`) : null;
+check('issue detail has the stack trace, the person and the replay link', !!issue && issue.exception_list[0]?.stacktrace?.frames?.length > 0 && issue.occurrences_list[0]?.session_id && issue.exception_list[0].mechanism?.handled === false, issue?.occurrences_list?.[0]);
+const usage = await api(`${A}/usage?days=7`);
+check('usage counts events by type and replay', usage.month_to_date.events > 10 && usage.daily.some((d: any) => d.event === '$pageview') && usage.month_to_date.recordings >= 1 && usage.cost.lines.length > 5, usage.month_to_date);
+await up.goto(`${SITE}/project/${project.id}/usage`);
+check('usage page draws events per day and the cost estimate', await up.waitForSelector('text=Estimated Cloudflare cost', { timeout: 10000 }).then(() => true).catch(() => false) && (await up.locator('svg.chart').count()) >= 1, null);
+if (web) { await up.goto(`${SITE}/project/${project.id}/errors/${web.id}`); check('issue page shows the stack trace', await up.waitForSelector('text=Stack trace', { timeout: 10000 }).then(() => true).catch(() => false) && (await up.locator('.frame').count()) > 0, null); }
+const capped = await api(A, 'PATCH', { limits: { events_monthly: 1, over_cap: 'drop' } });
+check('a cap below usage marks the project capped at once', capped.cap_state.events === true, capped.cap_state);
+const replies: string[] = []; const sent: string[] = [];
+p.on('response', async r => { const u = new URL(r.url()); if (u.origin === SITE && /^\/(e|i\/v0\/e)\/?$/.test(u.pathname)) replies.push(await r.text().catch(() => '')); });
+p.on('request', r => { const u = new URL(r.url()); if (u.origin === SITE && /^\/(e|i\/v0\/e)\/?$/.test(u.pathname)) sent.push(r.postData() ?? ''); });
+await p.click('#cta');
+await until('quota reply', async () => replies.length, n => n > 0, 10000); await sleep(1500); // posthog-js flushes its queue every few seconds
+const limitedReply = replies.find(x => x.includes('quota_limited'));
+const before = sent.length;
+await p.click('#cta'); await p.click('#pricing'); await sleep(5000);
+check('capture answers quota_limited and posthog-js stops sending', !!limitedReply && limitedReply.includes('"events"') && sent.length === before, { replies, before, after: sent.length });
+await api(A, 'PATCH', { limits: { events_monthly: null } });
 
 await browser.close(); site.close();
 await api(A, 'DELETE');

@@ -13,7 +13,11 @@ locally by posthog-node), watch session recordings with their console and
 network logs, see click heatmaps and scroll depth, define actions and
 cohorts and use them everywhere filters go, query events with read-only
 SQL (optionally over a Basin / R2 Iceberg cold tier), run A/B experiments on multivariate flags and run targeted surveys that
-posthog-js shows to visitors.
+posthog-js shows to visitors. Since 0.5 it also groups posthog-js and
+posthog-node exceptions into issues (with source-map symbolication), keeps
+each project inside monthly usage caps with sampling, shows what drives
+volume and an estimated Cloudflare cost, and alerts the owner in the app
+and by email.
 
 Every deploy is one *instance* on one domain. An instance holds one or more
 *projects*; each project has a public *project API key* (`phc_…`) that SDKs
@@ -66,10 +70,10 @@ unknown; it is context, not extra requirements.
   own, short and plain. Icons are inline SVG or text; no images or fonts are
   copied from anywhere.
 
-## Out of scope for 0.4
+## Out of scope for 0.5
 
-- Web experiments, product tours, early access features, error tracking,
-  logs, LLM analytics, data warehouse, CDP destinations and notebooks. The
+- Web experiments, product tours, early access features, logs, LLM
+  analytics, data warehouse, CDP destinations and notebooks. The
   SDK endpoints for these answer "nothing configured" (`protocol.md` 9) so
   the SDKs stay quiet.
 - Heatmaps: element-level click maps ("clickmaps" of autocapture elements
@@ -94,6 +98,12 @@ unknown; it is context, not extra requirements.
   shards only; cold data is reached through the SQL editor. Rows in the
   Iceberg table are not physically deleted by the app (Basin SQL is
   read-only); retention is enforced in every cold query.
+- Error tracking (R28-R29): issue assignment, merging and splitting issues,
+  custom grouping rules in the UI, suppression rules sent to the SDK,
+  release tracking, indexed (sectioned) source maps, symbolication of
+  exceptions that arrived before their map was uploaded, native (non-JS)
+  stack traces. Usage (R30): billing, per-person or per-event-name caps,
+  counting events dropped at the edge after a cap is reached, load testing.
 - Per-project permissions, organizations, invitations, SSO, billing.
 - Ingestion transformations, plugins, webhooks, GeoIP lookups beyond what
   Cloudflare puts on the request.
@@ -113,12 +123,14 @@ Each requirement has an id. Tests name the id they cover.
   npm package at build time.
 - Bindings: D1 `DB`; Durable Object namespaces `STORE` (class
   `ProjectStore`) and `SHARDS` (class `EventShard`), both SQLite storage;
-  R2 bucket `REPLAY` (recording chunks); Queue `INGEST` (producer and
-  consumer on the same Worker, with a dead-letter queue); Assets `ASSETS`.
+  R2 bucket `REPLAY` (recording chunks and source maps); Queue `INGEST`
+  (producer and consumer on the same Worker, with a dead-letter queue);
+  Assets `ASSETS`; optional `send_email` binding `EMAIL` (R30).
   Vars `SITE_URL`, `ALLOWED_EMAILS`, `DEFAULT_RETENTION_DAYS`,
-  `REPLAY_RETENTION_DAYS` and optional `INGEST_HOSTS` (R2) (`SHARD_PERIOD`
-  exists for tests only). No
-  secrets. A daily cron trigger applies data retention. Exact config in
+  `REPLAY_RETENTION_DAYS` and optional `INGEST_HOSTS` (R2) and
+  `ALERT_EMAIL_FROM` (R30) (`SHARD_PERIOD` exists for tests only). No
+  secrets. A daily cron trigger applies data retention and checks for
+  usage spikes. Exact config in
   `design.md`; no domain, account id or resource id is hard-coded anywhere.
 - `npm run dev` builds, applies local D1 migrations and runs `wrangler dev`
   on port 8787. `npm test` runs the Vitest suites inside the Workers
@@ -591,10 +603,112 @@ access, week start, rejections); a live run sends events, waits for the
 pipeline (about two minutes with a 60 s roll) and finds them with a cold
 query, with an event older than the retention period excluded.
 
+### R28. Error tracking
+
+- `$exception` events from posthog-js (`captureException`, exception
+  autocapture) and posthog-node (`captureException`) are grouped into
+  *issues* at ingest (`protocol.md` 19). The fingerprint is the event's
+  `$exception_fingerprint` when sent (string, or a list joined with `|`);
+  otherwise the outer exception's type plus its top five in-app frames
+  (function and filename without build hashes, innermost first, no line
+  numbers), or the type plus the message with numbers, ids and quoted
+  values removed when there is no stack. The stored event gets
+  `$exception_fingerprint` and `$exception_issue_id`.
+- An issue has a status (`active`, `resolved`, `suppressed`), first and
+  last seen, occurrences, affected users (distinct ids), regressions, and
+  the latest exception list. An occurrence after an issue was resolved
+  reopens it as a regression. Counting is idempotent per event uuid.
+- Remote config (`/array/<token>/config(.js)`, `/flags?config=true`,
+  `/decide`) sends `autocaptureExceptions` and
+  `errorTracking.autocaptureExceptions` from the project's
+  `error_tracking` switch, so posthog-js captures unhandled errors and
+  promise rejections. New projects have it on; existing projects off. It
+  is off while the project's events are capped in drop mode.
+- Screens: an issues list (status tabs with counts, search, sort, 14-day
+  sparkline, occurrences, users, first and last seen) and an issue page
+  (stack trace with source context, status actions, facts, 30-day chart,
+  recent occurrences linking to the person and to the session recording
+  when one exists).
+- Owner API: `GET /api/projects/:id/error_issues?status=&search=&order=`,
+  `GET` and `PATCH` (`{status}`) `/api/projects/:id/error_issues/:issue`.
+
+Check: `tests/v05.test.ts` groups the recorded posthog-js and posthog-node
+exceptions into five issues, resolves one and sees the regression; the
+e2e captures an unhandled error with real posthog-js and a posthog-node
+exception and opens the issue page.
+
+### R29. Source maps
+
+- `PUT` (or `POST`) `/api/projects/:id/symbol_sets?url=<URL or path of the
+  minified file>` with the source map JSON as the body (version 3, not
+  sectioned, at most 25 MB) stores the map in R2 under
+  `sourcemaps/<project>/`. Personal API keys work, so CI can upload; the
+  same URL replaces the old map. `GET` lists maps, `DELETE
+  /symbol_sets/:id` removes one. Deleting the project deletes its maps.
+- At ingest each frame whose filename matches a map (the URL without
+  query, else the same path, else a path suffix at a `/` boundary) is
+  resolved to the original file, line and column, with up to five lines
+  before and three after from `sourcesContent`; the frame keeps its
+  minified location in `minified`. A frame's original function name is the
+  name mapped at its caller's call site.
+- `scripts/upload-sourcemaps.mjs --host --project --dir --url-prefix`
+  (Node 18+, no dependencies, key in `PA_PERSONAL_API_KEY`) uploads the map
+  of every `.js` file under a build directory.
+
+Check: the VLQ decoder and frame resolution against an esbuild map
+(`test-vectors.json` "source_maps"); the upload, symbolicated stored event
+and issue frames over HTTP.
+
+### R30. Usage limits, sampling, usage page and alerts
+
+- Each project may have `limits` (`design.md` "Usage limits"): monthly
+  caps (UTC calendar month) on events, new session recordings and stored
+  replay bytes; what happens past a cap (`drop`, or `sample` with a kept
+  share); an autocapture sample rate; alert recipients and the spike
+  factor. Projects created from 0.5 on start with 1,000,000 events,
+  5,000 recordings and 5 GB of replay a month, drop past the cap,
+  autocapture sampled at 50% of sessions and the replay sample rate at
+  25%. Projects without `limits` behave exactly as before.
+- The project store counts accepted events per received day and event
+  name exactly and applies the cap; replay chunks over a replay cap are
+  refused and their R2 objects deleted. Sampling is deterministic
+  (`test-vectors.json` "sampling"): by distinct id for events past a cap,
+  by session id for replay and autocapture.
+- When a cap is reached the store writes the month's `cap_state` to D1.
+  The capture endpoints read it (cached up to 30 s per isolate) and in
+  drop mode answer `quota_limited` (`protocol.md` 20) so posthog-js
+  pauses sending; remote config then turns session recording and
+  exception autocapture off. Raising a cap lifts the state at once.
+- The Usage screen shows month-to-date meters against each cap, events per
+  day stacked by event type with a table of what drives volume, replay
+  recordings and bytes per day, and an estimated Cloudflare cost for the
+  month at public list prices, before and after the plan's included
+  usage, labelled as an estimate with its assumptions.
+- Alerts are stored per project and shown on the Usage screen (with an
+  unread badge in the navigation): 50%, 80% and 100% of each cap, a daily
+  spike (yesterday over 3x the previous 7-day average, at least 100
+  events; daily cron), new issues and regressions (not for suppressed
+  issues). With a Cloudflare Email Sending binding `EMAIL` and an
+  `ALERT_EMAIL_FROM` sender on an onboarded domain each alert is also
+  emailed (to the project's alert emails, else every user; at most 20
+  emails per project per day); without them alerts are in-app only.
+  `POST /api/projects/:id/alerts/test` sends a test alert.
+- Owner API: `GET /api/projects/:id/usage?days=`, `GET /alerts`,
+  `POST /alerts/read`, `POST /alerts/test`; `limits` and `error_tracking`
+  in the project `PATCH` and in project responses (with `cap_state`).
+
+Check: `tests/v05.test.ts` (exact counting and drop past the cap, the
+three threshold alerts, `quota_limited` at the edge, lifting the cap,
+sample mode, autocapture sampling, replay cap with chunk deletion and
+recorder off, spike alert, email delivery through a stub binding); the
+e2e shows real posthog-js stopping after a `quota_limited` answer.
+
 ## Definition of done
 
 `npm test` and `npm run e2e` pass, and a deploy following `design.md`
 ("Deploy") ingests the snippet's events from a real site and shows them in
 Events within a few seconds, records and plays back a session with its
 console log, shows a running survey, reports an experiment's exposures,
-draws a click heatmap and answers a SQL query.
+draws a click heatmap and answers a SQL query; since 0.5 it also groups a
+real browser exception into an issue with a symbolicated stack trace,
+shows the Usage screen and answers `quota_limited` past a cap.

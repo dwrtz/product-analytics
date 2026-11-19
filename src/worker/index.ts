@@ -67,10 +67,20 @@ export default {
       try {
         const store = storeFor(env, pid);
         const events = msgs.flatMap(m => m.body.events ?? []); const replay = msgs.flatMap(m => m.body.replay ?? []);
-        if (events.length) await store.ingest(events);
-        // Cold tier: at-least-once copy of every event into the Basin stream (design.md "Cold tier").
-        if (events.length && env.COLD_STREAM) await env.COLD_STREAM.send(events.map(e => coldRecord(pid, e)));
-        if (replay.length) await store.recordReplay(replay);
+        if (events.length) {
+          const r = await store.ingest(events, pid);
+          // Cold tier: at-least-once copy of every stored event into the Basin stream (design.md "Cold tier"); events
+          // dropped over the cap are left out and exceptions go in enriched (symbolicated, with their issue id).
+          if (env.COLD_STREAM) {
+            const gone = new Set(r.dropped); const enriched = new Map(r.exceptions.map(e => [e.uuid, e]));
+            const keep = events.filter(e => !gone.has(e.uuid)).map(e => enriched.get(e.uuid) ?? e);
+            if (keep.length) await env.COLD_STREAM.send(keep.map(e => coldRecord(pid, e)));
+          }
+        }
+        if (replay.length) {
+          const r = await store.recordReplay(replay, pid);
+          if (r.rejected.length) await env.REPLAY.delete(r.rejected);
+        }
         msgs.forEach(m => m.ack());
       }
       catch (e) { console.error('ingest failed', pid, e instanceof Error ? e.message : String(e)); msgs.forEach(m => m.retry({ delaySeconds: 10 })); }
@@ -82,6 +92,8 @@ export default {
       for (const p of (await env.DB.prepare('SELECT id FROM projects').all<{ id: number }>()).results) { try { await storeFor(env, p.id).calculateAllCohorts(); } catch (e) { console.error('cohorts', p.id, e instanceof Error ? e.message : String(e)); } }
       return;
     }
+    // Usage spike alerts (design.md "Alerts"): yesterday (UTC) against the 7 days before.
+    for (const p of (await env.DB.prepare('SELECT id FROM projects').all<{ id: number }>()).results) { try { await storeFor(env, p.id).checkSpike(p.id); } catch (e) { console.error('spike', p.id, e instanceof Error ? e.message : String(e)); } }
     const rows = (await env.DB.prepare('SELECT * FROM projects WHERE retention_days > 0').all<ProjectRow>()).results;
     for (const p of rows) await storeFor(env, p.id).purge(Date.now() - p.retention_days * 86400_000);
     // Recordings: REPLAY_RETENTION_DAYS (default 30), never longer than the project's event retention.

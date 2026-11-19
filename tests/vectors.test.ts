@@ -85,3 +85,22 @@ describe('date ranges and buckets (design.md Queries)', () => {
     expect(new Date(startOf(Date.parse('2026-03-11T12:00:00Z'), 'week', 'UTC')).toISOString()).toBe('2026-03-08T00:00:00.000Z');
   });
 });
+
+// ---------- 0.5 (protocol.md "Quota limiting", "Exceptions"; design.md "Usage limits", "Error tracking") ----------
+import { hashUnit, sampled } from '../src/shared/sample';
+import { decodeMap, originalPosition } from '../src/shared/sourcemap';
+import { fingerprintOf, normalizeFilename, normalizeMessage } from '../src/worker/errors';
+describe('sampling hash (0.5)', () => {
+  for (const c of (V as any).sampling.cases) it(JSON.stringify(c.key), () => {
+    expect(hashUnit(c.key)).toBe(c.unit); expect(sampled(c.key, 0.5)).toBe(c.kept_at_0_5); expect(sampled(c.key, 0.25)).toBe(c.kept_at_0_25);
+  });
+});
+describe('source map positions (0.5)', () => {
+  const m = decodeMap((V as any).source_maps.map);
+  for (const c of (V as any).source_maps.positions) it(`${c.line}:${c.column}`, () => expect(originalPosition(m, c.line, c.column)).toEqual(c.expect));
+});
+describe('exception fingerprints (0.5)', () => {
+  for (const c of (V as any).fingerprints.cases) it(c.name, async () => expect(await fingerprintOf(c.properties, c.properties.$exception_list)).toBe(c.expect));
+  it('filenames', () => { for (const c of (V as any).fingerprints.filenames) expect(normalizeFilename(c.filename)).toBe(c.expect); });
+  it('messages', () => { for (const c of (V as any).fingerprints.messages) expect(normalizeMessage(c.message)).toBe(c.expect); });
+});

@@ -1,0 +1,593 @@
+{
+ "_source": "Recorded 2026-11-19 with REA capture-browser-scenario (recorder5/scenario.json) against unmodified posthog-js 1.450.1 (MIT) and posthog-node 6.0.3 (MIT). Minified bundle built with esbuild from recorder5/app-src.js.",
+ "app_min_js": "(()=>{function n(e){if(typeof e!=\"number\")throw new TypeError(\"Price must be a number, got \"+typeof e);return e}function i(e){let t=0;for(let o of e.items)t+=n(o.price)*o.qty;return t}function r(e){return i(e)}async function c(e){throw await new Promise(t=>setTimeout(t,5)),new Error(\"Profile \"+e+\" not found\")}window.shop={throwUnhandled(){setTimeout(()=>{r({items:[{price:\"12\",qty:1}]})},0)},rejectUnhandled(){c(42)},manual(){try{r({items:[{price:null,qty:2}]})}catch(e){window.posthog.captureException(e,{cart_size:1})}},custom(){window.posthog.captureException(new RangeError(\"Quantity out of range\"),{$exception_fingerprint:\"qty-range\"})}};})();\n//# sourceMappingURL=app.min.js.map\n",
+ "app_min_js_map": {
+  "version": 3,
+  "sources": [
+   "app-src.js"
+  ],
+  "sourcesContent": [
+   "// Small \"site\" bundle used to produce real minified stack traces and a source map (fixtures for 0.5 error tracking).\nfunction parsePrice(raw) {\n  if (typeof raw !== 'number') {\n    const err = new TypeError('Price must be a number, got ' + typeof raw);\n    throw err;\n  }\n  return raw;\n}\nfunction computeTotal(cart) {\n  let sum = 0;\n  for (const item of cart.items) sum += parsePrice(item.price) * item.qty;\n  return sum;\n}\nexport function checkout(cart) {\n  return computeTotal(cart);\n}\nexport async function loadProfile(id) {\n  await new Promise(r => setTimeout(r, 5));\n  throw new Error('Profile ' + id + ' not found');\n}\nwindow.shop = {\n  throwUnhandled() { setTimeout(() => { checkout({ items: [{ price: '12', qty: 1 }] }); }, 0); },\n  rejectUnhandled() { loadProfile(42); },\n  manual() { try { checkout({ items: [{ price: null, qty: 2 }] }); } catch (e) { window.posthog.captureException(e, { cart_size: 1 }); } },\n  custom() { window.posthog.captureException(new RangeError('Quantity out of range'), { $exception_fingerprint: 'qty-range' }); },\n};\n"
+  ],
+  "mappings": "MACA,SAASA,EAAWC,EAAK,CACvB,GAAI,OAAOA,GAAQ,SAEjB,MADY,IAAI,UAAU,+BAAiC,OAAOA,CAAG,EAGvE,OAAOA,CACT,CACA,SAASC,EAAaC,EAAM,CAC1B,IAAIC,EAAM,EACV,QAAWC,KAAQF,EAAK,MAAOC,GAAOJ,EAAWK,EAAK,KAAK,EAAIA,EAAK,IACpE,OAAOD,CACT,CACO,SAASE,EAASH,EAAM,CAC7B,OAAOD,EAAaC,CAAI,CAC1B,CACA,eAAsBI,EAAYC,EAAI,CACpC,YAAM,IAAI,QAAQC,GAAK,WAAWA,EAAG,CAAC,CAAC,EACjC,IAAI,MAAM,WAAaD,EAAK,YAAY,CAChD,CACA,OAAO,KAAO,CACZ,gBAAiB,CAAE,WAAW,IAAM,CAAEF,EAAS,CAAE,MAAO,CAAC,CAAE,MAAO,KAAM,IAAK,CAAE,CAAC,CAAE,CAAC,CAAG,EAAG,CAAC,CAAG,EAC7F,iBAAkB,CAAEC,EAAY,EAAE,CAAG,EACrC,QAAS,CAAE,GAAI,CAAED,EAAS,CAAE,MAAO,CAAC,CAAE,MAAO,KAAM,IAAK,CAAE,CAAC,CAAE,CAAC,CAAG,OAAS,EAAG,CAAE,OAAO,QAAQ,iBAAiB,EAAG,CAAE,UAAW,CAAE,CAAC,CAAG,CAAE,EACvI,QAAS,CAAE,OAAO,QAAQ,iBAAiB,IAAI,WAAW,uBAAuB,EAAG,CAAE,uBAAwB,WAAY,CAAC,CAAG,CAChI",
+  "names": [
+   "parsePrice",
+   "raw",
+   "computeTotal",
+   "cart",
+   "sum",
+   "item",
+   "checkout",
+   "loadProfile",
+   "id",
+   "r"
+  ]
+ },
+ "posthog_js_exceptions": [
+  {
+   "uuid": "01a1f3c5-ab6b-77ab-8f17-ddc5f711c102",
+   "event": "$exception",
+   "properties": {
+    "$os": "Linux",
+    "$browser": "Chrome",
+    "$device_type": "Desktop",
+    "$timezone": "UTC",
+    "$timezone_offset": 0,
+    "$current_url": "http://172.17.0.1:8797/",
+    "$host": "172.17.0.1:8797",
+    "$pathname": "/",
+    "$raw_user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
+    "$browser_version": 156,
+    "$browser_language": "en-US",
+    "$browser_language_prefix": "en",
+    "$screen_height": 720,
+    "$screen_width": 1280,
+    "$viewport_height": 720,
+    "$viewport_width": 1280,
+    "$lib": "web",
+    "$lib_version": "1.450.1",
+    "$insert_id": "3myab7pfize6fgmr",
+    "$time": 1795091180.396,
+    "$sdk_dist_channel": "cdn",
+    "$initialization_time": "2026-11-19T12:26:15.244Z",
+    "$configured_session_timeout_ms": 1800000,
+    "distinct_id": "user-7",
+    "$device_id": "01a1f3c5-974f-74fb-ab45-c80a124f3ac2",
+    "$autocapture_disabled_server_side": false,
+    "$error_tracking_capture_extension_exceptions": false,
+    "$web_vitals_enabled_server_side": false,
+    "$exception_capture_enabled_server_side": true,
+    "$dead_clicks_enabled_server_side": false,
+    "$user_id": "user-7",
+    "$sdk_debug_extensions_init_method": "synchronous",
+    "$sdk_debug_extensions_init_time_ms": 1,
+    "$referrer": "$direct",
+    "$referring_domain": "$direct",
+    "$feature_flag_request_id": "00000000-0000-4000-8000-000000000000",
+    "$active_feature_flags": [],
+    "$feature_flag_payloads": {},
+    "$exception_list": [
+     {
+      "type": "TypeError",
+      "value": "Price must be a number, got string",
+      "mechanism": {
+       "type": "generic",
+       "handled": false,
+       "synthetic": false,
+       "exception_id": 0
+      },
+      "stacktrace": {
+       "type": "raw",
+       "frames": [
+        {
+         "platform": "web:javascript",
+         "filename": "http://172.17.0.1:8797/app.min.js",
+         "function": "?",
+         "in_app": true,
+         "lineno": 1,
+         "colno": 358
+        },
+        {
+         "platform": "web:javascript",
+         "filename": "http://172.17.0.1:8797/app.min.js",
+         "function": "r",
+         "in_app": true,
+         "lineno": 1,
+         "colno": 206
+        },
+        {
+         "platform": "web:javascript",
+         "filename": "http://172.17.0.1:8797/app.min.js",
+         "function": "i",
+         "in_app": true,
+         "lineno": 1,
+         "colno": 159
+        },
+        {
+         "platform": "web:javascript",
+         "filename": "http://172.17.0.1:8797/app.min.js",
+         "function": "n",
+         "in_app": true,
+         "lineno": 1,
+         "colno": 49
+        }
+       ]
+      }
+     }
+    ],
+    "$exception_level": "error",
+    "token": "phc_testtoken123",
+    "$config_defaults": "unset",
+    "$session_id": "01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
+    "$window_id": "01a1f3c5-9768-7ecc-ae2f-758a0ec51c92",
+    "$session_entry_referrer": "$direct",
+    "$session_entry_referring_domain": "$direct",
+    "$session_entry_url": "http://172.17.0.1:8797/",
+    "$session_entry_host": "172.17.0.1:8797",
+    "$session_entry_pathname": "/",
+    "$recording_status": "disabled",
+    "$sdk_debug_retry_queue_size": 0,
+    "$lib_custom_api_host": "http://172.17.0.1:8797",
+    "$pageview_id": "01a1f3c5-975f-7c94-b404-e672c88a02be",
+    "$browser_type": "bot",
+    "$is_identified": true,
+    "$process_person_profile": true,
+    "$lib_rate_limit_remaining_tokens": 98.14
+   },
+   "timestamp": "2026-11-19T12:26:20.395Z"
+  },
+  {
+   "uuid": "01a1f3c5-b35b-7f6c-a5bd-305320a311c4",
+   "event": "$exception",
+   "properties": {
+    "$os": "Linux",
+    "$browser": "Chrome",
+    "$device_type": "Desktop",
+    "$timezone": "UTC",
+    "$timezone_offset": 0,
+    "$current_url": "http://172.17.0.1:8797/",
+    "$host": "172.17.0.1:8797",
+    "$pathname": "/",
+    "$raw_user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
+    "$browser_version": 156,
+    "$browser_language": "en-US",
+    "$browser_language_prefix": "en",
+    "$screen_height": 720,
+    "$screen_width": 1280,
+    "$viewport_height": 720,
+    "$viewport_width": 1280,
+    "$lib": "web",
+    "$lib_version": "1.450.1",
+    "$insert_id": "y3zy9jsicsmvunsq",
+    "$time": 1795091182.427,
+    "$sdk_dist_channel": "cdn",
+    "$initialization_time": "2026-11-19T12:26:15.244Z",
+    "$configured_session_timeout_ms": 1800000,
+    "distinct_id": "user-7",
+    "$device_id": "01a1f3c5-974f-74fb-ab45-c80a124f3ac2",
+    "$autocapture_disabled_server_side": false,
+    "$error_tracking_capture_extension_exceptions": false,
+    "$web_vitals_enabled_server_side": false,
+    "$exception_capture_enabled_server_side": true,
+    "$dead_clicks_enabled_server_side": false,
+    "$user_id": "user-7",
+    "$sdk_debug_extensions_init_method": "synchronous",
+    "$sdk_debug_extensions_init_time_ms": 1,
+    "$referrer": "$direct",
+    "$referring_domain": "$direct",
+    "$feature_flag_request_id": "00000000-0000-4000-8000-000000000000",
+    "$active_feature_flags": [],
+    "$feature_flag_payloads": {},
+    "$exception_list": [
+     {
+      "type": "Error",
+      "value": "Profile 42 not found",
+      "mechanism": {
+       "type": "generic",
+       "handled": false,
+       "synthetic": false,
+       "exception_id": 0
+      },
+      "stacktrace": {
+       "type": "raw",
+       "frames": [
+        {
+         "platform": "web:javascript",
+         "filename": "http://172.17.0.1:8797/app.min.js",
+         "function": "c",
+         "in_app": true,
+         "lineno": 1,
+         "colno": 275
+        }
+       ]
+      }
+     }
+    ],
+    "$exception_level": "error",
+    "token": "phc_testtoken123",
+    "$config_defaults": "unset",
+    "$session_id": "01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
+    "$window_id": "01a1f3c5-9768-7ecc-ae2f-758a0ec51c92",
+    "$session_entry_referrer": "$direct",
+    "$session_entry_referring_domain": "$direct",
+    "$session_entry_url": "http://172.17.0.1:8797/",
+    "$session_entry_host": "172.17.0.1:8797",
+    "$session_entry_pathname": "/",
+    "$recording_status": "disabled",
+    "$sdk_debug_retry_queue_size": 0,
+    "$lib_custom_api_host": "http://172.17.0.1:8797",
+    "$pageview_id": "01a1f3c5-975f-7c94-b404-e672c88a02be",
+    "$browser_type": "bot",
+    "$is_identified": true,
+    "$process_person_profile": true,
+    "$lib_rate_limit_remaining_tokens": 98.1
+   },
+   "timestamp": "2026-11-19T12:26:22.427Z"
+  },
+  {
+   "uuid": "01a1f3c5-bb44-742f-a94f-6ae4f20a135c",
+   "event": "$exception",
+   "properties": {
+    "$os": "Linux",
+    "$browser": "Chrome",
+    "$device_type": "Desktop",
+    "$timezone": "UTC",
+    "$timezone_offset": 0,
+    "$current_url": "http://172.17.0.1:8797/",
+    "$host": "172.17.0.1:8797",
+    "$pathname": "/",
+    "$raw_user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
+    "$browser_version": 156,
+    "$browser_language": "en-US",
+    "$browser_language_prefix": "en",
+    "$screen_height": 720,
+    "$screen_width": 1280,
+    "$viewport_height": 720,
+    "$viewport_width": 1280,
+    "$lib": "web",
+    "$lib_version": "1.450.1",
+    "$insert_id": "3vwd7wlbip8ht2b3",
+    "$time": 1795091184.452,
+    "$sdk_dist_channel": "cdn",
+    "$initialization_time": "2026-11-19T12:26:15.244Z",
+    "$configured_session_timeout_ms": 1800000,
+    "distinct_id": "user-7",
+    "$device_id": "01a1f3c5-974f-74fb-ab45-c80a124f3ac2",
+    "$autocapture_disabled_server_side": false,
+    "$error_tracking_capture_extension_exceptions": false,
+    "$web_vitals_enabled_server_side": false,
+    "$exception_capture_enabled_server_side": true,
+    "$dead_clicks_enabled_server_side": false,
+    "$user_id": "user-7",
+    "$sdk_debug_extensions_init_method": "synchronous",
+    "$sdk_debug_extensions_init_time_ms": 1,
+    "$referrer": "$direct",
+    "$referring_domain": "$direct",
+    "$feature_flag_request_id": "00000000-0000-4000-8000-000000000000",
+    "$active_feature_flags": [],
+    "$feature_flag_payloads": {},
+    "$exception_list": [
+     {
+      "type": "TypeError",
+      "value": "Price must be a number, got object",
+      "mechanism": {
+       "type": "generic",
+       "handled": true,
+       "synthetic": false,
+       "exception_id": 0
+      },
+      "stacktrace": {
+       "type": "raw",
+       "frames": [
+        {
+         "platform": "web:javascript",
+         "filename": "http://172.17.0.1:8797/",
+         "function": "HTMLButtonElement.onclick",
+         "in_app": true,
+         "lineno": 8,
+         "colno": 50
+        },
+        {
+         "platform": "web:javascript",
+         "filename": "http://172.17.0.1:8797/app.min.js",
+         "function": "Object.manual",
+         "in_app": true,
+         "lineno": 1,
+         "colno": 433
+        },
+        {
+         "platform": "web:javascript",
+         "filename": "http://172.17.0.1:8797/app.min.js",
+         "function": "r",
+         "in_app": true,
+         "lineno": 1,
+         "colno": 206
+        },
+        {
+         "platform": "web:javascript",
+         "filename": "http://172.17.0.1:8797/app.min.js",
+         "function": "i",
+         "in_app": true,
+         "lineno": 1,
+         "colno": 159
+        },
+        {
+         "platform": "web:javascript",
+         "filename": "http://172.17.0.1:8797/app.min.js",
+         "function": "n",
+         "in_app": true,
+         "lineno": 1,
+         "colno": 49
+        }
+       ]
+      }
+     }
+    ],
+    "$exception_level": "error",
+    "cart_size": 1,
+    "token": "phc_testtoken123",
+    "$config_defaults": "unset",
+    "$session_id": "01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
+    "$window_id": "01a1f3c5-9768-7ecc-ae2f-758a0ec51c92",
+    "$session_entry_referrer": "$direct",
+    "$session_entry_referring_domain": "$direct",
+    "$session_entry_url": "http://172.17.0.1:8797/",
+    "$session_entry_host": "172.17.0.1:8797",
+    "$session_entry_pathname": "/",
+    "$recording_status": "disabled",
+    "$sdk_debug_retry_queue_size": 0,
+    "$lib_custom_api_host": "http://172.17.0.1:8797",
+    "$pageview_id": "01a1f3c5-975f-7c94-b404-e672c88a02be",
+    "$browser_type": "bot",
+    "$is_identified": true,
+    "$process_person_profile": true,
+    "$lib_rate_limit_remaining_tokens": 98.03
+   },
+   "timestamp": "2026-11-19T12:26:24.452Z"
+  },
+  {
+   "uuid": "01a1f3c5-c334-774f-8c10-000a6c9ac3ae",
+   "event": "$exception",
+   "properties": {
+    "$os": "Linux",
+    "$browser": "Chrome",
+    "$device_type": "Desktop",
+    "$timezone": "UTC",
+    "$timezone_offset": 0,
+    "$current_url": "http://172.17.0.1:8797/",
+    "$host": "172.17.0.1:8797",
+    "$pathname": "/",
+    "$raw_user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
+    "$browser_version": 156,
+    "$browser_language": "en-US",
+    "$browser_language_prefix": "en",
+    "$screen_height": 720,
+    "$screen_width": 1280,
+    "$viewport_height": 720,
+    "$viewport_width": 1280,
+    "$lib": "web",
+    "$lib_version": "1.450.1",
+    "$insert_id": "eci8fjsftro9hubi",
+    "$time": 1795091186.485,
+    "$sdk_dist_channel": "cdn",
+    "$initialization_time": "2026-11-19T12:26:15.244Z",
+    "$configured_session_timeout_ms": 1800000,
+    "distinct_id": "user-7",
+    "$device_id": "01a1f3c5-974f-74fb-ab45-c80a124f3ac2",
+    "$autocapture_disabled_server_side": false,
+    "$error_tracking_capture_extension_exceptions": false,
+    "$web_vitals_enabled_server_side": false,
+    "$exception_capture_enabled_server_side": true,
+    "$dead_clicks_enabled_server_side": false,
+    "$user_id": "user-7",
+    "$sdk_debug_extensions_init_method": "synchronous",
+    "$sdk_debug_extensions_init_time_ms": 1,
+    "$referrer": "$direct",
+    "$referring_domain": "$direct",
+    "$feature_flag_request_id": "00000000-0000-4000-8000-000000000000",
+    "$active_feature_flags": [],
+    "$feature_flag_payloads": {},
+    "$exception_list": [
+     {
+      "type": "RangeError",
+      "value": "Quantity out of range",
+      "mechanism": {
+       "type": "generic",
+       "handled": true,
+       "synthetic": false,
+       "exception_id": 0
+      },
+      "stacktrace": {
+       "type": "raw",
+       "frames": [
+        {
+         "platform": "web:javascript",
+         "filename": "http://172.17.0.1:8797/",
+         "function": "HTMLButtonElement.onclick",
+         "in_app": true,
+         "lineno": 9,
+         "colno": 50
+        },
+        {
+         "platform": "web:javascript",
+         "filename": "http://172.17.0.1:8797/app.min.js",
+         "function": "Object.custom",
+         "in_app": true,
+         "lineno": 1,
+         "colno": 566
+        }
+       ]
+      }
+     }
+    ],
+    "$exception_level": "error",
+    "$exception_fingerprint": "qty-range",
+    "token": "phc_testtoken123",
+    "$config_defaults": "unset",
+    "$session_id": "01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
+    "$window_id": "01a1f3c5-9768-7ecc-ae2f-758a0ec51c92",
+    "$session_entry_referrer": "$direct",
+    "$session_entry_referring_domain": "$direct",
+    "$session_entry_url": "http://172.17.0.1:8797/",
+    "$session_entry_host": "172.17.0.1:8797",
+    "$session_entry_pathname": "/",
+    "$recording_status": "disabled",
+    "$sdk_debug_retry_queue_size": 0,
+    "$lib_custom_api_host": "http://172.17.0.1:8797",
+    "$pageview_id": "01a1f3c5-975f-7c94-b404-e672c88a02be",
+    "$browser_type": "bot",
+    "$is_identified": true,
+    "$process_person_profile": true,
+    "$lib_rate_limit_remaining_tokens": 98.03
+   },
+   "timestamp": "2026-11-19T12:26:26.484Z"
+  }
+ ],
+ "posthog_node_exceptions": [
+  {
+   "event": "$exception",
+   "uuid": "01a1f3c6-4512-7b58-9154-bb137396cfd5",
+   "distinct_id": "server-user-1",
+   "timestamp": "2026-11-19T12:26:59.731Z",
+   "options": {},
+   "properties": {
+    "$exception_list": [
+     {
+      "type": "RangeError",
+      "value": "Negative amount for order 77",
+      "mechanism": {
+       "type": "generic",
+       "handled": true,
+       "synthetic": false,
+       "exception_id": 0
+      },
+      "stacktrace": {
+       "type": "raw",
+       "frames": [
+        {
+         "filename": "node:internal/modules/run_main",
+         "module": "run_main",
+         "function": "asyncRunEntryPointWithESMLoader",
+         "lineno": 101,
+         "colno": 5,
+         "in_app": false,
+         "platform": "node:javascript"
+        },
+        {
+         "filename": "node:internal/modules/esm/loader",
+         "module": "loader",
+         "function": "?",
+         "lineno": 647,
+         "colno": 26,
+         "in_app": false,
+         "platform": "node:javascript"
+        },
+        {
+         "filename": "node:internal/modules/esm/module_job",
+         "module": "module_job",
+         "function": "ModuleJob.run",
+         "lineno": 561,
+         "colno": 25,
+         "in_app": false,
+         "platform": "node:javascript"
+        },
+        {
+         "filename": "node-capture.mjs",
+         "module": "node-capture",
+         "function": "?",
+         "lineno": 6,
+         "colno": 7,
+         "in_app": true,
+         "platform": "node:javascript",
+         "pre_context": [
+          "// Records what the unmodified posthog-node SDK sends for captureException (fixture evidence).",
+          "import { PostHog } from '/workspace/analytics/build/node_modules/posthog-node/dist/entrypoints/index.node.mjs'",
+          "const ph = new PostHog('phc_testtoken123', { host: 'http://127.0.0.1:8797', flushAt: 1, flushInterval: 0, disableGeoip: false })",
+          "function loadOrder(id) { return chargeCard({ id, amount: -5 }) }",
+          "function chargeCard(o) { if (o.amount < 0) throw new RangeError('Negative amount for order ' + o.id); return true }"
+         ],
+         "context_line": "try { loadOrder(77) } catch (e) { ph.captureException(e, 'server-user-1', { route: '/api/orders' }) }",
+         "post_context": [
+          "await new Promise(r => setTimeout(r, 1500))",
+          "await ph.shutdown()"
+         ]
+        },
+        {
+         "filename": "node-capture.mjs",
+         "module": "node-capture",
+         "function": "loadOrder",
+         "lineno": 4,
+         "colno": 33,
+         "in_app": true,
+         "platform": "node:javascript",
+         "pre_context": [
+          "// Records what the unmodified posthog-node SDK sends for captureException (fixture evidence).",
+          "import { PostHog } from '/workspace/analytics/build/node_modules/posthog-node/dist/entrypoints/index.node.mjs'",
+          "const ph = new PostHog('phc_testtoken123', { host: 'http://127.0.0.1:8797', flushAt: 1, flushInterval: 0, disableGeoip: false })"
+         ],
+         "context_line": "function loadOrder(id) { return chargeCard({ id, amount: -5 }) }",
+         "post_context": [
+          "function chargeCard(o) { if (o.amount < 0) throw new RangeError('Negative amount for order ' + o.id); return true }",
+          "try { loadOrder(77) } catch (e) { ph.captureException(e, 'server-user-1', { route: '/api/orders' }) }",
+          "await new Promise(r => setTimeout(r, 1500))",
+          "await ph.shutdown()"
+         ]
+        },
+        {
+         "filename": "node-capture.mjs",
+         "module": "node-capture",
+         "function": "chargeCard",
+         "lineno": 5,
+         "colno": 50,
+         "in_app": true,
+         "platform": "node:javascript",
+         "pre_context": [
+          "// Records what the unmodified posthog-node SDK sends for captureException (fixture evidence).",
+          "import { PostHog } from '/workspace/analytics/build/node_modules/posthog-node/dist/entrypoints/index.node.mjs'",
+          "const ph = new PostHog('phc_testtoken123', { host: 'http://127.0.0.1:8797', flushAt: 1, flushInterval: 0, disableGeoip: false })",
+          "function loadOrder(id) { return chargeCard({ id, amount: -5 }) }"
+         ],
+         "context_line": "function chargeCard(o) { if (o.amount < 0) throw new RangeError('Negative amount for order ' + o.id); return true }",
+         "post_context": [
+          "try { loadOrder(77) } catch (e) { ph.captureException(e, 'server-user-1', { route: '/api/orders' }) }",
+          "await new Promise(r => setTimeout(r, 1500))",
+          "await ph.shutdown()"
+         ]
+        }
+       ]
+      }
+     }
+    ],
+    "$exception_level": "error",
+    "route": "/api/orders",
+    "$is_server": true,
+    "$lib": "posthog-node",
+    "$lib_version": "6.0.3"
+   }
+  }
+ ],
+ "quota": {
+  "note": "After the server answered a capture with quota_limited:[events,exceptionEvent,recordings], the SDK sent nothing further for 4 more clicks (event, event, captureException, event) in the following ~8s.",
+  "requests_after_quota_on": [
+   [
+    "/__quota_on",
+    [],
+    "{\"ok\":true}"
+   ],
+   [
+    "/i/v0/e/",
+    [
+     "$autocapture"
+    ],
+    "{\"status\":1,\"quota_limited\":[\"events\",\"exceptionEvent\",\"recordings\"]}"
+   ],
+   [
+    "/i/v1/analytics/events",
+    [
+     "$exception"
+    ],
+    "{}"
+   ]
+  ]
+ }
+}

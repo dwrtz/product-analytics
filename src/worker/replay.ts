@@ -5,10 +5,13 @@ import { Env, IngestMsg, json, ProjectRow } from './env';
 import { cors } from './capture';
 import { decodeBody, DecodeError } from '../shared/decode';
 import { projectByToken, validToken } from './projects';
+import { replayAllowed, replayQuotaLimited } from './usage';
 
 export type ReplayMeta = {
   session_id: string; distinct_id: string; start_ts: number; end_ts: number; clicks: number; keypresses: number;
   console_errors: number; first_url: string | null; size: number; chunks: number;
+  /** 0.5: gzip bytes stored in R2 and the chunk key (so the store can count storage and undo a chunk over the cap). */
+  stored?: number; key?: string;
 };
 const obj = (v: unknown): Record<string, any> | undefined => v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, any> : undefined;
 const SAFE = /^[A-Za-z0-9._:-]{1,200}$/;
@@ -45,6 +48,7 @@ export async function handleSnapshots(req: Request, env: Env, url: URL): Promise
   const fallbackToken = body?.api_key ?? body?.token ?? url.searchParams.get('token') ?? url.searchParams.get('api_key');
   // project -> session -> { did, items, window }
   const groups = new Map<number, { project: ProjectRow; sessions: Map<string, { did: string; items: any[] }> }>();
+  let quota = false;
   for (const ev of events) {
     const e = obj(ev); if (!e || (e.event !== '$snapshot' && e.event !== '$snapshot_items')) continue;
     const p = obj(e.properties) ?? {};
@@ -53,6 +57,7 @@ export async function handleSnapshots(req: Request, env: Env, url: URL): Promise
     const project = await projectByToken(env, token);
     if (!project || !project.session_recording) continue;
     const sid = String(p.$session_id ?? ''); if (!SAFE.test(sid)) continue;
+    if (!replayAllowed(project, sid)) { if (replayQuotaLimited(project)) quota = true; continue; }
     const items = Array.isArray(p.$snapshot_data) ? p.$snapshot_data : Array.isArray(p.$snapshot_items) ? p.$snapshot_items : obj(p.$snapshot_data) ? [p.$snapshot_data] : [];
     if (!items.length) continue;
     const did = String(e.distinct_id ?? p.distinct_id ?? '');
@@ -66,12 +71,13 @@ export async function handleSnapshots(req: Request, env: Env, url: URL): Promise
       const text = JSON.stringify(s.items); const f = summarize(s.items);
       if (!Number.isFinite(f.start)) continue;
       const key = `${chunkPrefix(pid, sid)}${String(f.start).padStart(15, '0')}-${crypto.randomUUID().slice(0, 8)}`;
-      await env.REPLAY.put(key, await gzip(text), { httpMetadata: { contentType: 'application/json', contentEncoding: 'gzip' } });
-      metas.push({ session_id: sid, distinct_id: s.did, start_ts: f.start, end_ts: f.end, clicks: f.clicks, keypresses: f.keypresses, console_errors: f.errors, first_url: f.url, size: text.length, chunks: 1 });
+      const gz = await gzip(text);
+      await env.REPLAY.put(key, gz, { httpMetadata: { contentType: 'application/json', contentEncoding: 'gzip' } });
+      metas.push({ session_id: sid, distinct_id: s.did, start_ts: f.start, end_ts: f.end, clicks: f.clicks, keypresses: f.keypresses, console_errors: f.errors, first_url: f.url, size: text.length, chunks: 1, stored: gz.byteLength, key });
     }
     if (metas.length) await env.INGEST.send({ pid, replay: metas } satisfies IngestMsg, { contentType: 'json' });
   }
-  return json({ status: 1 }, 200, cors(req));
+  return json(quota ? { status: 1, quota_limited: ['recordings'] } : { status: 1 }, 200, cors(req));
 }
 
 /** posthog-js field compression (`cv: '2024-10'`): gzip bytes carried as a latin1 string, JSON inside. */
@@ -172,7 +178,7 @@ export function cleanReplayConfig(c: any): ReplayConfig {
 export const replayConfigOf = (p: ProjectRow): ReplayConfig => { try { return p.replay_config ? JSON.parse(p.replay_config) : {}; } catch { return {}; } };
 /** posthog-js remote config `sessionRecording` (protocol.md "Replay settings"). */
 export function recordingConfig(p: ProjectRow) {
-  if (!p.session_recording) return false;
+  if (!p.session_recording || replayQuotaLimited(p)) return false;
   const c = replayConfigOf(p);
   const out: Record<string, unknown> = { endpoint: '/s/', consoleLogRecordingEnabled: c.console !== false, recorderVersion: 'v2',
     sampleRate: c.sample_rate === undefined || c.sample_rate === null ? null : c.sample_rate.toFixed(2),

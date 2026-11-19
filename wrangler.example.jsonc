@@ -20,6 +20,9 @@
   // Optional cold tier (design.md "Cold tier"): a Basin Pipelines stream writing an Iceberg table, queried with Basin SQL.
   // Add the binding plus BASIN_ACCOUNT_ID / BASIN_BUCKET / BASIN_TABLE vars and `wrangler secret put BASIN_TOKEN`.
   // "pipelines": [{ "binding": "COLD_STREAM", "stream": "<stream id>" }],
+  // Optional alert email (design.md "Alerts"): Cloudflare Email Sending, sender on an onboarded domain.
+  // "send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["analytics@yourdomain.com"] }],
+  // and add "ALERT_EMAIL_FROM": "analytics@yourdomain.com" to vars. Without both, alerts stay in the app.
   "triggers": { "crons": ["17 3 * * *", "41 * * * *"] },
   "observability": { "enabled": true }
 }

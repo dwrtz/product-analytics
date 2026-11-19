@@ -184,12 +184,15 @@ committed. Vars:
 | `REPLAY_RETENTION_DAYS` | Days to keep session recordings (default 30); never longer than the project's event retention when that is set. `0` keeps them as long as events. |
 | `INGEST_HOSTS` | Optional, empty by default: comma-separated hostnames that only receive SDK traffic ("Hostnames"). |
 | `SHARD_PERIOD` | `month` (default) or `day`; read once per project. For tests. |
+| `ALERT_EMAIL_FROM` | Optional (0.5): sender address for alert emails, on a domain onboarded to Cloudflare Email Sending. Needs the `EMAIL` binding; unset = alerts in the app only ("Alerts"). |
 
 Crons: `17 3 * * *` purges by retention; `41 * * * *` (0.3) recalculates
 dynamic cohorts. The optional cold tier (0.4, "Cold tier") adds a
 `COLD_STREAM` pipelines binding, vars `BASIN_ACCOUNT_ID`, `BASIN_BUCKET`,
 `BASIN_TABLE` (default `analytics.events`) and one secret, `BASIN_TOKEN`.
-Without them there are no secrets.
+Without them there are no secrets. Alert email (0.5, optional) adds
+`"send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["<ALERT_EMAIL_FROM>"] }]`
+and the `ALERT_EMAIL_FROM` var; the daily cron also runs the spike check.
 
 ## Hostnames
 
@@ -278,6 +281,10 @@ ALTER TABLE projects ADD COLUMN session_recording INTEGER NOT NULL DEFAULT 0;
 -- migrations/0003_v03.sql
 ALTER TABLE projects ADD COLUMN replay_config TEXT;              -- JSON replay settings, null = defaults
 ALTER TABLE projects ADD COLUMN heatmaps INTEGER NOT NULL DEFAULT 0;
+-- migrations/0004_v05.sql
+ALTER TABLE projects ADD COLUMN limits TEXT;                    -- JSON usage limits ("Usage limits"), null = none
+ALTER TABLE projects ADD COLUMN cap_state TEXT;                 -- JSON {month, events, replay}, written by the store
+ALTER TABLE projects ADD COLUMN error_tracking INTEGER NOT NULL DEFAULT 0;  -- exception autocapture switch
 ```
 
 - Passwords: PBKDF2-SHA256, 100,000 iterations, 16-byte random salt,
@@ -998,3 +1005,151 @@ table in R2, for cheap long-term storage and warehouse-style SQL.
 - Costs: stream ingress is free; sink output, Basin SQL scans and R2
   storage are billed by usage beyond the Workers Paid inclusions.
 
+
+## Usage limits (`worker/usage.ts`, `shared/sample.ts`, 0.5)
+
+`projects.limits` (JSON; null = no limits, the pre-0.5 behaviour):
+
+| field | meaning | new projects |
+|---|---|---|
+| `events_monthly` | accepted events per UTC month, null = no cap | 1,000,000 |
+| `replay_recordings_monthly` | new session recordings per UTC month | 5,000 |
+| `replay_bytes_monthly` | gzip bytes of replay stored per UTC month | 5 GiB |
+| `over_cap` | `drop` or `sample` | `drop` |
+| `over_cap_sample_rate` | share kept past a cap in sample mode | 0.1 |
+| `autocapture_sample_rate` | share of sessions whose `$autocapture` is kept | 0.5 |
+| `alert_emails` | alert recipients; empty = every user | [] |
+| `spike_alerts`, `spike_factor` | daily spike alert and its factor | true, 3 |
+
+New projects also get `replay_config.sample_rate = 0.25` (the posthog-js
+client-side replay sample) and `error_tracking = 1`.
+
+Enforcement has two layers:
+
+1. **Exact, in the project store.** `ingest()` dedupes, then
+   `applyEventCap()` walks the fresh events in order against this month's
+   accepted count (`usage_daily`, cached in memory): under the cap an
+   event is kept; past it, it is dropped, or kept when `over_cap` is
+   `sample` and `sampled('cap:' + distinct_id, rate)`. Dropped events are
+   written to `ingest_log` (so retries do not recount) and counted as
+   `dropped`. `recordReplay()` does the same per chunk: a chunk of a new
+   session past the recordings cap, or any chunk past the bytes cap, is
+   refused (sample mode keeps `sampled('cap:' + session_id)`), and the
+   queue consumer deletes the refused R2 objects.
+2. **Short-cut at the edge.** After a batch the store compares the month
+   totals with the caps and writes `{month, events, replay}` to
+   `projects.cap_state` when it changes. Capture reads it from the cached
+   project row (up to 30 s per isolate; a PATCH clears the cache of the
+   isolate that served it). In drop mode capture keeps nothing and answers
+   `quota_limited` (`protocol.md` 20); `/s/` refuses snapshots and answers
+   `["recordings"]`; remote config turns session recording and exception
+   autocapture off. In sample mode the edge applies the same hash. A state
+   from an earlier month means "not capped", so caps reset by themselves.
+   Events dropped at the edge are not counted (documented on the screen).
+
+Autocapture sampling runs only at the edge:
+`sampled('ac:' + ($session_id ?? distinct_id), autocapture_sample_rate)`,
+so a session keeps all or none of its clicks. `sampled(key, rate)` is
+FNV-1a 32-bit of the key / 2^32 < rate (`test-vectors.json` "sampling").
+
+Changing `limits` (PATCH) calls `ProjectStore.refreshCaps()`, which reloads
+the row and rewrites `cap_state`, so raising a cap lifts it at once.
+
+### Usage counting
+
+`usage_daily (day, kind, name, count, bytes, dropped)` in the head, by UTC
+day the event was received:
+
+- `kind = 'event'`, `name` = event name (at most 200 names a day, then
+  `(other)`): accepted count, approximate JSON bytes, dropped count.
+- `kind = 'requests'`: capture requests, counted as distinct receive times
+  in a batch (every event of one request shares `received_at`).
+- `kind = 'replay'`, `name = 'recordings'`: new recordings, gzip bytes
+  stored, refused chunks; `name = 'chunks'`: uploads (R2 writes).
+- `kind = 'email'`: alert emails sent.
+
+Rows older than 400 days go with the daily retention run.
+
+## Cost estimate (`estimateCost` in `worker/usage.ts`)
+
+The Usage screen projects month-to-date usage to the full month
+(`× days in month / days elapsed`) and prices it with Cloudflare's public
+list prices (`PRICES`, read 2026-11-19 from the Workers, Durable Objects,
+Queues, R2, Pipelines and Email Service pricing pages): Workers requests
+and CPU, Queue operations (3 per message), Durable Object requests and
+duration, SQLite rows written and read, SQLite storage (the store's
+`databaseSize` plus shards), R2 storage (replay + source maps) and
+operations, alert emails, and the Pipelines sink when the cold tier is on.
+Modelling assumptions (`ASSUMPTIONS`): 3 ms CPU per request at the edge and
+again in the consumer, 2 Durable Object requests and 10 ms at 128 MB per
+queue message, 8 rows written and 5 read per event, 2 R2 reads per
+recording. Two totals: list price, and after the Workers Paid plan's
+included usage assuming the project is the only usage on the account. The
+screen says it is an estimate and lists what is not counted.
+
+## Alerts (`worker/alerts.ts`, 0.5)
+
+`alerts (id, kind, title, body, link, created_at, read_at, email_status)`
+in the head. Kinds: `usage_threshold` (50/80/100% of each cap, once per
+month and cap, keyed in `meta`), `usage_spike` (daily cron
+`checkSpike()`: yesterday's events over `spike_factor` × the mean of the
+7 days before and at least 100; once per day), `error_new`,
+`error_regression` (not for suppressed issues), `test`.
+
+`raise()` stores the alert, then, when `EMAIL` and `ALERT_EMAIL_FROM` are
+set, sends one email per recipient (the project's `alert_emails`, else all
+users) with `env.EMAIL.send({from, to, subject, text, html})`, at most 20
+alert emails per project per UTC day (test alerts excepted); the result
+("sent to 2", an error code such as `E_SENDER_NOT_VERIFIED`, or "off") is
+kept in `email_status`. The sender domain must be onboarded to Cloudflare
+Email Sending (DNS records on the zone) and the Worker needs the
+`send_email` binding; nothing else changes without them.
+
+## Error tracking (`worker/errors.ts`, `shared/sourcemap.ts`, 0.5)
+
+Tables in the head:
+
+```sql
+CREATE TABLE error_issues (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'active',
+  type TEXT NOT NULL, message TEXT NOT NULL, top_frame TEXT, first_seen INTEGER, last_seen INTEGER,
+  occurrences INTEGER NOT NULL DEFAULT 0, users INTEGER NOT NULL DEFAULT 0, resolved_at INTEGER,
+  regressions INTEGER NOT NULL DEFAULT 0, sample TEXT, sample_uuid TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE error_occurrences (uuid TEXT PRIMARY KEY, issue_id TEXT NOT NULL, ts INTEGER NOT NULL, distinct_id TEXT NOT NULL,
+  session_id TEXT, url TEXT, handled INTEGER);                  -- trimmed by retention
+CREATE TABLE error_issue_users (issue_id TEXT NOT NULL, distinct_id TEXT NOT NULL, PRIMARY KEY (issue_id, distinct_id));
+CREATE TABLE symbol_sets (id TEXT PRIMARY KEY, ref TEXT NOT NULL UNIQUE, path TEXT NOT NULL, r2_key TEXT NOT NULL,
+  size INTEGER NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER);
+```
+
+Ingest (`ProjectStore.ingest`, before the shard insert): for each kept
+`$exception`, `symbolicate()` resolves frames with source maps (R2
+`sourcemaps/<project>/<uuid>.map`, parsed maps cached per store, 8 at a
+time), `fingerprintOf()` computes the fingerprint, and the issue row is
+created if missing (uuidv7 id) so the event is stored with
+`$exception_issue_id`. In the ingest transaction `recordOccurrence()`
+inserts the occurrence by event uuid (idempotent) and only then updates
+counts, users, first/last seen, the latest exception list (`sample`) and
+the status: an occurrence after `resolved_at` sets it back to `active` and
+adds a regression. The cold tier receives the enriched event.
+
+Fingerprint: see `spec.md` R28 and `test-vectors.json` "fingerprints".
+Filenames drop scheme, host, query and build hashes (`app.3f9a2c1b.js`,
+`index-B7xQ2kLp.js`); messages without a stack drop numbers, uuids, hex and
+quoted values.
+
+Symbolication: `decodeMap()` decodes VLQ `mappings` per generated line;
+`originalPosition()` binary-searches the last segment at or before the
+column. The original function name comes from the caller frame's mapped
+name (call sites are mapped to the callee identifier); a frame without a
+mapped caller (e.g. an async function after `await`) takes the nearest
+enclosing declaration's name from `sourcesContent`. Source paths lose `webpack://` and leading `./` / `../`.
+
+## Screens (0.5)
+
+- **Usage** (`/project/:id/usage?days=7|30|90`): meters, events per day
+  stacked by event type (top 8 + other) with a table, replay per day, the
+  cost table with notes, and the alert list (mark read, send test alert).
+  The navigation shows the unread count as a badge (cached a minute).
+- **Error tracking** (`/project/:id/errors`, `/errors/:issue`): R28.
+- **Settings** gains "Usage limits and alerts" and "Error tracking"
+  (exception autocapture switch, source maps list, upload command).

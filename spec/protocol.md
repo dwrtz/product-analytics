@@ -300,9 +300,10 @@ A missing property matches only `is_not`, `not_icontains`, `not_regex` and
 {
   "token": "<token>", "supportedCompression": ["gzip", "gzip-js"], "hasFeatureFlags": true,
   "analytics": { "endpoint": "/i/v0/e/" }, "elementsChainAsString": true, "defaultIdentifiedOnly": true,
-  "autocapture_opt_out": false, "autocaptureExceptions": false, "captureDeadClicks": false,
-  "capturePerformance": false, "sessionRecording": false, "heatmaps": false, "surveys": false,
-  "productTours": false, "siteApps": []
+  "autocapture_opt_out": false, "autocaptureExceptions": false,
+  "errorTracking": { "autocaptureExceptions": false, "suppressionRules": [], "captureExtensionExceptions": false },
+  "captureDeadClicks": false, "capturePerformance": false, "sessionRecording": false, "heatmaps": false,
+  "surveys": false, "productTours": false, "siteApps": []
 }
 ```
 
@@ -321,7 +322,10 @@ observed working with posthog-js 1.450.1):
 ```
 
 The `/flags` response with `config=true` (and `/decide`) carries the same
-two fields. 0.3: the project's replay settings fill these fields (18);
+two fields. 0.5: `autocaptureExceptions` and `errorTracking.autocaptureExceptions`
+are the project's error tracking switch (19); both, and `sessionRecording`,
+are `false` while the project's events (or replay) are capped in drop
+mode (20). 0.3: the project's replay settings fill these fields (18);
 `heatmaps` and `captureDeadClicks` are the project's heatmaps setting (14);
 `capturePerformance` is `{"network_timing": true, "web_vitals": false}`
 when network capture is on (18), else `false`.
@@ -587,3 +591,56 @@ headers and bodies when enabled]}}`; posthog-js turns the network recorder
 off when the page's host is `localhost` or `127.0.0.1`. Canvas as type 3
 source 9 (canvas mutation) with base64 webp image data; the player needs
 canvas replay turned on.
+
+## 19. Exceptions [posthog-js packages/browser/src/extensions/exception-autocapture, posthog-node src/extensions/error-tracking; observed with posthog-js 1.450.1 and posthog-node 6.0.3]
+
+`$exception` is an ordinary event on the capture endpoints (posthog-js:
+`/i/v0/e/`; posthog-node: `/i/v1/analytics/events`). With
+`autocaptureExceptions` truthy in the remote config posthog-js loads
+`/static/exception-autocapture.js` and captures `window.onerror` and
+`unhandledrejection`; `captureException(error, props)` works either way.
+Observed properties (`tests/fixtures/v05-errors.json`):
+
+```json
+{ "$exception_list": [ { "type": "TypeError", "value": "Price must be a number, got string",
+    "mechanism": { "type": "generic", "handled": false, "synthetic": false, "exception_id": 0 },
+    "stacktrace": { "type": "raw", "frames": [
+      { "platform": "web:javascript", "filename": "http://host/app.min.js", "function": "r", "in_app": true, "lineno": 1, "colno": 206 },
+      { "platform": "web:javascript", "filename": "http://host/app.min.js", "function": "n", "in_app": true, "lineno": 1, "colno": 49 } ] } } ],
+  "$exception_level": "error", "$exception_capture_enabled_server_side": true,
+  "$exception_fingerprint": "qty-range" }
+```
+
+- The list's first entry is the outer exception; frames are ordered
+  outermost first, so the frame that threw is the **last** one. Line and
+  column are 1-based.
+- posthog-node frames carry `"platform": "node:javascript"`, a `module`,
+  `in_app: false` for `node:` internals and dependencies, and already
+  include `pre_context` / `context_line` / `post_context` read from disk.
+- `$exception_fingerprint` is optional (string; a list is accepted).
+
+The server adds to the stored event: `$exception_fingerprint` (computed
+unless sent, `test-vectors.json` "fingerprints"), `$exception_issue_id`,
+`$exception_type` / `$exception_message` from the first entry when
+missing, and, for frames resolved with an uploaded source map,
+`stacktrace.type: "resolved"` and per frame `resolved: true`, the original
+`filename` / `lineno` / `colno` / `function`, context lines and
+`minified: {filename, function, lineno, colno}`.
+
+## 20. Quota limiting [posthog-js src/rate-limiter.ts; observed]
+
+A capture response may carry `quota_limited`, a list of batch keys.
+posthog-js then drops new events for those keys for 60 seconds without
+sending them (observed: after one limited answer, four further clicks and a
+`captureException` sent nothing). Batch keys: `events` (ordinary events),
+`exceptionEvent` (`$exception`), `recordings` (`/s/` snapshots).
+
+| endpoint, project capped in drop mode | response |
+|---|---|
+| `/e/`, `/i/v0/e/`, `/batch/`, … | `{"status": 1, "quota_limited": ["events", "exceptionEvent"]}` |
+| `/i/v1/analytics/events` | `{"results": {…}, "quota_limited": ["events", "exceptionEvent"]}` |
+| `/s/` | `{"status": 1, "quota_limited": ["recordings"]}` |
+
+In sample mode the answer stays `{"status": 1}` and a deterministic share
+is kept (`test-vectors.json` "sampling"). Events dropped because of a cap
+are accepted with status 200 like events of an unknown project.

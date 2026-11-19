@@ -744,5 +744,498 @@
     }
    }
   ]
+ },
+ "sampling": {
+  "source": "design.md \"Usage limits\": FNV-1a 32-bit over the UTF-16 code units of the key, divided by 2^32; kept when below the rate. Keys: cap:<distinct_id> (events past a cap), cap:<session_id> (replay past a cap), ac:<$session_id or distinct_id> (autocapture).",
+  "cases": [
+   {
+    "key": "cap:user-1",
+    "unit": 0.34798795776441693,
+    "kept_at_0_5": true,
+    "kept_at_0_25": false
+   },
+   {
+    "key": "cap:user-2",
+    "unit": 0.34408161393366754,
+    "kept_at_0_5": true,
+    "kept_at_0_25": false
+   },
+   {
+    "key": "ac:01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
+    "unit": 0.5421303973998874,
+    "kept_at_0_5": false,
+    "kept_at_0_25": false
+   },
+   {
+    "key": "cap:sess-a",
+    "unit": 0.11303425836376846,
+    "kept_at_0_5": true,
+    "kept_at_0_25": true
+   },
+   {
+    "key": "",
+    "unit": 0.5043428998906165,
+    "kept_at_0_5": false,
+    "kept_at_0_25": false
+   }
+  ]
+ },
+ "quota_limited": {
+  "source": "posthog-js 1.450.1 src/rate-limiter.ts (MIT): a capture response whose JSON has quota_limited: [batch keys] pauses those keys for 60 s. Batch keys: events (default), exceptionEvent, recordings.",
+  "capture_capped_drop": {
+   "status": 1,
+   "quota_limited": [
+    "events",
+    "exceptionEvent"
+   ]
+  },
+  "snapshots_capped_drop": {
+   "status": 1,
+   "quota_limited": [
+    "recordings"
+   ]
+  },
+  "v1_capped_drop_has": {
+   "quota_limited": [
+    "events",
+    "exceptionEvent"
+   ]
+  },
+  "sample_mode": {
+   "status": 1
+  }
+ },
+ "source_maps": {
+  "source": "Source Map Revision 3 (tc39.es/ecma426); map and frames from tests/fixtures/v05-errors.json (esbuild bundle, posthog-js frames). Lines and columns are 1-based like stack traces.",
+  "map": {
+   "version": 3,
+   "sources": [
+    "app-src.js"
+   ],
+   "sourcesContent": [
+    "// Small \"site\" bundle used to produce real minified stack traces and a source map (fixtures for 0.5 error tracking).\nfunction parsePrice(raw) {\n  if (typeof raw !== 'number') {\n    const err = new TypeError('Price must be a number, got ' + typeof raw);\n    throw err;\n  }\n  return raw;\n}\nfunction computeTotal(cart) {\n  let sum = 0;\n  for (const item of cart.items) sum += parsePrice(item.price) * item.qty;\n  return sum;\n}\nexport function checkout(cart) {\n  return computeTotal(cart);\n}\nexport async function loadProfile(id) {\n  await new Promise(r => setTimeout(r, 5));\n  throw new Error('Profile ' + id + ' not found');\n}\nwindow.shop = {\n  throwUnhandled() { setTimeout(() => { checkout({ items: [{ price: '12', qty: 1 }] }); }, 0); },\n  rejectUnhandled() { loadProfile(42); },\n  manual() { try { checkout({ items: [{ price: null, qty: 2 }] }); } catch (e) { window.posthog.captureException(e, { cart_size: 1 }); } },\n  custom() { window.posthog.captureException(new RangeError('Quantity out of range'), { $exception_fingerprint: 'qty-range' }); },\n};\n"
+   ],
+   "mappings": "MACA,SAASA,EAAWC,EAAK,CACvB,GAAI,OAAOA,GAAQ,SAEjB,MADY,IAAI,UAAU,+BAAiC,OAAOA,CAAG,EAGvE,OAAOA,CACT,CACA,SAASC,EAAaC,EAAM,CAC1B,IAAIC,EAAM,EACV,QAAWC,KAAQF,EAAK,MAAOC,GAAOJ,EAAWK,EAAK,KAAK,EAAIA,EAAK,IACpE,OAAOD,CACT,CACO,SAASE,EAASH,EAAM,CAC7B,OAAOD,EAAaC,CAAI,CAC1B,CACA,eAAsBI,EAAYC,EAAI,CACpC,YAAM,IAAI,QAAQC,GAAK,WAAWA,EAAG,CAAC,CAAC,EACjC,IAAI,MAAM,WAAaD,EAAK,YAAY,CAChD,CACA,OAAO,KAAO,CACZ,gBAAiB,CAAE,WAAW,IAAM,CAAEF,EAAS,CAAE,MAAO,CAAC,CAAE,MAAO,KAAM,IAAK,CAAE,CAAC,CAAE,CAAC,CAAG,EAAG,CAAC,CAAG,EAC7F,iBAAkB,CAAEC,EAAY,EAAE,CAAG,EACrC,QAAS,CAAE,GAAI,CAAED,EAAS,CAAE,MAAO,CAAC,CAAE,MAAO,KAAM,IAAK,CAAE,CAAC,CAAE,CAAC,CAAG,OAAS,EAAG,CAAE,OAAO,QAAQ,iBAAiB,EAAG,CAAE,UAAW,CAAE,CAAC,CAAG,CAAE,EACvI,QAAS,CAAE,OAAO,QAAQ,iBAAiB,IAAI,WAAW,uBAAuB,EAAG,CAAE,uBAAwB,WAAY,CAAC,CAAG,CAChI",
+   "names": [
+    "parsePrice",
+    "raw",
+    "computeTotal",
+    "cart",
+    "sum",
+    "item",
+    "checkout",
+    "loadProfile",
+    "id",
+    "r"
+   ]
+  },
+  "positions": [
+   {
+    "line": 1,
+    "column": 49,
+    "expect": {
+     "source": "app-src.js",
+     "line": 4,
+     "column": 17,
+     "name": null,
+     "sourceIndex": 0
+    }
+   },
+   {
+    "line": 1,
+    "column": 159,
+    "expect": {
+     "source": "app-src.js",
+     "line": 11,
+     "column": 41,
+     "name": "parsePrice",
+     "sourceIndex": 0
+    }
+   },
+   {
+    "line": 1,
+    "column": 206,
+    "expect": {
+     "source": "app-src.js",
+     "line": 15,
+     "column": 10,
+     "name": "computeTotal",
+     "sourceIndex": 0
+    }
+   },
+   {
+    "line": 1,
+    "column": 358,
+    "expect": {
+     "source": "app-src.js",
+     "line": 22,
+     "column": 41,
+     "name": "checkout",
+     "sourceIndex": 0
+    }
+   },
+   {
+    "line": 1,
+    "column": 275,
+    "expect": {
+     "source": "app-src.js",
+     "line": 19,
+     "column": 9,
+     "name": null,
+     "sourceIndex": 0
+    }
+   }
+  ]
+ },
+ "fingerprints": {
+  "source": "design.md \"Error tracking\": $exception_fingerprint wins (custom:<value>); else SHA-256 (first 16 bytes, hex) of \"<type>\\n\" + top five in-app frames innermost first as \"<function>@<normalized filename>\" joined by \\n; with no frames \"<type>\\n<normalized message>\".",
+  "cases": [
+   {
+    "name": "posthog-js unhandled TypeError (raw frames)",
+    "properties": {
+     "$os": "Linux",
+     "$browser": "Chrome",
+     "$device_type": "Desktop",
+     "$timezone": "UTC",
+     "$timezone_offset": 0,
+     "$current_url": "http://172.17.0.1:8797/",
+     "$host": "172.17.0.1:8797",
+     "$pathname": "/",
+     "$raw_user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
+     "$browser_version": 156,
+     "$browser_language": "en-US",
+     "$browser_language_prefix": "en",
+     "$screen_height": 720,
+     "$screen_width": 1280,
+     "$viewport_height": 720,
+     "$viewport_width": 1280,
+     "$lib": "web",
+     "$lib_version": "1.450.1",
+     "$insert_id": "3myab7pfize6fgmr",
+     "$time": 1795091180.396,
+     "$sdk_dist_channel": "cdn",
+     "$initialization_time": "2026-11-19T12:26:15.244Z",
+     "$configured_session_timeout_ms": 1800000,
+     "distinct_id": "user-7",
+     "$device_id": "01a1f3c5-974f-74fb-ab45-c80a124f3ac2",
+     "$autocapture_disabled_server_side": false,
+     "$error_tracking_capture_extension_exceptions": false,
+     "$web_vitals_enabled_server_side": false,
+     "$exception_capture_enabled_server_side": true,
+     "$dead_clicks_enabled_server_side": false,
+     "$user_id": "user-7",
+     "$sdk_debug_extensions_init_method": "synchronous",
+     "$sdk_debug_extensions_init_time_ms": 1,
+     "$referrer": "$direct",
+     "$referring_domain": "$direct",
+     "$feature_flag_request_id": "00000000-0000-4000-8000-000000000000",
+     "$active_feature_flags": [],
+     "$feature_flag_payloads": {},
+     "$exception_list": [
+      {
+       "type": "TypeError",
+       "value": "Price must be a number, got string",
+       "mechanism": {
+        "type": "generic",
+        "handled": false,
+        "synthetic": false,
+        "exception_id": 0
+       },
+       "stacktrace": {
+        "type": "raw",
+        "frames": [
+         {
+          "platform": "web:javascript",
+          "filename": "http://172.17.0.1:8797/app.min.js",
+          "function": "?",
+          "in_app": true,
+          "lineno": 1,
+          "colno": 358
+         },
+         {
+          "platform": "web:javascript",
+          "filename": "http://172.17.0.1:8797/app.min.js",
+          "function": "r",
+          "in_app": true,
+          "lineno": 1,
+          "colno": 206
+         },
+         {
+          "platform": "web:javascript",
+          "filename": "http://172.17.0.1:8797/app.min.js",
+          "function": "i",
+          "in_app": true,
+          "lineno": 1,
+          "colno": 159
+         },
+         {
+          "platform": "web:javascript",
+          "filename": "http://172.17.0.1:8797/app.min.js",
+          "function": "n",
+          "in_app": true,
+          "lineno": 1,
+          "colno": 49
+         }
+        ]
+       }
+      }
+     ],
+     "$exception_level": "error",
+     "token": "phc_testtoken123",
+     "$config_defaults": "unset",
+     "$session_id": "01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
+     "$window_id": "01a1f3c5-9768-7ecc-ae2f-758a0ec51c92",
+     "$session_entry_referrer": "$direct",
+     "$session_entry_referring_domain": "$direct",
+     "$session_entry_url": "http://172.17.0.1:8797/",
+     "$session_entry_host": "172.17.0.1:8797",
+     "$session_entry_pathname": "/",
+     "$recording_status": "disabled",
+     "$sdk_debug_retry_queue_size": 0,
+     "$lib_custom_api_host": "http://172.17.0.1:8797",
+     "$pageview_id": "01a1f3c5-975f-7c94-b404-e672c88a02be",
+     "$browser_type": "bot",
+     "$is_identified": true,
+     "$process_person_profile": true,
+     "$lib_rate_limit_remaining_tokens": 98.14
+    },
+    "expect": "a6fcf13979853cb7ab140c960b08ecbe"
+   },
+   {
+    "name": "posthog-js unhandled rejection",
+    "properties": {
+     "$os": "Linux",
+     "$browser": "Chrome",
+     "$device_type": "Desktop",
+     "$timezone": "UTC",
+     "$timezone_offset": 0,
+     "$current_url": "http://172.17.0.1:8797/",
+     "$host": "172.17.0.1:8797",
+     "$pathname": "/",
+     "$raw_user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
+     "$browser_version": 156,
+     "$browser_language": "en-US",
+     "$browser_language_prefix": "en",
+     "$screen_height": 720,
+     "$screen_width": 1280,
+     "$viewport_height": 720,
+     "$viewport_width": 1280,
+     "$lib": "web",
+     "$lib_version": "1.450.1",
+     "$insert_id": "y3zy9jsicsmvunsq",
+     "$time": 1795091182.427,
+     "$sdk_dist_channel": "cdn",
+     "$initialization_time": "2026-11-19T12:26:15.244Z",
+     "$configured_session_timeout_ms": 1800000,
+     "distinct_id": "user-7",
+     "$device_id": "01a1f3c5-974f-74fb-ab45-c80a124f3ac2",
+     "$autocapture_disabled_server_side": false,
+     "$error_tracking_capture_extension_exceptions": false,
+     "$web_vitals_enabled_server_side": false,
+     "$exception_capture_enabled_server_side": true,
+     "$dead_clicks_enabled_server_side": false,
+     "$user_id": "user-7",
+     "$sdk_debug_extensions_init_method": "synchronous",
+     "$sdk_debug_extensions_init_time_ms": 1,
+     "$referrer": "$direct",
+     "$referring_domain": "$direct",
+     "$feature_flag_request_id": "00000000-0000-4000-8000-000000000000",
+     "$active_feature_flags": [],
+     "$feature_flag_payloads": {},
+     "$exception_list": [
+      {
+       "type": "Error",
+       "value": "Profile 42 not found",
+       "mechanism": {
+        "type": "generic",
+        "handled": false,
+        "synthetic": false,
+        "exception_id": 0
+       },
+       "stacktrace": {
+        "type": "raw",
+        "frames": [
+         {
+          "platform": "web:javascript",
+          "filename": "http://172.17.0.1:8797/app.min.js",
+          "function": "c",
+          "in_app": true,
+          "lineno": 1,
+          "colno": 275
+         }
+        ]
+       }
+      }
+     ],
+     "$exception_level": "error",
+     "token": "phc_testtoken123",
+     "$config_defaults": "unset",
+     "$session_id": "01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
+     "$window_id": "01a1f3c5-9768-7ecc-ae2f-758a0ec51c92",
+     "$session_entry_referrer": "$direct",
+     "$session_entry_referring_domain": "$direct",
+     "$session_entry_url": "http://172.17.0.1:8797/",
+     "$session_entry_host": "172.17.0.1:8797",
+     "$session_entry_pathname": "/",
+     "$recording_status": "disabled",
+     "$sdk_debug_retry_queue_size": 0,
+     "$lib_custom_api_host": "http://172.17.0.1:8797",
+     "$pageview_id": "01a1f3c5-975f-7c94-b404-e672c88a02be",
+     "$browser_type": "bot",
+     "$is_identified": true,
+     "$process_person_profile": true,
+     "$lib_rate_limit_remaining_tokens": 98.1
+    },
+    "expect": "641056856ac9e738663b8e56f0b1c8ad"
+   },
+   {
+    "name": "custom fingerprint",
+    "properties": {
+     "$os": "Linux",
+     "$browser": "Chrome",
+     "$device_type": "Desktop",
+     "$timezone": "UTC",
+     "$timezone_offset": 0,
+     "$current_url": "http://172.17.0.1:8797/",
+     "$host": "172.17.0.1:8797",
+     "$pathname": "/",
+     "$raw_user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
+     "$browser_version": 156,
+     "$browser_language": "en-US",
+     "$browser_language_prefix": "en",
+     "$screen_height": 720,
+     "$screen_width": 1280,
+     "$viewport_height": 720,
+     "$viewport_width": 1280,
+     "$lib": "web",
+     "$lib_version": "1.450.1",
+     "$insert_id": "eci8fjsftro9hubi",
+     "$time": 1795091186.485,
+     "$sdk_dist_channel": "cdn",
+     "$initialization_time": "2026-11-19T12:26:15.244Z",
+     "$configured_session_timeout_ms": 1800000,
+     "distinct_id": "user-7",
+     "$device_id": "01a1f3c5-974f-74fb-ab45-c80a124f3ac2",
+     "$autocapture_disabled_server_side": false,
+     "$error_tracking_capture_extension_exceptions": false,
+     "$web_vitals_enabled_server_side": false,
+     "$exception_capture_enabled_server_side": true,
+     "$dead_clicks_enabled_server_side": false,
+     "$user_id": "user-7",
+     "$sdk_debug_extensions_init_method": "synchronous",
+     "$sdk_debug_extensions_init_time_ms": 1,
+     "$referrer": "$direct",
+     "$referring_domain": "$direct",
+     "$feature_flag_request_id": "00000000-0000-4000-8000-000000000000",
+     "$active_feature_flags": [],
+     "$feature_flag_payloads": {},
+     "$exception_list": [
+      {
+       "type": "RangeError",
+       "value": "Quantity out of range",
+       "mechanism": {
+        "type": "generic",
+        "handled": true,
+        "synthetic": false,
+        "exception_id": 0
+       },
+       "stacktrace": {
+        "type": "raw",
+        "frames": [
+         {
+          "platform": "web:javascript",
+          "filename": "http://172.17.0.1:8797/",
+          "function": "HTMLButtonElement.onclick",
+          "in_app": true,
+          "lineno": 9,
+          "colno": 50
+         },
+         {
+          "platform": "web:javascript",
+          "filename": "http://172.17.0.1:8797/app.min.js",
+          "function": "Object.custom",
+          "in_app": true,
+          "lineno": 1,
+          "colno": 566
+         }
+        ]
+       }
+      }
+     ],
+     "$exception_level": "error",
+     "$exception_fingerprint": "qty-range",
+     "token": "phc_testtoken123",
+     "$config_defaults": "unset",
+     "$session_id": "01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
+     "$window_id": "01a1f3c5-9768-7ecc-ae2f-758a0ec51c92",
+     "$session_entry_referrer": "$direct",
+     "$session_entry_referring_domain": "$direct",
+     "$session_entry_url": "http://172.17.0.1:8797/",
+     "$session_entry_host": "172.17.0.1:8797",
+     "$session_entry_pathname": "/",
+     "$recording_status": "disabled",
+     "$sdk_debug_retry_queue_size": 0,
+     "$lib_custom_api_host": "http://172.17.0.1:8797",
+     "$pageview_id": "01a1f3c5-975f-7c94-b404-e672c88a02be",
+     "$browser_type": "bot",
+     "$is_identified": true,
+     "$process_person_profile": true,
+     "$lib_rate_limit_remaining_tokens": 98.03
+    },
+    "expect": "custom:qty-range"
+   },
+   {
+    "name": "no frames: type and normalized message",
+    "properties": {
+     "$exception_list": [
+      {
+       "type": "Error",
+       "value": "Order 1234 failed for \"bob\""
+      }
+     ]
+    },
+    "expect": "bce20b4535f75101bafcf77c680a994e"
+   },
+   {
+    "name": "same as above with other numbers and strings",
+    "properties": {
+     "$exception_list": [
+      {
+       "type": "Error",
+       "value": "Order 99 failed for \"ann\""
+      }
+     ]
+    },
+    "expect": "bce20b4535f75101bafcf77c680a994e"
+   }
+  ],
+  "filenames": [
+   {
+    "filename": "https://cdn.test/assets/app.3f9a2c1b.js?v=2",
+    "expect": "/assets/app.js"
+   },
+   {
+    "filename": "/assets/index-B7xQ2kLp.js",
+    "expect": "/assets/index.js"
+   },
+   {
+    "filename": "/js/app-facade.js",
+    "expect": "/js/app-facade.js"
+   },
+   {
+    "filename": "node:internal/modules/run_main",
+    "expect": "node:internal/modules/run_main"
+   }
+  ],
+  "messages": [
+   {
+    "message": "Profile 42 not found for \"bob\"",
+    "expect": "Profile <n> not found for <str>"
+   },
+   {
+    "message": "Bad id 0x1F at 3.5s for 0190f3c2-1111-7000-8000-000000000000",
+    "expect": "Bad id <hex> at <n>s for <id>"
+   }
+  ]
  }
 }

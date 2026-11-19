@@ -15,6 +15,12 @@ import { cleanStep, ActionError, ActionStep } from '../shared/actions';
 import { cleanGroup, criteria, evalGroup, propertyOnly, behaviorKey, windowMs, toFlagGroup, Group, Criterion } from './cohorts';
 import { runSql, runShardSql } from './sqlquery';
 import { heatmapQuery, scrollDepthQuery, heatmapUrls } from './heatmaps';
+import { limitsOf, Limits, monthKey, dayKey, THRESHOLDS, estimateCost, PRICES, ASSUMPTIONS } from './usage';
+import { sampled } from '../shared/sample';
+import { exceptionList, fingerprintOf, symbolicate, topFrame, pathOf, refOf } from './errors';
+import { decodeMap, DecodedMap } from '../shared/sourcemap';
+import { Alert, emailAlert, recipients, emailConfigured } from './alerts';
+import { coldEnabled } from './cold';
 
 const SCHEMA = [
   ...X.EVENTS_SCHEMA,
@@ -51,6 +57,16 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS cohort_people (cohort_id INTEGER NOT NULL, person_id INTEGER NOT NULL, PRIMARY KEY (cohort_id, person_id))`,
   `CREATE INDEX IF NOT EXISTS cohort_people_person ON cohort_people (person_id)`,
   `CREATE TABLE IF NOT EXISTS flag_hash_key_overrides (distinct_id TEXT NOT NULL, flag_key TEXT NOT NULL, hash_key TEXT NOT NULL, PRIMARY KEY (distinct_id, flag_key))`,
+  // 0.5: usage, alerts, error tracking
+  `CREATE TABLE IF NOT EXISTS usage_daily (day TEXT NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, dropped INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, kind, name))`,
+  `CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, link TEXT, created_at INTEGER NOT NULL, read_at INTEGER, email_status TEXT)`,
+  `CREATE TABLE IF NOT EXISTS error_issues (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'active', type TEXT NOT NULL, message TEXT NOT NULL, top_frame TEXT,
+     first_seen INTEGER, last_seen INTEGER, occurrences INTEGER NOT NULL DEFAULT 0, users INTEGER NOT NULL DEFAULT 0, resolved_at INTEGER, regressions INTEGER NOT NULL DEFAULT 0, sample TEXT, sample_uuid TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS error_issues_last ON error_issues (last_seen)`,
+  `CREATE TABLE IF NOT EXISTS error_occurrences (uuid TEXT PRIMARY KEY, issue_id TEXT NOT NULL, ts INTEGER NOT NULL, distinct_id TEXT NOT NULL, session_id TEXT, url TEXT, handled INTEGER)`,
+  `CREATE INDEX IF NOT EXISTS error_occ_issue ON error_occurrences (issue_id, ts)`,
+  `CREATE TABLE IF NOT EXISTS error_issue_users (issue_id TEXT NOT NULL, distinct_id TEXT NOT NULL, PRIMARY KEY (issue_id, distinct_id))`,
+  `CREATE TABLE IF NOT EXISTS symbol_sets (id TEXT PRIMARY KEY, ref TEXT NOT NULL UNIQUE, path TEXT NOT NULL, r2_key TEXT NOT NULL, size INTEGER NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER)`,
 ];
 /** Columns added after a table first shipped; applied with ALTER TABLE when missing. */
 const COLUMNS: [string, string, string][] = [
@@ -62,6 +78,7 @@ const COLUMNS: [string, string, string][] = [
   ['surveys', 'iteration_count', 'INTEGER'],
   ['surveys', 'iteration_frequency_days', 'INTEGER'],
   ['surveys', 'schedule', 'TEXT'],
+  ['session_recordings', 'stored', 'INTEGER NOT NULL DEFAULT 0'],
 ];
 const SURVEY_FLAG_PREFIX = 'survey-targeting-';
 
@@ -148,7 +165,7 @@ export class ProjectStore extends DurableObject<Env> {
    * their period's shard (INSERT OR IGNORE, so a retry after a crash cannot duplicate them), then persons, groups and
    * definitions are updated in one head transaction that also records the uuids.
    */
-  async ingest(events: NormEvent[]): Promise<{ inserted: number; duplicates: number }> {
+  async ingest(events: NormEvent[], pid?: number): Promise<{ inserted: number; duplicates: number; dropped: string[]; exceptions: NormEvent[] }> {
     const fresh: NormEvent[] = []; const batch = new Set<string>();
     const legacy = this.hasLegacy();
     for (const ev of events) {
@@ -159,24 +176,310 @@ export class ProjectStore extends DurableObject<Env> {
     }
     for (const u of batch) this.inflight.add(u);
     try {
+      const info = await this.info(pid);
+      // Monthly event cap (design.md "Usage limits"): exact here; the edge only short-cuts once cap_state is written.
+      const { keep, dropped } = this.applyEventCap(fresh, info?.limits ?? null);
+      const before = this.monthTotals().events;
+      const exc = keep.filter(e => e.event === '$exception');
+      const issueOf = exc.length ? await this.prepareExceptions(exc) : new Map<string, string>();
       const groups = new Map<string, { start: number; end: number; evs: NormEvent[] }>();
-      for (const ev of fresh) { const p = this.periodOf(ev.ts); let g = groups.get(p.key); if (!g) groups.set(p.key, g = { start: p.start, end: p.end, evs: [] }); g.evs.push(ev); }
+      for (const ev of keep) { const p = this.periodOf(ev.ts); let g = groups.get(p.key); if (!g) groups.set(p.key, g = { start: p.start, end: p.end, evs: [] }); g.evs.push(ev); }
       const counts = await Promise.all([...groups].map(async ([key, g]) => [key, g, await this.shardStub(key).insert(g.evs)] as const));
-      const now = Date.now();
+      const now = Date.now(); const alerts: Alert[] = [];
       this.ctx.storage.transactionSync(() => {
         for (const [key, g, n] of counts) this.sql.exec('INSERT INTO shards (key, start, end, events) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET events = events + excluded.events', key, g.start, g.end, n);
         const lastSeen = new Map<string, number>();
-        for (const ev of fresh) {
+        for (const ev of dropped) this.sql.exec('INSERT OR IGNORE INTO ingest_log (uuid, at) VALUES (?, ?)', ev.uuid, now);
+        for (const ev of keep) {
           this.sql.exec('INSERT OR IGNORE INTO ingest_log (uuid, at) VALUES (?, ?)', ev.uuid, now);
           this.define(ev);
           if (ev.event === '$groupidentify') this.groupIdentify(ev);
           if (ev.person) this.processPerson(ev);
           lastSeen.set(ev.distinct_id, Math.max(lastSeen.get(ev.distinct_id) ?? 0, ev.ts));
+          const iid = issueOf.get(ev.uuid); if (iid) { const a = this.recordOccurrence(iid, ev, info?.pid ?? 0); if (a) alerts.push(a); }
         }
         for (const [did, ts] of lastSeen) this.sql.exec('UPDATE persons SET last_seen_at = MAX(COALESCE(last_seen_at, 0), ?) WHERE id = (SELECT person_id FROM person_distinct_ids WHERE distinct_id = ?)', ts, did);
+        this.countEvents(keep, dropped, now);
       });
+      if (info?.limits?.events_monthly !== null && info?.limits?.events_monthly !== undefined) alerts.push(...this.thresholdAlerts('events', before, this.monthTotals().events, info.limits.events_monthly, info.pid));
+      await this.afterIngest(info, alerts);
+      return { inserted: keep.length, duplicates: events.length - fresh.length, dropped: dropped.map(e => e.uuid), exceptions: exc };
     } finally { for (const u of batch) this.inflight.delete(u); }
-    return { inserted: fresh.length, duplicates: events.length - fresh.length };
+  }
+
+  // ---------- usage, caps and alerts (design.md "Usage limits", "Alerts") ----------
+  private infoCache: { at: number; v: { pid: number; name: string; limits: Limits | null; cap_state: string | null; error_tracking: number } } | null = null;
+  /** The project's row fields the store needs (D1, cached 30 s). The project id is remembered from the first call that passes it. */
+  private async info(pid?: number) {
+    if (pid) { const cur = this.one<{ value: string }>("SELECT value FROM meta WHERE key = 'pid'")?.value; if (cur !== String(pid)) this.sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('pid', ?)", String(pid)); }
+    const id = pid ?? Number(this.one<{ value: string }>("SELECT value FROM meta WHERE key = 'pid'")?.value ?? 0);
+    if (!id) return null;
+    if (this.infoCache && this.infoCache.v.pid === id && Date.now() - this.infoCache.at < 30_000) return this.infoCache.v;
+    const r = await this.env.DB.prepare('SELECT id, name, limits, cap_state, error_tracking FROM projects WHERE id = ?').bind(id).first<any>();
+    if (!r) return null;
+    const v = { pid: id, name: String(r.name), limits: r.limits ? limitsOf(r) : null, cap_state: r.cap_state ?? null, error_tracking: Number(r.error_tracking ?? 0) };
+    this.infoCache = { at: Date.now(), v }; return v;
+  }
+  private mt: { month: string; events: number; recordings: number; bytes: number } | null = null;
+  /** This UTC month's accepted events, new recordings and stored replay bytes. */
+  private monthTotals() {
+    const month = monthKey(Date.now());
+    if (this.mt?.month === month) return this.mt;
+    const r = this.one<any>(`SELECT COALESCE(SUM(CASE WHEN kind = 'event' THEN count END), 0) AS events, COALESCE(SUM(CASE WHEN kind = 'replay' AND name = 'recordings' THEN count END), 0) AS recordings,
+      COALESCE(SUM(CASE WHEN kind = 'replay' AND name = 'recordings' THEN bytes END), 0) AS bytes FROM usage_daily WHERE day >= ? AND day < ?`, month + '-01', month + '-99')!;
+    return this.mt = { month, events: Number(r.events), recordings: Number(r.recordings), bytes: Number(r.bytes) };
+  }
+  private applyEventCap(fresh: NormEvent[], L: Limits | null): { keep: NormEvent[]; dropped: NormEvent[] } {
+    if (!L || L.events_monthly === null) return { keep: fresh, dropped: [] };
+    let used = this.monthTotals().events; const keep: NormEvent[] = []; const dropped: NormEvent[] = [];
+    for (const ev of fresh) {
+      if (used < L.events_monthly || (L.over_cap === 'sample' && sampled('cap:' + ev.distinct_id, L.over_cap_sample_rate))) { keep.push(ev); used++; }
+      else dropped.push(ev);
+    }
+    return { keep, dropped };
+  }
+  private usageNames = new Map<string, Set<string>>();
+  private bump(day: string, kind: string, name: string, count: number, bytes: number, dropped: number) {
+    if (kind === 'event') {
+      let set = this.usageNames.get(day); if (!set) { this.usageNames.clear(); set = new Set(this.all<{ name: string }>("SELECT name FROM usage_daily WHERE day = ? AND kind = 'event'", day).map(r => r.name)); this.usageNames.set(day, set); }
+      if (!set.has(name)) { if (set.size >= 200) name = '(other)'; set.add(name); }
+    }
+    this.sql.exec('INSERT INTO usage_daily (day, kind, name, count, bytes, dropped) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(day, kind, name) DO UPDATE SET count = count + excluded.count, bytes = bytes + excluded.bytes, dropped = dropped + excluded.dropped', day, kind, name, count, bytes, dropped);
+  }
+  /** Per received day (UTC) and event name: accepted count, approximate JSON bytes, dropped count; plus capture requests (distinct receive times). */
+  private countEvents(keep: NormEvent[], dropped: NormEvent[], now: number) {
+    const agg = new Map<string, [number, number, number]>(); const reqs = new Map<string, Set<number>>();
+    const add = (ev: NormEvent, kept: boolean) => {
+      const day = dayKey(ev.received_at || now); const k = day + '\u0000' + ev.event; const a = agg.get(k) ?? [0, 0, 0];
+      if (kept) { a[0]++; a[1] += JSON.stringify(ev.properties).length + ev.event.length + ev.distinct_id.length + 80; } else a[2]++;
+      agg.set(k, a); let r = reqs.get(day); if (!r) reqs.set(day, r = new Set()); r.add(ev.received_at);
+    };
+    for (const ev of keep) add(ev, true); for (const ev of dropped) add(ev, false);
+    for (const [k, [c, b, d]] of agg) { const [day, name] = k.split('\u0000'); this.bump(day, 'event', name, c, b, d); }
+    for (const [day, r] of reqs) this.bump(day, 'requests', '', r.size, 0, 0);
+    if (this.mt) this.mt.events += keep.length;
+  }
+  private thresholdAlerts(what: 'events' | 'recordings' | 'bytes', before: number, after: number, cap: number, pid: number): Alert[] {
+    const out: Alert[] = []; const month = monthKey(Date.now());
+    const label = what === 'events' ? 'events' : what === 'recordings' ? 'session recordings' : 'replay storage';
+    const show = (n: number) => what === 'bytes' ? `${(n / 1024 ** 2).toFixed(1)} MB` : n.toLocaleString('en-US');
+    for (const t of THRESHOLDS) {
+      const line = cap * t / 100;
+      if (!(after >= line && (before < line || (cap === 0 && before === 0)))) continue;
+      const key = `alert:${month}:${what}:${t}`; if (this.one('SELECT 1 AS x FROM meta WHERE key = ?', key)) continue;
+      this.sql.exec('INSERT INTO meta (key, value) VALUES (?, ?)', key, String(Date.now()));
+      out.push({ kind: 'usage_threshold', title: t >= 100 ? `Monthly ${label} cap reached` : `${t}% of the monthly ${label} cap used`,
+        body: `${show(after)} of ${show(cap)} ${label} used in ${month} (UTC).` + (t >= 100 ? ' New data is now dropped or sampled, as set in the project settings, until the month ends or the cap is raised.' : ''), link: `/project/${pid}/usage` });
+    }
+    return out;
+  }
+  /** Writes the month's cap state to D1 when it changes, so the edge and remote config can short-cut (30 s cache). */
+  private async syncCapState(info: { pid: number; limits: Limits | null; cap_state: string | null }) {
+    const L = info.limits; const t = this.monthTotals();
+    const st = { month: t.month, events: !!L && L.events_monthly !== null && t.events >= L.events_monthly,
+      replay: !!L && ((L.replay_recordings_monthly !== null && t.recordings >= L.replay_recordings_monthly) || (L.replay_bytes_monthly !== null && t.bytes >= L.replay_bytes_monthly)) };
+    const text = JSON.stringify(st);
+    if (text === info.cap_state) return st;
+    let cur: any = null; try { cur = info.cap_state ? JSON.parse(info.cap_state) : null; } catch { /* rewrite */ }
+    if (!cur && !st.events && !st.replay) return st;
+    await this.env.DB.prepare('UPDATE projects SET cap_state = ? WHERE id = ?').bind(text, info.pid).run();
+    info.cap_state = text; return st;
+  }
+  private async afterIngest(info: Awaited<ReturnType<ProjectStore['info']>>, alerts: Alert[]) {
+    if (!info) return;
+    if (info.limits) await this.syncCapState(info);
+    for (const a of alerts) await this.raise(a, info);
+  }
+  /** Stores an alert and emails it when the instance has email set up (at most 20 alert emails per project per UTC day). */
+  private async raise(a: Alert, info: { pid: number; name: string; limits: Limits | null }) {
+    const id = this.one<{ id: number }>('INSERT INTO alerts (kind, title, body, link, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id', a.kind, a.title.slice(0, 300), a.body.slice(0, 4000), a.link, Date.now())!.id;
+    let status = 'off';
+    if (emailConfigured(this.env)) {
+      const key = 'emails:' + dayKey(Date.now()); const sent = Number(this.one<{ value: string }>('SELECT value FROM meta WHERE key = ?', key)?.value ?? 0);
+      if (sent >= 20 && a.kind !== 'test') status = 'skipped: 20 alert emails a day';
+      else {
+        const to = await recipients(this.env, info.limits?.alert_emails ?? []);
+        status = await emailAlert(this.env, info.name, a, to);
+        const n = Number(/sent to (\d+)/.exec(status)?.[1] ?? 0);
+        this.sql.exec('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?', key, String(sent + 1), String(sent + 1));
+        if (n) this.bump(dayKey(Date.now()), 'email', '', n, 0, 0);
+      }
+    }
+    this.sql.exec('UPDATE alerts SET email_status = ? WHERE id = ?', status, id);
+    return { id, email_status: status };
+  }
+  async listAlerts(limit = 50) {
+    return { results: this.all<any>('SELECT * FROM alerts ORDER BY id DESC LIMIT ?', Math.min(Math.max(limit, 1), 200)).map(r => ({ ...r, read: r.read_at !== null })),
+      unread: this.one<{ c: number }>('SELECT COUNT(*) AS c FROM alerts WHERE read_at IS NULL')!.c };
+  }
+  async markAlertsRead() { this.sql.exec('UPDATE alerts SET read_at = ? WHERE read_at IS NULL', Date.now()); return { ok: true }; }
+  async testAlert(pid: number) {
+    this.infoCache = null; const info = await this.info(pid); if (!info) return null;
+    return this.raise({ kind: 'test', title: 'Test alert', body: 'This is a test of usage and error alerts for this project.', link: `/project/${pid}/usage` }, info);
+  }
+  /** After the owner changes limits: reload them and rewrite the cap state (raising a cap lifts it at once). */
+  async refreshCaps(pid: number) { this.infoCache = null; const info = await this.info(pid); return info ? this.syncCapState(info) : null; }
+  /** Daily spike check (cron): yesterday's events over spike_factor times the average of the 7 days before. */
+  async checkSpike(pid: number, now = Date.now()) {
+    const info = await this.info(pid); if (!info) return null;
+    const L = info.limits ?? limitsOf(null); if (!L.spike_alerts) return null;
+    const y = dayKey(now - 86400_000); const from = dayKey(now - 8 * 86400_000);
+    const rows = this.all<{ day: string; c: number }>("SELECT day, SUM(count) AS c FROM usage_daily WHERE kind = 'event' AND day >= ? AND day <= ? GROUP BY day", from, y);
+    const yc = Number(rows.find(r => r.day === y)?.c ?? 0); const prev = rows.filter(r => r.day !== y).reduce((a, r) => a + Number(r.c), 0) / 7;
+    if (!(prev > 0 && yc >= 100 && yc > L.spike_factor * prev)) return null;
+    const key = 'spike:' + y; if (this.one('SELECT 1 AS x FROM meta WHERE key = ?', key)) return null;
+    this.sql.exec('INSERT INTO meta (key, value) VALUES (?, ?)', key, String(now));
+    const top = this.all<{ name: string; c: number }>("SELECT name, count AS c FROM usage_daily WHERE kind = 'event' AND day = ? ORDER BY count DESC LIMIT 3", y);
+    const a: Alert = { kind: 'usage_spike', title: `Event spike on ${y}: ${yc.toLocaleString('en-US')} events (${(yc / prev).toFixed(1)}x the 7-day average)`,
+      body: `${y} (UTC) had ${yc.toLocaleString('en-US')} events against a 7-day average of ${Math.round(prev).toLocaleString('en-US')}. Top events: ${top.map(t => `${t.name} ${Number(t.c).toLocaleString('en-US')}`).join(', ')}.`, link: `/project/${pid}/usage` };
+    return this.raise(a, info);
+  }
+  /** Usage page data: per-day counts by event name, replay, month totals against caps and the cost estimate. */
+  async usage(pid: number, days = 30, now = Date.now()) {
+    const info = await this.info(pid); const L = info?.limits ?? null;
+    const from = dayKey(now - (Math.min(Math.max(days, 1), 400) - 1) * 86400_000);
+    const rows = this.all<{ day: string; kind: string; name: string; count: number; bytes: number; dropped: number }>('SELECT * FROM usage_daily WHERE day >= ? ORDER BY day', from);
+    const t = this.monthTotals(); const month = t.month;
+    const monthRows = this.all<{ kind: string; name: string; count: number; bytes: number; dropped: number }>('SELECT kind, name, SUM(count) AS count, SUM(bytes) AS bytes, SUM(dropped) AS dropped FROM usage_daily WHERE day >= ? AND day < ? GROUP BY kind, name', month + '-01', month + '-99');
+    const sum = (k: string, n?: string, f: 'count' | 'bytes' | 'dropped' = 'count') => monthRows.filter(r => r.kind === k && (n === undefined || r.name === n)).reduce((a, r) => a + Number(r[f]), 0);
+    const st = await this.stats();
+    const r2 = this.one<{ b: number }>('SELECT COALESCE(SUM(stored), 0) AS b FROM session_recordings')!.b + this.one<{ b: number }>('SELECT COALESCE(SUM(size), 0) AS b FROM symbol_sets')!.b;
+    const d = new Date(now); const dim = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+    const elapsed = Math.max((now - Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)) / 86400_000, 1 / 24); const scale = dim / elapsed;
+    const mtd = { events: sum('event'), event_bytes: sum('event', undefined, 'bytes'), requests: sum('requests'), recordings: sum('replay', 'recordings'), replay_bytes: sum('replay', 'recordings', 'bytes'), replay_chunks: sum('replay', 'chunks'), emails: sum('email'),
+      dropped_events: sum('event', undefined, 'dropped'), dropped_replay_chunks: sum('replay', 'recordings', 'dropped') };
+    const proj = (n: number) => Math.round(n * scale);
+    const cost = estimateCost({ events: proj(mtd.events), event_bytes: proj(mtd.event_bytes), requests: proj(mtd.requests), recordings: proj(mtd.recordings), replay_bytes: proj(mtd.replay_bytes), replay_chunks: proj(mtd.replay_chunks), emails: proj(mtd.emails),
+      stored_db_bytes: st.database_bytes, stored_r2_bytes: r2, cold_tier: coldEnabled(this.env) });
+    const pct = (n: number, c: number | null | undefined) => c === null || c === undefined ? null : c === 0 ? 100 : Math.round(n / c * 1000) / 10;
+    return {
+      month, days_in_month: dim, days_elapsed: Math.round(elapsed * 10) / 10,
+      month_to_date: mtd,
+      caps: { limits: L, cap_state: info?.cap_state ? JSON.parse(info.cap_state) : null,
+        events: { used: t.events, cap: L?.events_monthly ?? null, pct: pct(t.events, L?.events_monthly) },
+        recordings: { used: t.recordings, cap: L?.replay_recordings_monthly ?? null, pct: pct(t.recordings, L?.replay_recordings_monthly) },
+        replay_bytes: { used: t.bytes, cap: L?.replay_bytes_monthly ?? null, pct: pct(t.bytes, L?.replay_bytes_monthly) } },
+      daily: rows.filter(r => r.kind === 'event').map(r => ({ day: r.day, event: r.name, count: r.count, bytes: r.bytes, dropped: r.dropped })),
+      requests: rows.filter(r => r.kind === 'requests').map(r => ({ day: r.day, count: r.count })),
+      replay: Object.values(rows.filter(r => r.kind === 'replay').reduce((a: Record<string, any>, r) => { const x = a[r.day] ??= { day: r.day, recordings: 0, bytes: 0, chunks: 0, dropped: 0 }; if (r.name === 'recordings') { x.recordings += r.count; x.bytes += r.bytes; x.dropped += r.dropped; } else if (r.name === 'chunks') x.chunks += r.count; return a; }, {})),
+      storage: { database_bytes: st.database_bytes, r2_bytes: r2 },
+      cost: { ...cost, projected_from_days: Math.round(elapsed * 10) / 10, prices: PRICES, assumptions: ASSUMPTIONS },
+      email: { configured: emailConfigured(this.env), from: emailConfigured(this.env) ? this.env.ALERT_EMAIL_FROM : null, recipients: L?.alert_emails?.length ? L.alert_emails : 'all users' },
+    };
+  }
+
+  // ---------- error tracking (design.md "Error tracking") ----------
+  private symbolList: { id: string; ref: string; path: string; r2_key: string }[] | null = null;
+  private maps = new Map<string, DecodedMap | null>();
+  private findSymbolSet(file: string) {
+    this.symbolList ??= this.all<any>('SELECT id, ref, path, r2_key FROM symbol_sets ORDER BY created_at DESC LIMIT 2000');
+    if (!this.symbolList.length) return null;
+    const ref = refOf(file); const path = pathOf(file);
+    return this.symbolList.find(x => x.ref === ref) ?? this.symbolList.find(x => x.path === path)
+      ?? this.symbolList.filter(x => path.endsWith('/' + x.path.replace(/^\/+/, '')) || x.path.endsWith('/' + path.replace(/^\/+/, ''))).sort((a, b) => b.path.length - a.path.length)[0] ?? null;
+  }
+  private async loadMap(file: string): Promise<DecodedMap | null> {
+    const set = this.findSymbolSet(file); if (!set) return null;
+    if (this.maps.has(set.id)) { const m = this.maps.get(set.id)!; this.maps.delete(set.id); this.maps.set(set.id, m); return m; }
+    let m: DecodedMap | null = null;
+    try { const o = await this.env.REPLAY.get(set.r2_key); if (o) m = decodeMap(JSON.parse(await o.text())); } catch (e) { console.error('source map', set.ref, e instanceof Error ? e.message : String(e)); }
+    this.maps.set(set.id, m); while (this.maps.size > 8) this.maps.delete(this.maps.keys().next().value!);
+    this.sql.exec('UPDATE symbol_sets SET last_used_at = ? WHERE id = ?', Date.now(), set.id);
+    return m;
+  }
+  /** Symbolicates and fingerprints exceptions (rewriting their properties) and makes sure each fingerprint has an issue row. */
+  private async prepareExceptions(evs: NormEvent[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    for (const ev of evs) {
+      let list = exceptionList(ev.properties); if (!list.length) list = [{ type: 'Error', value: String(ev.properties.$exception_message ?? 'Unknown error'), stacktrace: { frames: [] } }];
+      try { const r = await symbolicate(list, f => this.loadMap(f)); if (r.resolved) list = r.list; } catch (e) { console.error('symbolicate', e instanceof Error ? e.message : String(e)); }
+      const fp = await fingerprintOf(ev.properties, list);
+      ev.properties.$exception_list = list; ev.properties.$exception_fingerprint = fp;
+      const first = list[0] ?? {};
+      let issue = this.one<{ id: string }>('SELECT id FROM error_issues WHERE fingerprint = ?', fp)?.id;
+      if (!issue) {
+        issue = uuidv7(ev.ts); const now = Date.now();
+        this.sql.exec('INSERT OR IGNORE INTO error_issues (id, fingerprint, type, message, top_frame, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)', issue, fp, String(first.type ?? 'Error').slice(0, 200), String(first.value ?? '').slice(0, 1000), topFrame(list), now, now);
+        issue = this.one<{ id: string }>('SELECT id FROM error_issues WHERE fingerprint = ?', fp)!.id;
+      }
+      ev.properties.$exception_issue_id = issue;
+      if (!ev.properties.$exception_type && first.type) ev.properties.$exception_type = first.type;
+      if (!ev.properties.$exception_message && first.value) ev.properties.$exception_message = String(first.value).slice(0, 1000);
+      out.set(ev.uuid, issue);
+    }
+    return out;
+  }
+  /** Counts one occurrence (idempotent by event uuid); returns a new-issue or regression alert. Suppressed issues never alert. */
+  private recordOccurrence(iid: string, ev: NormEvent, pid: number): Alert | null {
+    const p = ev.properties;
+    const ins = this.sql.exec('INSERT OR IGNORE INTO error_occurrences (uuid, issue_id, ts, distinct_id, session_id, url, handled) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING uuid', ev.uuid, iid, ev.ts, ev.distinct_id,
+      typeof p.$session_id === 'string' ? p.$session_id : null, typeof p.$current_url === 'string' ? p.$current_url.slice(0, 2000) : null,
+      (exceptionList(p)[0]?.mechanism as any)?.handled === false ? 0 : 1).toArray().length;
+    if (!ins) return null;
+    const cur = this.one<any>('SELECT * FROM error_issues WHERE id = ?', iid)!;
+    const newUser = this.sql.exec('INSERT OR IGNORE INTO error_issue_users (issue_id, distinct_id) VALUES (?, ?) RETURNING issue_id', iid, ev.distinct_id).toArray().length;
+    const regressed = cur.status === 'resolved' && cur.resolved_at !== null && ev.ts > cur.resolved_at;
+    const isNew = cur.occurrences === 0;
+    const latest = cur.last_seen === null || ev.ts >= cur.last_seen;
+    this.sql.exec(`UPDATE error_issues SET occurrences = occurrences + 1, users = users + ?, first_seen = MIN(COALESCE(first_seen, ?), ?), last_seen = MAX(COALESCE(last_seen, ?), ?),
+        status = CASE WHEN ? THEN 'active' ELSE status END, regressions = regressions + ?, sample = CASE WHEN ? THEN ? ELSE sample END, sample_uuid = CASE WHEN ? THEN ? ELSE sample_uuid END, updated_at = ? WHERE id = ?`,
+      newUser, ev.ts, ev.ts, ev.ts, ev.ts, regressed ? 1 : 0, regressed ? 1 : 0, latest ? 1 : 0, JSON.stringify(p.$exception_list ?? []).slice(0, 200_000), latest ? 1 : 0, ev.uuid, Date.now(), iid);
+    if (cur.status === 'suppressed') return null;
+    const name = `${cur.type}${cur.message ? ': ' + String(cur.message).slice(0, 120) : ''}`;
+    if (isNew) return { kind: 'error_new', title: `New issue: ${name}`, body: `First seen ${new Date(ev.ts).toISOString()} for ${ev.distinct_id}${typeof p.$current_url === 'string' ? ' on ' + p.$current_url : ''}.${cur.top_frame ? '\nAt ' + cur.top_frame : ''}`, link: `/project/${pid}/errors/${iid}` };
+    if (regressed) return { kind: 'error_regression', title: `Regression: ${name}`, body: `This issue was resolved on ${new Date(cur.resolved_at).toISOString()} and happened again at ${new Date(ev.ts).toISOString()} for ${ev.distinct_id}.`, link: `/project/${pid}/errors/${iid}` };
+    return null;
+  }
+  private issueOut(r: any) {
+    return { id: r.id, fingerprint: r.fingerprint, status: r.status, type: r.type, message: r.message, top_frame: r.top_frame, first_seen: r.first_seen, last_seen: r.last_seen,
+      occurrences: r.occurrences, users: r.users, resolved_at: r.resolved_at, regressions: r.regressions };
+  }
+  async listIssues(o: { status?: string | null; search?: string | null; order?: string | null; limit?: number }) {
+    const order = o.order === 'occurrences' ? 'occurrences DESC' : o.order === 'first_seen' ? 'first_seen DESC' : o.order === 'users' ? 'users DESC' : 'last_seen DESC';
+    const status = o.status && ['active', 'resolved', 'suppressed'].includes(o.status) ? o.status : null;
+    const q = o.search ? '%' + o.search.replace(/[%_]/g, '') + '%' : null;
+    const rows = this.all<any>(`SELECT * FROM error_issues WHERE occurrences > 0 AND (? IS NULL OR status = ?) AND (? IS NULL OR type LIKE ? OR message LIKE ? OR top_frame LIKE ?) ORDER BY ${order} LIMIT ?`,
+      status, status, q, q, q, q, Math.min(Math.max(o.limit ?? 100, 1), 500));
+    const since = Date.now() - 14 * 86400_000;
+    const spark = new Map<string, number[]>();
+    for (const r of this.all<{ issue_id: string; d: number; c: number }>(`SELECT issue_id, CAST((ts - ?) / 86400000 AS INTEGER) AS d, COUNT(*) AS c FROM error_occurrences WHERE ts >= ? AND issue_id IN (SELECT value FROM json_each(?)) GROUP BY issue_id, d`, since, since, JSON.stringify(rows.map(r => r.id)))) {
+      const a = spark.get(r.issue_id) ?? Array(14).fill(0); if (r.d >= 0 && r.d < 14) a[r.d] = r.c; spark.set(r.issue_id, a);
+    }
+    const counts = Object.fromEntries(this.all<{ status: string; c: number }>('SELECT status, COUNT(*) AS c FROM error_issues WHERE occurrences > 0 GROUP BY status').map(r => [r.status, r.c]));
+    return { results: rows.map(r => ({ ...this.issueOut(r), last_14_days: spark.get(r.id) ?? Array(14).fill(0) })), counts };
+  }
+  async getIssue(id: string) {
+    const r = this.one<any>('SELECT * FROM error_issues WHERE id = ?', id); if (!r) return null;
+    const occ = this.all<any>('SELECT * FROM error_occurrences WHERE issue_id = ? ORDER BY ts DESC LIMIT 50', id);
+    const people = this.engine().resolve([...new Set(occ.map(o => o.distinct_id))]);
+    const sids = [...new Set(occ.map(o => o.session_id).filter(Boolean))];
+    const recs = new Set(this.all<{ s: string }>('SELECT session_id AS s FROM session_recordings WHERE session_id IN (SELECT value FROM json_each(?))', JSON.stringify(sids)).map(x => x.s));
+    const since = Date.now() - 30 * 86400_000;
+    const daily = this.all<{ d: string; c: number }>(`SELECT strftime('%Y-%m-%d', ts / 1000, 'unixepoch') AS d, COUNT(*) AS c FROM error_occurrences WHERE issue_id = ? AND ts >= ? GROUP BY d ORDER BY d`, id, since);
+    let exception: unknown = []; try { exception = r.sample ? JSON.parse(r.sample) : []; } catch { /* keep empty */ }
+    return { ...this.issueOut(r), exception_list: exception, sample_event_uuid: r.sample_uuid, daily,
+      occurrences_list: occ.map(o => { const ref = people.get(o.distinct_id); return { uuid: o.uuid, timestamp: o.ts, distinct_id: o.distinct_id, session_id: o.session_id, url: o.url, handled: o.handled === null ? null : !!o.handled,
+        person: ref?.uuid ? { id: ref.uuid, name: (ref.props.email ?? ref.props.name ?? o.distinct_id) as string } : null, has_recording: !!o.session_id && recs.has(o.session_id) }; }) };
+  }
+  async updateIssue(id: string, b: any) {
+    const r = this.one<any>('SELECT * FROM error_issues WHERE id = ?', id); if (!r) return null;
+    if (b.status !== undefined) {
+      if (!['active', 'resolved', 'suppressed'].includes(b.status)) return { error: "status must be 'active', 'resolved' or 'suppressed'" };
+      this.sql.exec('UPDATE error_issues SET status = ?, resolved_at = ?, updated_at = ? WHERE id = ?', b.status, b.status === 'resolved' ? Date.now() : null, Date.now(), id);
+    }
+    return this.issueOut(this.one<any>('SELECT * FROM error_issues WHERE id = ?', id));
+  }
+  async addSymbolSet(ref: string, r2Key: string, size: number): Promise<{ id: string; replaced: string | null }> {
+    const old = this.one<{ r2_key: string }>('SELECT r2_key FROM symbol_sets WHERE ref = ?', ref);
+    const id = uuidv7();
+    this.sql.exec('INSERT INTO symbol_sets (id, ref, path, r2_key, size, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(ref) DO UPDATE SET id = excluded.id, path = excluded.path, r2_key = excluded.r2_key, size = excluded.size, created_at = excluded.created_at, last_used_at = NULL',
+      id, ref, pathOf(ref), r2Key, size, Date.now());
+    this.symbolList = null; this.maps.clear();
+    return { id, replaced: old && old.r2_key !== r2Key ? old.r2_key : null };
+  }
+  async listSymbolSets() { return this.all<any>('SELECT id, ref, path, size, created_at, last_used_at FROM symbol_sets ORDER BY created_at DESC'); }
+  async deleteSymbolSet(id: string): Promise<string | null> {
+    const r = this.one<{ r2_key: string }>('DELETE FROM symbol_sets WHERE id = ? RETURNING r2_key', id); this.symbolList = null; this.maps.clear(); return r?.r2_key ?? null;
   }
 
   private define(ev: NormEvent) {
@@ -602,16 +905,38 @@ export class ProjectStore extends DurableObject<Env> {
   async surveyResults(id: string, iteration: number | null = null) { const r = this.one<any>('SELECT * FROM surveys WHERE id = ?', id); return r ? surveyResults(this.engine(), this.surveyRow(r), { iteration }) : null; }
 
   // ---------- session recordings ----------
-  async recordReplay(metas: import('./replay').ReplayMeta[]) {
-    const now = Date.now();
+  /**
+   * Upserts recording metadata. Past a replay cap (recordings or stored bytes per UTC month) a chunk is refused unless
+   * over_cap is 'sample' and its session is in the sample; refused chunks' R2 keys are returned for the caller to delete.
+   */
+  async recordReplay(metas: import('./replay').ReplayMeta[], pid?: number): Promise<{ rejected: string[] }> {
+    const now = Date.now(); const info = await this.info(pid); const L = info?.limits ?? null;
+    const t0 = { ...this.monthTotals() }; const rejected: string[] = []; const alerts: Alert[] = [];
     this.ctx.storage.transactionSync(() => {
-      for (const m of metas) this.sql.exec(`INSERT INTO session_recordings (session_id, distinct_id, start_ts, end_ts, click_count, keypress_count, console_error_count, first_url, size, chunks, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET start_ts = MIN(start_ts, excluded.start_ts), end_ts = MAX(end_ts, excluded.end_ts),
+      const t = this.monthTotals();
+      for (const m of metas) {
+        const exists = !!this.one('SELECT 1 AS x FROM session_recordings WHERE session_id = ?', m.session_id);
+        const capped = !!L && ((L.replay_recordings_monthly !== null && t.recordings >= L.replay_recordings_monthly && !exists) || (L.replay_bytes_monthly !== null && t.bytes >= L.replay_bytes_monthly));
+        const day = dayKey(now);
+        if (capped && !(L!.over_cap === 'sample' && sampled('cap:' + m.session_id, L!.over_cap_sample_rate))) { if (m.key) rejected.push(m.key); this.bump(day, 'replay', 'recordings', 0, 0, 1); continue; }
+        this.sql.exec(`INSERT INTO session_recordings (session_id, distinct_id, start_ts, end_ts, click_count, keypress_count, console_error_count, first_url, size, chunks, created_at, stored)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET start_ts = MIN(start_ts, excluded.start_ts), end_ts = MAX(end_ts, excluded.end_ts),
           click_count = click_count + excluded.click_count, keypress_count = keypress_count + excluded.keypress_count, console_error_count = console_error_count + excluded.console_error_count,
           first_url = CASE WHEN excluded.start_ts < start_ts OR first_url IS NULL THEN COALESCE(excluded.first_url, first_url) ELSE first_url END,
-          distinct_id = CASE WHEN distinct_id = '' THEN excluded.distinct_id ELSE distinct_id END, size = size + excluded.size, chunks = chunks + excluded.chunks`,
-        m.session_id, m.distinct_id, m.start_ts, m.end_ts, m.clicks, m.keypresses, m.console_errors, m.first_url, m.size, m.chunks, now);
+          distinct_id = CASE WHEN distinct_id = '' THEN excluded.distinct_id ELSE distinct_id END, size = size + excluded.size, chunks = chunks + excluded.chunks, stored = stored + excluded.stored`,
+        m.session_id, m.distinct_id, m.start_ts, m.end_ts, m.clicks, m.keypresses, m.console_errors, m.first_url, m.size, m.chunks, now, m.stored ?? 0);
+        const stored = m.stored ?? 0;
+        this.bump(day, 'replay', 'recordings', exists ? 0 : 1, stored, 0); this.bump(day, 'replay', 'chunks', m.chunks, 0, 0);
+        if (!exists) t.recordings++; t.bytes += stored;
+      }
     });
+    if (info && L) {
+      const t = this.monthTotals();
+      if (L.replay_recordings_monthly !== null) alerts.push(...this.thresholdAlerts('recordings', t0.recordings, t.recordings, L.replay_recordings_monthly, info.pid));
+      if (L.replay_bytes_monthly !== null) alerts.push(...this.thresholdAlerts('bytes', t0.bytes, t.bytes, L.replay_bytes_monthly, info.pid));
+    }
+    await this.afterIngest(info, alerts);
+    return { rejected };
   }
   private recordingOut(r: any, ref?: PersonRef) {
     return { id: r.session_id, distinct_id: r.distinct_id, start_time: new Date(r.start_ts).toISOString(), end_time: new Date(r.end_ts).toISOString(),
@@ -868,6 +1193,8 @@ export class ProjectStore extends DurableObject<Env> {
       else { const n = await st.purge(beforeMs); total += n; this.sql.exec('UPDATE shards SET events = MAX(0, events - ?) WHERE key = ?', n, r.key); }
     }
     this.sql.exec('DELETE FROM ingest_log WHERE at < ?', Date.now() - 7 * 86400_000);
+    this.sql.exec('DELETE FROM error_occurrences WHERE ts < ?', beforeMs);
+    this.sql.exec('DELETE FROM usage_daily WHERE day < ?', dayKey(Date.now() - 400 * 86400_000));
     return total;
   }
   async destroy() {

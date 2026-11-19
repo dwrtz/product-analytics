@@ -110,3 +110,29 @@ Work in this order. Finish each check before the next task.
     "ingest-only hostnames" HTTP tests (preflight, capture, `/flags`,
     `/_health`, page redirect, 421 on a cookie write; an unlisted host
     serves the full app).
+
+0.5 (after 1-29):
+
+30. **Usage limits and sampling (R30).** D1 `0004_v05.sql`;
+    `worker/usage.ts` (limits, `gateEvents`, cap state), `shared/sample.ts`;
+    store `applyEventCap`, `usage_daily`, `syncCapState`, replay caps with
+    chunk deletion; `quota_limited` on capture and `/s/`; remote config
+    switches. Check: the caps tests in `tests/v05.test.ts`.
+31. **Usage screen and cost estimate (R30).** `store.usage()`,
+    `estimateCost()` with list prices, the Usage screen and Settings form.
+    Check: usage tests; e2e "usage page".
+32. **Alerts (R30).** `alerts` table, thresholds, daily spike in the cron,
+    `worker/alerts.ts` with the optional `EMAIL` binding and
+    `ALERT_EMAIL_FROM`; unread badge. Check: alert tests (stub binding).
+33. **Error tracking (R28).** `worker/errors.ts` (exception list,
+    fingerprint), issue tables, `recordOccurrence`, issues API, screens,
+    remote config `autocaptureExceptions`. Check: error tests with the REA
+    fixtures (`tests/fixtures/v05-errors.json`, recorder in
+    `research.md`); e2e exception checks.
+34. **Source maps (R29).** `shared/sourcemap.ts`, symbol set upload/list/
+    delete, symbolication at ingest, `scripts/upload-sourcemaps.mjs`.
+    Check: vectors "source_maps", HTTP upload test, `scripts/shots-05.mjs`.
+35. **Upgrade a deployment.** Apply `0004_v05.sql` (additive; existing
+    projects keep no limits and exception autocapture off), deploy. For
+    email alerts add the `send_email` binding and `ALERT_EMAIL_FROM` on a
+    sender domain onboarded to Email Sending.
