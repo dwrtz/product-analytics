@@ -185,8 +185,10 @@ committed. Vars:
 | `SHARD_PERIOD` | `month` (default) or `day`; read once per project. For tests. |
 
 Crons: `17 3 * * *` purges by retention; `41 * * * *` (0.3) recalculates
-dynamic cohorts. An optional `COLD_STREAM` binding (a Basin stream, see
-"Cold tier") is used when present. There are no secrets.
+dynamic cohorts. The optional cold tier (0.4, "Cold tier") adds a
+`COLD_STREAM` pipelines binding, vars `BASIN_ACCOUNT_ID`, `BASIN_BUCKET`,
+`BASIN_TABLE` (default `analytics.events`) and one secret, `BASIN_TOKEN`.
+Without them there are no secrets.
 
 ## Deploy
 
@@ -780,7 +782,7 @@ to be best" across more than two variants directly. No PostHog code or
   seen in two months counts twice.
 - Cohort membership of behavioural cohorts is as of the last calculation
   (at most an hour old, or on demand); property-only cohorts are live.
-- No data warehouse, exports or cold tier (see "Cold tier").
+- No data warehouse or exports; the cold tier is reachable from SQL only (see "Cold tier").
 
 ## Actions (`shared/actions.ts`, `shared/elements.ts`)
 
@@ -905,15 +907,66 @@ to be best" across more than two variants directly. No PostHog code or
   distinct ids) and sums the per-step counts, conversion times and
   breakdowns. Experiments use the same path.
 
-## Cold tier (Basin; not enabled)
+## Cold tier (Basin; `worker/cold.ts`, 0.4)
 
-- Plan: export events past a hot window to an R2 Iceberg table through a
-  Basin pipeline and query old ranges with Basin SQL. The queue consumer
-  already sends `{project_id, uuid, event, distinct_id, timestamp,
-  properties}` to an optional `COLD_STREAM` binding when one is
-  configured, so a Basin stream can be attached without code changes.
-- Not enabled in the reference deploy: a Basin Catalog sink needs an R2
-  catalog token with R2 admin read/write, an R2 sink needs R2 S3
-  credentials, and querying needs an API token with Basin SQL, Catalog and
-  R2 read; none of these come from the deploy token. Until then events stay
-  in shards and `retention_days` bounds them.
+Optional. A full, append-only copy of every event in an Apache Iceberg
+table in R2, for cheap long-term storage and warehouse-style SQL.
+
+- Write path: after `store.ingest`, the queue consumer calls
+  `COLD_STREAM.send(records)` with one record per event:
+  `project_id` int64, `uuid`, `event`, `distinct_id` strings, `timestamp`
+  (RFC 3339, the event time), `ts` int64 (the same time in epoch ms) and
+  `properties` (JSON string). If the send throws, the batch is retried;
+  the head's `ingest_log` keeps the hot side exact, so the cold copy is at
+  least once (a retried batch can appear twice).
+- Basin setup (operator, once): an R2 bucket with Basin Catalog enabled;
+  a stream with that schema, Worker binding on and HTTP off; a Basin
+  Catalog sink (Parquet, zstd, roll interval 60 s) to `namespace.table`;
+  a pipeline `INSERT INTO <sink> SELECT * FROM <stream>`; catalog
+  compaction and snapshot expiration on. The sink adds `__ingest_ts` and
+  partitions by its day.
+- One API token serves the sink, the catalog's maintenance credential and
+  the Worker's `BASIN_TOKEN`: Workers R2 Data Catalog Write and Workers R2
+  SQL Read on the account, and Workers R2 Storage Bucket Item Write on the
+  cold bucket only. (A token whose every group is scoped to the bucket is
+  refused by the sink with code 1012.)
+- Read path: the SQL editor's "Cold" source. `sqlquery.ts` parses and
+  resolves the query (`prepareSelect`, shared with the hot engine);
+  `compileCold` turns the AST into one DataFusion-dialect statement over
+  `BASIN_TABLE`:
+  - every select item becomes `<expr> AS cN` and is mapped back to its
+    name; `LIMIT` is sent as limit + 1 to report `hasMore`;
+  - `timestamp` maps to `ts`, so datetimes are epoch ms exactly as in the
+    hot engine (results typed DateTime come back as ISO strings);
+  - `properties.a.b` is `json_get_str(properties, 'a', 'b')`, or
+    `json_get_float` where a number is expected (arithmetic, `sum`/`avg`,
+    comparison with a number);
+  - functions map to DataFusion (`uniq` → `approx_distinct`,
+    `uniqExact` → `COUNT(DISTINCT)`, `countIf`/`sumIf` → `SUM(CASE …)`,
+    `toStartOfWeek` keeps Sunday weeks, `toStartOfMonth` via
+    `date_trunc`); `ILIKE` is `lower(a) LIKE lower(b)`;
+  - strings and property keys are quoted literals; identifiers come only
+    from the fixed column set, so nothing typed is passed through;
+  - the WHERE clause always starts with `project_id = <id>` and, when
+    `retention_days > 0`, `timestamp >= to_timestamp_millis(cutoff) AND
+    ts >= cutoff`; the user's condition is ANDed after them in
+    parentheses. `project_id` is not a user-visible column.
+- The Worker POSTs `{warehouse, query}` to
+  `https://api.sql.cloudflarestorage.com/api/v1/accounts/<BASIN_ACCOUNT_ID>/basin-sql/query/<BASIN_BUCKET>`
+  with `Authorization: Bearer <BASIN_TOKEN>`; the answer is
+  `{success, errors, result: {schema, rows: [{cN: value}], metrics:
+  {bytes_scanned, files_scanned}}}`. Errors become 400 `invalid_query`
+  (`Basin SQL: …`); a missing table (before the first roll) is an empty
+  result. 25 s timeout, 10,000 rows.
+- Retention: the hot shards are purged daily as before; cold rows are
+  filtered out of every cold query once older than the project's
+  retention. Basin SQL cannot delete, so the Iceberg files are not
+  rewritten by the app. Physically removing old rows (or a deleted
+  project's rows) needs an Iceberg engine (`DELETE FROM … WHERE ts <
+  cutoff`, then snapshot expiration). Project ids are never reused
+  (`AUTOINCREMENT`), so a deleted project's rows are unreachable.
+- Not in 0.4: insights over the cold tier, a hot window shorter than
+  retention (the shards stay the source for every screen).
+- Costs: stream ingress is free; sink output, Basin SQL scans and R2
+  storage are billed by usage beyond the Workers Paid inclusions.
+

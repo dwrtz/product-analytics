@@ -249,8 +249,9 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
 - **SQL** is a subset with SQLite semantics (UTC times, case-insensitive
   `LIKE`), not HogQL; queries that need joins are out of scope.
 - **Heatmap unique visitors** add per-month distinct counts.
-- **Cold tier** not enabled: Basin needs credentials the deploy token
-  does not have (`design.md`, "Cold tier").
+- **Cold tier** (0.4): enabled on the reference deploy. A token scoped only
+  to the bucket was refused by the sink (code 1012) and needed the catalog
+  and SQL groups on the account (`design.md`, "Cold tier").
 - Not studied: web analytics, the data warehouse, the toolbar.
 
 ## Licensing
@@ -307,5 +308,5 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
 - Funnels stream in person batches instead of loading all rows.
 - Heatmap backgrounds are the live page in a sandboxed frame or a
   recording's first full snapshot; no server-side screenshots.
-- Basin cold tier: export hook only (needs operator-created Basin and R2
+- Basin cold tier (0.4): stream binding, Iceberg sink, Basin SQL queries from the SQL editor (was: export hook only; needed operator-created Basin and R2
   credentials).

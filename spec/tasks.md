@@ -91,3 +91,16 @@ Work in this order. Finish each check before the next task.
 26. **Upgrade a deployment.** Apply `0003_v03.sql`, deploy (adds the
     hourly cron). Existing data needs no migration.
 
+0.4 (after 1-26):
+
+27. **Cold tier (R27).** `worker/cold.ts` (records, `compileCold`,
+    `buildColdQuery`, `basinSql`), `prepareSelect` shared from
+    `sqlquery.ts`, `source: "cold"` on `/sql`, `cold_tier` in
+    `/api/config`, the source picker on the SQL screen. Check:
+    `tests/cold.test.ts`.
+28. **Basin setup and deploy.** Bucket with Basin Catalog, stream (schema
+    in `design.md` "Cold tier"), the one token, sink, pipeline, catalog
+    maintenance; `COLD_STREAM` binding, `BASIN_*` vars and the
+    `BASIN_TOKEN` secret (keep secrets on later uploads). Check: send
+    events, wait about two minutes, and a cold SQL query returns them
+    while an event older than the retention period is excluded.

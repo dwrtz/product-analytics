@@ -1,4 +1,5 @@
 // Worker entry: routing, the ingest queue consumer and the daily retention cron (spec R1).
+import { coldRecord } from './cold';
 import { Env, HttpError, IngestMsg, json, storeFor, ProjectRow } from './env';
 import { handleLegacyCapture, handleV1Capture, LEGACY_PATHS, V1_PATH, cors } from './capture';
 import { handleConfig, handleFlags, handleStub, handleSurveys, handleLocalEvaluation } from './sdk';
@@ -60,7 +61,8 @@ export default {
         const store = storeFor(env, pid);
         const events = msgs.flatMap(m => m.body.events ?? []); const replay = msgs.flatMap(m => m.body.replay ?? []);
         if (events.length) await store.ingest(events);
-        if (events.length && env.COLD_STREAM) await env.COLD_STREAM.send(events.map(e => ({ project_id: pid, uuid: e.uuid, event: e.event, distinct_id: e.distinct_id, timestamp: new Date(e.ts).toISOString(), properties: JSON.stringify(e.properties) })));
+        // Cold tier: at-least-once copy of every event into the Basin stream (design.md "Cold tier").
+        if (events.length && env.COLD_STREAM) await env.COLD_STREAM.send(events.map(e => coldRecord(pid, e)));
         if (replay.length) await store.recordReplay(replay);
         msgs.forEach(m => m.ack());
       }

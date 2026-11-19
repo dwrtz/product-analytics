@@ -12,7 +12,7 @@ insights, pin them to dashboards, manage feature flags (also evaluated
 locally by posthog-node), watch session recordings with their console and
 network logs, see click heatmaps and scroll depth, define actions and
 cohorts and use them everywhere filters go, query events with read-only
-SQL, run A/B experiments on multivariate flags and run targeted surveys that
+SQL (optionally over a Basin / R2 Iceberg cold tier), run A/B experiments on multivariate flags and run targeted surveys that
 posthog-js shows to visitors.
 
 Every deploy is one *instance* on one domain. An instance holds one or more
@@ -66,7 +66,7 @@ unknown; it is context, not extra requirements.
   own, short and plain. Icons are inline SVG or text; no images or fonts are
   copied from anywhere.
 
-## Out of scope for 0.3
+## Out of scope for 0.4
 
 - Web experiments, product tours, early access features, error tracking,
   logs, LLM analytics, data warehouse, CDP destinations and notebooks. The
@@ -90,8 +90,10 @@ unknown; it is context, not extra requirements.
   HogQL language; the editor takes the subset in `design.md` ("SQL").
 - Feature flags: flag-dependency conditions, group-aggregated flags,
   encrypted payloads, remote config flags.
-- A cold tier for old events (Basin / R2 Iceberg): the export hook exists
-  (`design.md`, "Cold tier") but needs operator-created Basin credentials.
+- Cold tier (R27): insights, funnels and the other screens read the hot
+  shards only; cold data is reached through the SQL editor. Rows in the
+  Iceberg table are not physically deleted by the app (Basin SQL is
+  read-only); retention is enforced in every cold query.
 - Per-project permissions, organizations, invitations, SSO, billing.
 - Ingestion transformations, plugins, webhooks, GeoIP lookups beyond what
   Cloudflare puts on the request.
@@ -551,6 +553,32 @@ Check: the remote config test maps every setting to posthog-js's fields;
 the streamed-funnel test gives the same result with a batch size of 3 as
 in one pass; the e2e finds console and network plugin events and the
 console panel.
+
+### R27. Cold tier (optional; Basin)
+
+- When the instance has a `COLD_STREAM` binding (a Basin Pipelines stream)
+  the queue consumer also sends every ingested event to it as
+  `{project_id, uuid, event, distinct_id, timestamp, ts, properties}`
+  (`timestamp` RFC 3339, `ts` epoch ms, `properties` a JSON string). A
+  pipeline writes them to an Apache Iceberg table in R2 (Basin Catalog,
+  default `analytics.events`). Delivery is at least once.
+- With `BASIN_TOKEN`, `BASIN_ACCOUNT_ID` and `BASIN_BUCKET` also set,
+  `GET /api/config` reports `cold_tier: true` and
+  `POST /api/projects/:id/sql` with `"source": "cold"` runs the R22 query
+  language against that table through Basin SQL: the same AST is compiled
+  to one Basin SQL statement (`design.md`, "Cold tier"). The compiler
+  always adds `project_id = <project>` and, when the project has a
+  retention period, `timestamp >= now - retention_days`, so a project
+  never sees another project's rows or rows past its retention. `persons`
+  and person columns are a 400 on the cold source. The response is the
+  R22 shape plus `source: "cold"` and `scanned: {bytes, files}`.
+- The SQL screen shows a Hot / Cold source picker only when `cold_tier`
+  is true. Without the bindings nothing changes.
+
+Check: `tests/cold.test.ts` (forced filters, quoting, numeric property
+access, week start, rejections); a live run sends events, waits for the
+pipeline (about two minutes with a 60 s roll) and finds them with a cold
+query, with an event older than the retention period excluded.
 
 ## Definition of done
 

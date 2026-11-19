@@ -18,6 +18,13 @@ export interface Env {
   REPLAY_RETENTION_DAYS?: string;
   /** Optional Basin Pipelines stream (cold tier, design.md "Cold tier"); every ingested event is also sent here. */
   COLD_STREAM?: { send(records: unknown[]): Promise<void> };
+  /** Cold-tier queries (Basin SQL): an API token secret with Basin SQL read, Basin Catalog and R2 access to BASIN_BUCKET. */
+  BASIN_TOKEN?: string;
+  BASIN_ACCOUNT_ID?: string;
+  /** R2 bucket with Basin Catalog enabled that the pipeline's Iceberg sink writes to. */
+  BASIN_BUCKET?: string;
+  /** Iceberg table as namespace.table (default analytics.events). */
+  BASIN_TABLE?: string;
 }
 /** One queue message: events for one project, already normalized by the capture endpoint. */
 export type IngestMsg = { pid: number; events?: NormEvent[]; replay?: import('./replay').ReplayMeta[] };

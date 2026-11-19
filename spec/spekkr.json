@@ -2,7 +2,7 @@
   "spekkr": 1,
   "id": "dwrtz/product-analytics",
   "name": "Product Analytics",
-  "summary": "Self-hosted product analytics on Cloudflare for posthog-js: insights, flags, replay, heatmaps, cohorts, SQL, experiments, surveys.",
+  "summary": "Self-hosted posthog-js analytics on Cloudflare: insights, flags, replay, heatmaps, cohorts, SQL, experiments, surveys, Iceberg cold tier.",
   "kind": "web app",
   "keywords": [
     "product analytics",
@@ -14,11 +14,11 @@
     "experiments",
     "surveys",
     "feature flags",
-    "funnels",
+    "iceberg cold tier",
     "self-hosted",
     "cloudflare workers"
   ],
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": {
     "id": "dwrtz",
     "name": "David Wurtz"
@@ -35,6 +35,7 @@
       "Cloudflare D1",
       "Cloudflare Queues",
       "Cloudflare R2",
+      "Cloudflare Basin (Pipelines, Catalog, SQL)",
       "Wrangler",
       "lz-string",
       "posthog-js",
@@ -64,7 +65,7 @@
   "files": [
     {
       "path": "spec.md",
-      "about": "Requirements R1-R26 (0.2: event shards, replay, experiments, surveys; 0.3: actions, cohorts, heatmaps, SQL, local evaluation, continuity, survey targeting, replay settings, no row limits) with acceptance checks, scope and definition of done."
+      "about": "Requirements R1-R27 (0.2: event shards, replay, experiments, surveys; 0.3: actions, cohorts, heatmaps, SQL, local evaluation, continuity, survey targeting, replay settings, no row limits; 0.4: optional Basin / Iceberg cold tier queried from SQL) with acceptance checks, scope and definition of done."
     },
     {
       "path": "protocol.md",
@@ -76,7 +77,7 @@
     },
     {
       "path": "design.md",
-      "about": "Stack, storage and event-shard decisions, Cloudflare config, deploy and upgrade, data model, ingestion, query semantics, actions, cohorts, SQL, heatmaps, streaming funnels, replay, experiment statistics, surveys, owner API, screens, tests, limits and the cold-tier plan."
+      "about": "Stack, storage and event-shard decisions, Cloudflare config, deploy and upgrade, data model, ingestion, query semantics, actions, cohorts, SQL, heatmaps, streaming funnels, replay, experiment statistics, surveys, owner API, screens, tests, limits and the Basin cold tier (stream, Iceberg sink, Basin SQL compiler, retention)."
     },
     {
       "path": "tasks.md",
@@ -84,7 +85,7 @@
     },
     {
       "path": "research.md",
-      "about": "How the protocol was established with REA (0.1-0.3 captures and conformance runs), evidence and obligation ledgers, unknowns, licensing and choices."
+      "about": "How the protocol was established with REA (0.1-0.3 captures, 0.4 Basin findings, and conformance runs), evidence and obligation ledgers, unknowns, licensing and choices."
     }
   ],
   "needs": {
@@ -106,6 +107,11 @@
   },
   "lineage": {},
   "changelog": [
+    {
+      "version": "0.4.0",
+      "date": "2026-11-19",
+      "note": "Optional cold tier on Cloudflare Basin: every ingested event is also streamed through a Basin Pipelines Worker binding into an Apache Iceberg table in R2 (Basin Catalog), and the SQL editor gains a Cold source that compiles the same query language to Basin SQL with the project and retention filters always applied. Off unless the COLD_STREAM binding, BASIN_* vars and BASIN_TOKEN secret are set; upgrades a 0.3 instance in place (no D1 migration)."
+    },
     {
       "version": "0.3.0",
       "date": "2026-11-18",
@@ -137,7 +143,7 @@
       "shots/survey-results.png",
       "shots03/heatmap-clicks.png",
       "shots03/cohort-edit.png",
-      "shots03/sql.png",
+      "shots04/sql-cold.png",
       "shots03/replay-console-network.png",
       "shots03/action-edit.png",
       "shots03/survey-targeting.png"

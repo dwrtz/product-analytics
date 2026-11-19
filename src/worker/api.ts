@@ -6,6 +6,7 @@ import { forgetToken } from './projects';
 import { QueryError } from './query';
 import { chunkPrefix, deletePrefix, readSnapshots, readSnapshotsPage, cleanReplayConfig, ReplayConfigError } from './replay';
 import { handleLocalEvaluation } from './sdk';
+import { coldEnabled, runColdSql } from './cold';
 
 const readJson = async (req: Request) => { try { return await req.json() as any; } catch { throw new HttpError(400, 'bad_request', 'Body must be JSON.'); } };
 const validTz = (tz: string) => { try { new Intl.DateTimeFormat('en', { timeZone: tz }); return true; } catch { return false; } };
@@ -13,7 +14,7 @@ const validTz = (tz: string) => { try { new Intl.DateTimeFormat('en', { timeZone
 export async function handleApi(req: Request, env: Env, url: URL, appName: string): Promise<Response> {
   const path = url.pathname.replace(/\/+$/, '');
   const m = req.method;
-  if (path === '/api/config' && m === 'GET') return json({ app_name: appName, site_url: origin(env), signup_open: await signupOpen(env) });
+  if (path === '/api/config' && m === 'GET') return json({ app_name: appName, site_url: origin(env), signup_open: await signupOpen(env), cold_tier: coldEnabled(env) });
   const cookieAuthWrite = m !== 'GET' && m !== 'HEAD' && !req.headers.get('authorization');
   if (cookieAuthWrite && req.headers.get('origin') !== origin(env)) throw new HttpError(403, 'bad_origin', 'Origin does not match SITE_URL.');
   if (path === '/api/signup' && m === 'POST') { const r = await signup(env, await readJson(req)); return json({ ok: true }, 201, { 'set-cookie': r.cookie }); }
@@ -85,6 +86,7 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
   // SQL editor (design.md "SQL"): read-only SELECT over events and persons.
   if (sub === '/sql' && m === 'POST') {
     const b = await readJson(req); if (typeof b.query !== 'string' || !b.query.trim()) throw new HttpError(400, 'bad_request', 'query (a SELECT statement) is required.');
+    if (b.source === 'cold') { try { return json(await runColdSql(env, b.query, { projectId: pid, retentionDays: project.retention_days })); } catch (e) { return asQueryError(e); } }
     try { return json(await store.sqlQuery(b.query, qc)); } catch (e) { return asQueryError(e); }
   }
   if ((sub === '/heatmaps' || sub === '/heatmaps/urls' || sub === '/scroll_depth') && m === 'GET') {

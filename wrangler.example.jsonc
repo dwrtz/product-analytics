@@ -15,6 +15,9 @@
   },
   "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
   "vars": { "SITE_URL": "http://localhost:8787", "ALLOWED_EMAILS": "", "DEFAULT_RETENTION_DAYS": "0" },
+  // Optional cold tier (design.md "Cold tier"): a Basin Pipelines stream writing an Iceberg table, queried with Basin SQL.
+  // Add the binding plus BASIN_ACCOUNT_ID / BASIN_BUCKET / BASIN_TABLE vars and `wrangler secret put BASIN_TOKEN`.
+  // "pipelines": [{ "binding": "COLD_STREAM", "stream": "<stream id>" }],
   "triggers": { "crons": ["17 3 * * *", "41 * * * *"] },
   "observability": { "enabled": true }
 }

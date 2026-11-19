@@ -463,7 +463,9 @@ export async function runSql(host: SqlHost, src: string, qc: { timezone: string;
   return Promise.race([execute(host, src, qc.now ?? Date.now()), timer]);
 }
 
-async function execute(host: SqlHost, src: string, now: number): Promise<SqlResult> {
+/** Parses and resolves a query: `*` expanded, positions/aliases substituted, date literals normalized. Shared with the
+ * cold tier (cold.ts), which compiles the same AST to Basin SQL. */
+export function prepareSelect(src: string) {
   let sel = parse(src);
   const star: Item[] = sel.from === 'events'
     ? ['uuid', 'event', 'distinct_id', 'timestamp', 'properties'].map(n => ({ e: { k: 'col', table: 'event', name: n } as Expr, name: n }))
@@ -476,6 +478,13 @@ async function execute(host: SqlHost, src: string, now: number): Promise<SqlResu
   const aggregate = sel.groupBy.length > 0 || items.some(i => hasAgg(i.e)) || (sel.having !== null) || sel.orderBy.some(o => hasAgg(o.e));
   for (const g of sel.groupBy) if (hasAgg(g)) throw new QueryError('aggregates are not allowed in GROUP BY');
   const types = items.map(i => isDt(i.e) ? 'DateTime' : 'String');
+  return { sel, items, types, aggregate };
+}
+export { hasAgg, isDt, walk, AGGS };
+export type { Item };
+
+async function execute(host: SqlHost, src: string, now: number): Promise<SqlResult> {
+  const { sel, items, types, aggregate } = prepareSelect(src);
   const out = (rows: unknown[][], more: boolean): SqlResult => ({ columns: items.map(i => i.name), types, results: rows.map(r => r.map((v, k) => types[k] === 'DateTime' && typeof v === 'number' ? new Date(v).toISOString() : v)), hasMore: more, limit: sel.limit, offset: sel.offset });
   const aggs: AggSpec[] = [];
   const collect = (e: Expr) => walk(e, x => { if (isAgg(x) && !aggs.some(a => same(a.e, x))) { const a: AggSpec = { e: x as AggSpec['e'], kind: aggKind(x as AggSpec['e']) }; checkAggArgs(a); aggs.push(a); } });

@@ -1025,12 +1025,18 @@ async function sqlPage() {
   const ta = h('textarea', { class: 'sql mono', rows: 10, spellcheck: false, 'aria-label': 'SQL query' }, saved) as HTMLTextAreaElement;
   const out = h('div', { class: 'result' }); const err = errBox(); const meta = h('p', { class: 'muted small' });
   const btn = h('button', { class: 'primary', type: 'button' }, 'Run') as HTMLButtonElement;
+  // Cold tier (Basin SQL over the Iceberg copy of all events) when the instance has one configured.
+  const cfg = await api<{ cold_tier?: boolean }>('/api/config').catch(() => ({ cold_tier: false }));
+  const srcSel = h('select', { 'aria-label': 'Data source', onchange: () => sessionStorage.setItem(`sqlsrc:${pid}`, srcSel.value) },
+    opt('hot', 'Hot: event shards + persons', sessionStorage.getItem(`sqlsrc:${pid}`) ?? 'hot'), opt('cold', 'Cold: Iceberg via Basin SQL (events only)', sessionStorage.getItem(`sqlsrc:${pid}`) ?? 'hot')) as HTMLSelectElement;
   const run = busy(btn, async () => {
     err.textContent = ''; sessionStorage.setItem(`sql:${pid}`, ta.value); const t = performance.now();
     out.replaceChildren(loading());
     try {
-      const r = await api<any>(apiP('/sql'), { body: { query: ta.value } });
-      meta.textContent = `${fmt(r.results.length)} row${r.results.length === 1 ? '' : 's'}${r.hasMore ? ' (more available; add LIMIT/OFFSET)' : ''} · ${Math.round(performance.now() - t)} ms`;
+      const source = cfg.cold_tier ? srcSel.value : 'hot';
+      const r = await api<any>(apiP('/sql'), { body: { query: ta.value, source } });
+      const scanned = r.scanned && typeof r.scanned.bytes === 'number' ? ` · Basin SQL scanned ${fmt(r.scanned.bytes)} bytes in ${fmt(r.scanned.files ?? 0)} file${r.scanned.files === 1 ? '' : 's'}` : '';
+      meta.textContent = `${fmt(r.results.length)} row${r.results.length === 1 ? '' : 's'}${r.hasMore ? ' (more available; add LIMIT/OFFSET)' : ''} · ${Math.round(performance.now() - t)} ms${source === 'cold' ? ' · cold tier' : ''}${scanned}`;
       out.replaceChildren(h('div', { class: 'scroll-x' }, h('table', { class: 'sql-result' }, h('thead', {}, h('tr', {}, r.columns.map((c: string) => h('th', {}, c)))),
         h('tbody', {}, r.results.map((row: unknown[]) => h('tr', {}, row.map(v => h('td', { class: typeof v === 'number' ? 'num' : 'mono small' }, v === null ? 'null' : typeof v === 'object' ? JSON.stringify(v) : String(v)))))))));
     } catch (e) { out.replaceChildren(); meta.textContent = ''; throw e; }
@@ -1039,7 +1045,7 @@ async function sqlPage() {
   ta.addEventListener('keydown', (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); btn.click(); } });
   shell('SQL', [],
     h('section', { class: 'card' }, h('div', { class: 'row' }, h('span', { class: 'muted small' }, 'Examples:'), ...SQL_EXAMPLES.map(([l, q]) => h('button', { class: 'link', type: 'button', onclick: () => { ta.value = q; } }, l))),
-      ta, h('div', { class: 'row' }, btn, h('span', { class: 'muted small' }, 'Ctrl/⌘ + Enter. Read-only SELECT over events and persons in this project. Times are UTC; results stop at 10,000 rows; queries time out after 25 s.')), err, meta),
+      ta, h('div', { class: 'row' }, btn, cfg.cold_tier ? srcSel : null, h('span', { class: 'muted small' }, 'Ctrl/⌘ + Enter. Read-only SELECT over events and persons in this project. Times are UTC; results stop at 10,000 rows; queries time out after 25 s.')), err, meta),
     h('section', { class: 'card' }, out));
   if (location.hash === '#run') btn.click();
 }

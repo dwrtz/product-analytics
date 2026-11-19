@@ -10,7 +10,7 @@ targeted surveys. Events live in SQLite Durable Objects sharded by
 month, so a project is not limited to 10 GB and every count stays exact.
 
 **Spec:** [spekkr.com/dwrtz/product-analytics](https://spekkr.com/dwrtz/product-analytics/)
-(version 0.3.0, also in [`spec/`](spec/)). This repo is the reference
+(version 0.4.0, also in [`spec/`](spec/)). This repo is the reference
 implementation of that spec.
 
 This is not PostHog and contains no PostHog code. The wire format was
@@ -73,6 +73,13 @@ reconstructed from PostHog's MIT-licensed sources and recorded SDK traffic
   responses; replay sampling, minimum duration, linked flag, URL/event
   triggers, network/console/canvas capture and paged playback (no 64 MB
   cap); funnels and survey results without row limits.
+- **0.4**: optional Basin cold tier: every event is also streamed through
+  a Basin Pipelines binding (`COLD_STREAM`) into an Apache Iceberg table in
+  R2, and the SQL screen gets a Cold source that runs the same query
+  language through Basin SQL, always scoped to the project and its
+  retention period. Setup: [`spec/design.md`](spec/design.md) "Cold tier".
+
+![SQL over the Iceberg cold tier](shots04/sql-cold.png)
 
 Full, normative detail: [`spec/protocol.md`](spec/protocol.md), with worked
 examples in [`spec/test-vectors.json`](spec/test-vectors.json).
@@ -143,7 +150,7 @@ Settings shows the full snippet for your instance. With posthog-node:
 
 ## Test status
 
-- `npm test`: 119/119 pass.
+- `npm test`: 128/128 pass (0.4 adds the cold-tier compiler tests).
 - `npm run typecheck`: passes.
 - `npm run e2e`: 49/49 checks pass (0.3 adds actions, cohorts, SQL,
   heatmaps, scroll depth, console/network capture, continuity, partial
@@ -156,12 +163,16 @@ Settings shows the full snippet for your instance. With posthog-node:
   16/16, 0.2 (recorder, surveys, exposure) 22/22 and 0.3 (heatmaps,
   console/network/canvas, continuity, partial surveys) 30/30 SDK requests
   succeed.
+- Live cold tier (0.4, analytics.beef-able.com): events sent to `/batch`
+  appeared in the Iceberg table and in cold SQL results after about two
+  minutes; an event older than the 365-day retention was excluded; 14/14
+  checks.
 
-## Not in 0.3
+## Not in 0.4
 
-Data warehouse and exports; the Basin cold tier (an optional
-`COLD_STREAM` hook exists, but Basin needs credentials beyond a deploy
-token); full HogQL (joins, subqueries); lifecycle, stickiness and paths;
+Data warehouse exports; insights over the cold tier (it is reachable from
+SQL only) and physical deletion of expired cold rows (Basin SQL is
+read-only; retention is applied to every cold query); full HogQL (joins, subqueries); lifecycle, stickiness and paths;
 toolbar and element clickmaps; web experiments and product tours.
 
 ## License
