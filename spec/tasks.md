@@ -104,3 +104,7 @@ Work in this order. Finish each check before the next task.
     `BASIN_TOKEN` secret (keep secrets on later uploads). Check: send
     events, wait about two minutes, and a cold SQL query returns them
     while an event older than the retention period is excluded.
+29. **Second hostname (0.4.1).** Host check in `worker/index.ts` after
+    the SDK routes (`design.md` "Hostnames"). Check: the "second
+    hostname" HTTP test (preflight, capture, `/flags`, `/_health`, page
+    redirect, 421 on a cookie write).

@@ -145,6 +145,13 @@ Check: `npm run dev` serves the web app on port 8787 and
   stored as SHA-256 with a display mask, and can be revoked.
 - Every state-changing `/api/*` request authenticated by cookie must carry
   an `Origin` equal to `SITE_URL` (else 403 `bad_origin`).
+- The dashboard has one host, `SITE_URL`. Any other hostname routed to the
+  Worker (for example a first-party ingest subdomain such as
+  `analytics.<your-site>`) serves the SDK endpoints (capture, `/flags`,
+  `/decide`, remote config, `/s/`, `/api/surveys`, `/static/*`, local
+  evaluation), `/_health` and requests with an `Authorization` header;
+  other `GET`/`HEAD` requests redirect (302) to the same path on
+  `SITE_URL`, and other methods get 421 `{"error":"wrong_host"}` (0.4.1).
 
 Check: the first sign-up succeeds and a second is refused with
 `signup_closed`; a cookie POST with a foreign Origin is 403; a personal key

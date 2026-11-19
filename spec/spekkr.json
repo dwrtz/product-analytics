@@ -18,7 +18,7 @@
     "self-hosted",
     "cloudflare workers"
   ],
-  "version": "0.4.0",
+  "version": "0.4.1",
   "author": {
     "id": "dwrtz",
     "name": "David Wurtz"
@@ -107,6 +107,11 @@
   },
   "lineage": {},
   "changelog": [
+    {
+      "version": "0.4.1",
+      "date": "2026-11-19",
+      "note": "A Worker can serve extra hostnames, such as a first-party ingest subdomain on the measured site: SDK endpoints, /static and /_health answer on every host, while dashboard pages redirect to SITE_URL and other owner API writes there get 421, so sign-in and cookies stay on one origin. No config change."
+    },
     {
       "version": "0.4.0",
       "date": "2026-11-19",

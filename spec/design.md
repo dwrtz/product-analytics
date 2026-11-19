@@ -190,6 +190,28 @@ dynamic cohorts. The optional cold tier (0.4, "Cold tier") adds a
 `BASIN_TABLE` (default `analytics.events`) and one secret, `BASIN_TOKEN`.
 Without them there are no secrets.
 
+## Hostnames (0.4.1)
+
+- One Worker can have several custom domains. `SITE_URL` is the only
+  dashboard origin: sign-in, the `pa_session` cookie (host-only), the
+  `Origin` check and the Settings snippet all use it.
+- A second hostname exists so a site can send to a first-party subdomain
+  of its own domain (no third-party host, no CORS surprises, fewer
+  blockers). The SDK routes are matched before the host check, so they
+  answer on every hostname; CORS reflects the request `Origin` with
+  credentials, as before. `/_health` and `Authorization` (personal API
+  key) requests also pass, so posthog-node can use the ingest host for
+  local evaluation.
+- Everything else on a non-`SITE_URL` host: `GET`/`HEAD` → 302 to
+  `SITE_URL` + path + query; other methods → 421 `wrong_host`. This keeps
+  one cookie jar and one Origin rule instead of per-host sessions; making
+  the dashboard work on several hosts would need per-host cookies, an
+  Origin allow list and a per-host snippet, for no benefit.
+- To add one: create a Workers Custom Domain for the hostname on the same
+  Worker (it creates the proxied DNS record); no config change. On the
+  site, set posthog-js `api_host` to `https://<that host>` and leave
+  `ui_host` unset (or set it to `SITE_URL`).
+
 ## Deploy
 
 With an API token scoped to the target account (Workers Scripts, D1,

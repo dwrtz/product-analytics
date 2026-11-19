@@ -141,3 +141,21 @@ describe('flags and remote config (protocol.md 8-9)', () => {
     expect((await call('/e/', { method: 'POST', body: JSON.stringify({ api_key: 'phc_unknown', event: 'x', distinct_id: 'd' }) })).status).toBe(200);
   });
 });
+
+describe('second hostname (0.4.1, design.md "Hostnames")', () => {
+  const other = (path: string, init: RequestInit = {}) => W.fetch(new Request('https://ingest.test' + path, init)) as Promise<Response>;
+  it('serves SDK endpoints and /_health, redirects pages and refuses cookie API writes', async () => {
+    const { p } = await owner();
+    const pre = await other('/i/v0/e/', { method: 'OPTIONS', headers: { origin: 'https://shop.test', 'access-control-request-method': 'POST', 'access-control-request-headers': 'content-type' } });
+    expect(pre.status).toBe(204); expect(pre.headers.get('access-control-allow-origin')).toBe('https://shop.test');
+    const cap = await other('/i/v0/e/', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'https://shop.test' }, body: JSON.stringify({ api_key: p.api_token, event: 'x', distinct_id: 'd1' }) });
+    expect(cap.status).toBe(200);
+    const fl = await other('/flags/?v=2', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: p.api_token, distinct_id: 'd1' }) });
+    expect(fl.status).toBe(200);
+    expect((await other('/_health')).status).toBe(200);
+    const page = await other('/project/1/sql?x=1', { headers: { accept: 'text/html' }, redirect: 'manual' });
+    expect(page.status).toBe(302); expect(page.headers.get('location')).toBe(SITE + '/project/1/sql?x=1');
+    const login = await other('/api/login', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'https://ingest.test' }, body: '{}' });
+    expect(login.status).toBe(421);
+  });
+});
