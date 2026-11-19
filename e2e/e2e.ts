@@ -242,6 +242,10 @@ check('usage page draws events per day and the cost estimate', await up.waitForS
 if (web) { await up.goto(`${SITE}/project/${project.id}/errors/${web.id}`); check('issue page shows the stack trace', await up.waitForSelector('text=Stack trace', { timeout: 10000 }).then(() => true).catch(() => false) && (await up.locator('.frame').count()) > 0, null); }
 const capped = await api(A, 'PATCH', { limits: { events_monthly: 1, over_cap: 'drop' } });
 check('a cap below usage marks the project capped at once', capped.cap_state.events === true, capped.cap_state);
+// Other isolates keep the project row for up to 30 s (design.md "Usage limits"), so wait for the edge to see the cap.
+const cappedAt = Date.now();
+await until('edge cap state', async () => (await fetch(`${SITE}/e/`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ api_key: project.api_token, event: 'cap probe', distinct_id: 'cap-probe', properties: {} }) })).text(), t => t.includes('quota_limited'), 45000);
+if (Date.now() - cappedAt < 31000) await sleep(31000 - (Date.now() - cappedAt));
 const replies: string[] = []; const sent: string[] = [];
 p.on('response', async r => { const u = new URL(r.url()); if (u.origin === SITE && /^\/(e|i\/v0\/e)\/?$/.test(u.pathname)) replies.push(await r.text().catch(() => '')); });
 p.on('request', r => { const u = new URL(r.url()); if (u.origin === SITE && /^\/(e|i\/v0\/e)\/?$/.test(u.pathname)) sent.push(r.postData() ?? ''); });
