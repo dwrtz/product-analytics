@@ -142,7 +142,7 @@ describe('flags and remote config (protocol.md 8-9)', () => {
   });
 });
 
-describe('second hostname (0.4.1, design.md "Hostnames")', () => {
+describe('ingest-only hostnames (INGEST_HOSTS, design.md "Hostnames")', () => {
   const other = (path: string, init: RequestInit = {}) => W.fetch(new Request('https://ingest.test' + path, init)) as Promise<Response>;
   it('serves SDK endpoints and /_health, redirects pages and refuses cookie API writes', async () => {
     const { p } = await owner();
@@ -157,5 +157,9 @@ describe('second hostname (0.4.1, design.md "Hostnames")', () => {
     expect(page.status).toBe(302); expect(page.headers.get('location')).toBe(SITE + '/project/1/sql?x=1');
     const login = await other('/api/login', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'https://ingest.test' }, body: '{}' });
     expect(login.status).toBe(421);
+  });
+  it('other hostnames not listed serve the full app (the default)', async () => {
+    const r = await W.fetch(new Request('https://other.test/login', { headers: { accept: 'text/html' }, redirect: 'manual' })) as Response;
+    expect(r.status).toBe(200); expect(r.headers.get('content-type')).toContain('text/html');
   });
 });

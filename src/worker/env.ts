@@ -25,6 +25,8 @@ export interface Env {
   BASIN_BUCKET?: string;
   /** Iceberg table as namespace.table (default analytics.events). */
   BASIN_TABLE?: string;
+  /** Optional comma-separated hostnames that only receive SDK traffic (design.md "Hostnames"); empty = none. */
+  INGEST_HOSTS?: string;
 }
 /** One queue message: events for one project, already normalized by the capture endpoint. */
 export type IngestMsg = { pid: number; events?: NormEvent[]; replay?: import('./replay').ReplayMeta[] };
@@ -44,5 +46,11 @@ export function json(data: unknown, status = 200, headers: Record<string, string
   return new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json', ...headers } });
 }
 export const origin = (env: Env) => env.SITE_URL.replace(/\/+$/, '');
+/** True when the request's hostname is listed in INGEST_HOSTS (never for the SITE_URL hostname itself). */
+export const ingestHost = (env: Env, url: URL) => {
+  const h = url.hostname.toLowerCase();
+  if (!env.INGEST_HOSTS || h === new URL(origin(env)).hostname.toLowerCase()) return false;
+  return env.INGEST_HOSTS.split(',').some(x => x.trim().toLowerCase() === h);
+};
 /** The project's store stub, typed as the class (RPC types are too deep for tsc). */
 export const storeFor = (env: Env, pid: number) => env.STORE.get(env.STORE.idFromName(`project:${pid}`)) as unknown as ProjectStore;

@@ -130,11 +130,13 @@ and R2, and a zone for the hostname.
    `"routes": [{ "pattern": "analytics.example.com", "custom_domain": true }]`.
 6. `npm run deploy`, open the site, sign up, create a project and paste the
    snippet into your site.
-7. Optional, first-party ingest: add a second custom domain on the measured
-   site's own zone (e.g. `{ "pattern": "analytics.yoursite.com", "custom_domain": true }`)
-   and set `api_host: 'https://analytics.yoursite.com'` in the snippet. That
-   host serves only the SDK endpoints, `/static/*`, `/_health` and personal
-   API key calls; dashboard pages redirect to `SITE_URL` (0.4.1).
+7. Measuring a site on another domain: simplest is a separate instance on a
+   subdomain of that site (e.g. `analytics.yoursite.com` as `SITE_URL`). To
+   instead send its events to this instance through a first-party ingest
+   subdomain there, add that hostname as a second custom domain and list it
+   in the optional `INGEST_HOSTS` var: it then serves only the SDK
+   endpoints, `/static/*`, `/_health` and personal API key calls, and
+   dashboard pages redirect to `SITE_URL` (off by default; 0.4.2).
 
 No secrets are needed. Upgrading from 0.2: run step 4 again (migration
 0003) and `npm run deploy` (adds the hourly cohort cron). Upgrading from 0.1: create the R2 bucket, run step
@@ -155,7 +157,7 @@ Settings shows the full snippet for your instance. With posthog-node:
 
 ## Test status
 
-- `npm test`: 129/129 pass (0.4 adds the cold-tier compiler tests, 0.4.1 the second-hostname test).
+- `npm test`: 130/130 pass (0.4 adds the cold-tier compiler tests, 0.4.1/0.4.2 the ingest-only hostname tests).
 - `npm run typecheck`: passes.
 - `npm run e2e`: 49/49 checks pass (0.3 adds actions, cohorts, SQL,
   heatmaps, scroll depth, console/network capture, continuity, partial

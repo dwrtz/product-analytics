@@ -1,6 +1,6 @@
 // Worker entry: routing, the ingest queue consumer and the daily retention cron (spec R1).
 import { coldRecord } from './cold';
-import { Env, HttpError, IngestMsg, json, origin, storeFor, ProjectRow } from './env';
+import { Env, HttpError, IngestMsg, ingestHost, json, origin, storeFor, ProjectRow } from './env';
 import { handleLegacyCapture, handleV1Capture, LEGACY_PATHS, V1_PATH, cors } from './capture';
 import { handleConfig, handleFlags, handleStub, handleSurveys, handleLocalEvaluation } from './sdk';
 import { handleApi } from './api';
@@ -34,12 +34,12 @@ async function route(req: Request, env: Env): Promise<Response> {
   }
   if (bare === '/api/surveys' && req.method === 'GET') return handleSurveys(req, env, url);
   const stub = handleStub(req, bare); if (stub) return stub;
-  // One dashboard host (design.md "Hostnames"): other hostnames routed to this Worker (e.g. a first-party ingest
-  // subdomain on the site being measured) serve only the SDK endpoints above, /_health and personal-API-key calls.
-  // Browser pages redirect to SITE_URL, so sign-in, cookies and the Origin check all stay on one origin.
-  if (url.host !== new URL(origin(env)).host && bare !== '/_health' && !req.headers.get('authorization')) {
+  // Optional ingest-only hostnames (INGEST_HOSTS, design.md "Hostnames"): a first-party ingest subdomain on the site being
+  // measured serves only the SDK endpoints above, /_health and personal-API-key calls. Browser pages redirect to SITE_URL,
+  // so sign-in, cookies and the Origin check all stay on one origin. Unset (the default): every hostname serves the full app.
+  if (ingestHost(env, url) && bare !== '/_health' && !req.headers.get('authorization')) {
     if (req.method === 'GET' || req.method === 'HEAD') return new Response(null, { status: 302, headers: { location: origin(env) + path + url.search, ...SECURITY } });
-    return json({ error: 'wrong_host', detail: 'The dashboard and owner API are served at SITE_URL.' }, 421);
+    return json({ error: 'wrong_host', detail: 'This hostname only receives SDK traffic; the dashboard and owner API are served at SITE_URL.' }, 421);
   }
   if (path.startsWith('/api/')) return handleApi(req, env, url, ui.appName);
   if (path === '/app.js') return new Response(ui.js, { headers: { 'content-type': 'application/javascript', 'cache-control': 'no-cache', ...SECURITY } });

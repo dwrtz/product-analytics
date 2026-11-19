@@ -182,6 +182,7 @@ committed. Vars:
 | `ALLOWED_EMAILS` | Comma-separated emails that may sign up. Empty: only the first account can sign up. |
 | `DEFAULT_RETENTION_DAYS` | Retention for new projects, in days. Empty or `0`: keep events forever. |
 | `REPLAY_RETENTION_DAYS` | Days to keep session recordings (default 30); never longer than the project's event retention when that is set. `0` keeps them as long as events. |
+| `INGEST_HOSTS` | Optional, empty by default: comma-separated hostnames that only receive SDK traffic ("Hostnames"). |
 | `SHARD_PERIOD` | `month` (default) or `day`; read once per project. For tests. |
 
 Crons: `17 3 * * *` purges by retention; `41 * * * *` (0.3) recalculates
@@ -190,27 +191,32 @@ dynamic cohorts. The optional cold tier (0.4, "Cold tier") adds a
 `BASIN_TABLE` (default `analytics.events`) and one secret, `BASIN_TOKEN`.
 Without them there are no secrets.
 
-## Hostnames (0.4.1)
+## Hostnames
 
-- One Worker can have several custom domains. `SITE_URL` is the only
-  dashboard origin: sign-in, the `pa_session` cookie (host-only), the
-  `Origin` check and the Settings snippet all use it.
-- A second hostname exists so a site can send to a first-party subdomain
-  of its own domain (no third-party host, no CORS surprises, fewer
-  blockers). The SDK routes are matched before the host check, so they
-  answer on every hostname; CORS reflects the request `Origin` with
-  credentials, as before. `/_health` and `Authorization` (personal API
-  key) requests also pass, so posthog-node can use the ingest host for
-  local evaluation.
-- Everything else on a non-`SITE_URL` host: `GET`/`HEAD` → 302 to
-  `SITE_URL` + path + query; other methods → 421 `wrong_host`. This keeps
-  one cookie jar and one Origin rule instead of per-host sessions; making
-  the dashboard work on several hosts would need per-host cookies, an
-  Origin allow list and a per-host snippet, for no benefit.
-- To add one: create a Workers Custom Domain for the hostname on the same
-  Worker (it creates the proxied DNS record); no config change. On the
-  site, set posthog-js `api_host` to `https://<that host>` and leave
-  `ui_host` unset (or set it to `SITE_URL`).
+- `SITE_URL` is the dashboard origin: sign-in, the host-only `pa_session`
+  cookie, the cookie `Origin` check and the Settings snippet's `api_host`
+  all use it. The simplest setup puts the whole instance on a subdomain of
+  the measured site (e.g. `analytics.example.com` for example.com): that
+  host is first-party for the site and also serves the dashboard, so
+  nothing else is needed. One instance per measured organisation is the
+  recommended way to separate data, users and retention.
+- By default every hostname routed to the Worker serves the full app (as
+  before 0.4.1).
+- `INGEST_HOSTS` (optional var, comma-separated, empty by default; 0.4.1
+  had this always on for every non-`SITE_URL` host, 0.4.2 makes it
+  opt-in): for one instance that measures a site on another domain
+  through a first-party ingest subdomain there. Listed hosts answer the
+  SDK routes (matched before the host check; CORS reflects the request
+  `Origin` with credentials), `/_health` and `Authorization` (personal API
+  key) requests, so posthog-node local evaluation also works there.
+  Everything else: `GET`/`HEAD` → 302 to `SITE_URL` + path + query; other
+  methods → 421 `wrong_host`. This keeps one cookie jar and one Origin rule
+  instead of per-host sessions. The `SITE_URL` hostname is never treated as
+  ingest-only. On the site, set posthog-js `api_host` to the ingest host
+  and `ui_host` to `SITE_URL`.
+- To add a hostname, create a Workers Custom Domain for it on the same
+  Worker (it creates the proxied DNS record), plus `INGEST_HOSTS` if it
+  should be ingest-only.
 
 ## Deploy
 

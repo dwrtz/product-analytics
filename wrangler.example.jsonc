@@ -15,6 +15,8 @@
   },
   "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
   "vars": { "SITE_URL": "http://localhost:8787", "ALLOWED_EMAILS": "", "DEFAULT_RETENTION_DAYS": "0" },
+  // Optional INGEST_HOSTS var (design.md "Hostnames"): comma-separated extra hostnames that only receive SDK traffic,
+  // e.g. "analytics.yoursite.com" routed to this Worker; unset, every hostname serves the full app.
   // Optional cold tier (design.md "Cold tier"): a Basin Pipelines stream writing an Iceberg table, queried with Basin SQL.
   // Add the binding plus BASIN_ACCOUNT_ID / BASIN_BUCKET / BASIN_TABLE vars and `wrangler secret put BASIN_TOKEN`.
   // "pipelines": [{ "binding": "COLD_STREAM", "stream": "<stream id>" }],

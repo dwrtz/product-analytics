@@ -18,7 +18,7 @@
     "self-hosted",
     "cloudflare workers"
   ],
-  "version": "0.4.1",
+  "version": "0.4.2",
   "author": {
     "id": "dwrtz",
     "name": "David Wurtz"
@@ -107,6 +107,11 @@
   },
   "lineage": {},
   "changelog": [
+    {
+      "version": "0.4.2",
+      "date": "2026-11-19",
+      "note": "Ingest-only hostnames are now opt-in: every hostname serves the full app unless listed in the new optional INGEST_HOSTS var, which keeps the 0.4.1 behaviour (SDK endpoints, /static and /_health only; pages redirect to SITE_URL). design.md recommends one instance per measured site on its own subdomain."
+    },
     {
       "version": "0.4.1",
       "date": "2026-11-19",

@@ -115,8 +115,9 @@ Each requirement has an id. Tests name the id they cover.
   `ProjectStore`) and `SHARDS` (class `EventShard`), both SQLite storage;
   R2 bucket `REPLAY` (recording chunks); Queue `INGEST` (producer and
   consumer on the same Worker, with a dead-letter queue); Assets `ASSETS`.
-  Vars `SITE_URL`, `ALLOWED_EMAILS`, `DEFAULT_RETENTION_DAYS` and
-  `REPLAY_RETENTION_DAYS` (`SHARD_PERIOD` exists for tests only). No
+  Vars `SITE_URL`, `ALLOWED_EMAILS`, `DEFAULT_RETENTION_DAYS`,
+  `REPLAY_RETENTION_DAYS` and optional `INGEST_HOSTS` (R2) (`SHARD_PERIOD`
+  exists for tests only). No
   secrets. A daily cron trigger applies data retention. Exact config in
   `design.md`; no domain, account id or resource id is hard-coded anywhere.
 - `npm run dev` builds, applies local D1 migrations and runs `wrangler dev`
@@ -145,13 +146,16 @@ Check: `npm run dev` serves the web app on port 8787 and
   stored as SHA-256 with a display mask, and can be revoked.
 - Every state-changing `/api/*` request authenticated by cookie must carry
   an `Origin` equal to `SITE_URL` (else 403 `bad_origin`).
-- The dashboard has one host, `SITE_URL`. Any other hostname routed to the
-  Worker (for example a first-party ingest subdomain such as
-  `analytics.<your-site>`) serves the SDK endpoints (capture, `/flags`,
-  `/decide`, remote config, `/s/`, `/api/surveys`, `/static/*`, local
-  evaluation), `/_health` and requests with an `Authorization` header;
-  other `GET`/`HEAD` requests redirect (302) to the same path on
-  `SITE_URL`, and other methods get 421 `{"error":"wrong_host"}` (0.4.1).
+- Every hostname routed to the Worker serves the full app by default. An
+  optional `INGEST_HOSTS` var (comma-separated hostnames, case-insensitive,
+  empty by default) makes listed hostnames ingest-only, for a first-party
+  ingest subdomain on a measured site (for example `analytics.<your-site>`)
+  while the dashboard stays on `SITE_URL`: they serve the SDK endpoints
+  (capture, `/flags`, `/decide`, remote config, `/s/`, `/api/surveys`,
+  `/static/*`, local evaluation), `/_health` and requests with an
+  `Authorization` header; other `GET`/`HEAD` requests redirect (302) to the
+  same path on `SITE_URL`, and other methods get 421
+  `{"error":"wrong_host"}`. The `SITE_URL` hostname is never ingest-only.
 
 Check: the first sign-up succeeds and a second is refused with
 `signup_closed`; a cookie POST with a foreign Origin is 403; a personal key
