@@ -3,7 +3,7 @@
 // dashboard and flags; session recordings, an experiment and a survey (scripts/demo-02.mjs, needs Playwright);
 // error tracking with real posthog-js stacks across three releases (source maps uploaded per release AFTER the
 // exceptions arrive, so retroactive symbolication runs), pre-symbolicated Python, Go and Rust stacks, a merged issue,
-// a grouping rule, a suppression rule and an assignee; usage including events and requests dropped past a cap; LLM
+// a grouping rule, a suppression rule and an assignee; click heatmaps and scroll depth; usage including events and requests dropped past a cap; LLM
 // traces, generations, spans and embeddings across OpenAI, Anthropic, Google and xAI models. Finally marks the project
 // public_demo so signed-out visitors can browse it read-only when the instance runs with PUBLIC_DEMO=1.
 //
@@ -136,6 +136,33 @@ if (!llm.totals.generations) {
   // Wait until the queue has stored them (the cap step below must not race these events).
   const want = evs.filter(e => e.event === '$ai_generation').length;
   for (let i = 0; i < 40; i++) { const o = await call(`${A}/llm/overview?date_from=-30d`); if (o.totals.generations >= want) break; await sleep(1000); }
+}
+
+// ---- 3b. heatmaps and scroll depth (0.3): synthetic $$heatmap and $pageleave events on the store pages ----
+if (!(await call(`${A}/heatmaps/urls?date_from=-7d`, 'GET', undefined, [400])).results?.length) {
+  await call(A, 'PATCH', { heatmaps: true });
+  // Hot spots in CSS px on a 1280 px wide page: nav links, hero button, product cards, add-to-cart buttons.
+  const spots = { '/': [[640, 420, 30], [180, 40, 8], [1100, 40, 10], [320, 760, 14], [640, 760, 16], [960, 760, 12]],
+    '/products': [[300, 520, 18], [640, 520, 14], [980, 520, 10], [300, 940, 9], [640, 940, 7], [1180, 40, 6]] };
+  const evs = [];
+  for (const [path, pts] of Object.entries(spots)) {
+    const url = `https://shop.example${path}`;
+    for (let v = 0; v < 60; v++) {
+      const t = now - Math.floor(rnd() * 6 * DAY); const did = `hm-${v}`; const sid = `hm-s-${v}`;
+      const data = [];
+      for (const [x, y, w] of pts) for (let k = 0; k < Math.round(w * rnd() / 4); k++) data.push({ x: Math.round(x + (rnd() - 0.5) * 60), y: Math.round(y + (rnd() - 0.5) * 30), target_fixed: y < 60, type: 'click' });
+      if (rnd() < 0.2) for (let k = 0; k < 3; k++) data.push({ x: 640 + k, y: 1180, target_fixed: false, type: 'rageclick' });
+      for (let k = 0; k < 12; k++) data.push({ x: Math.round(rnd() * 1280), y: Math.round(rnd() * 1400), target_fixed: false, type: 'mousemove' });
+      const base = { $current_url: url, $pathname: path, $viewport_width: 1280, $viewport_height: 760, $session_id: sid, $browser: pick(['Chrome', 'Safari', 'Firefox']) };
+      evs.push({ event: '$$heatmap', distinct_id: did, uuid: uuid(), timestamp: iso(t), properties: { ...base, $heatmap_data: { [url]: data } } });
+      const max = Math.round(30 + rnd() * 70);
+      evs.push({ event: '$pageleave', distinct_id: did, uuid: uuid(), timestamp: iso(t + 30_000), properties: { ...base, $prev_pageview_pathname: path, $prev_pageview_max_scroll: Math.round(max * 24), $prev_pageview_max_scroll_percentage: max / 100, $prev_pageview_last_scroll: Math.round(max * 20), $prev_pageview_last_scroll_percentage: max / 120, $prev_pageview_max_content: Math.round(max * 30), $prev_pageview_max_content_percentage: Math.min(1, max / 90), $prev_pageview_last_content: Math.round(max * 25), $prev_pageview_last_content_percentage: max / 110 } });
+    }
+  }
+  const before = (await call(`${A}/stats`)).events;
+  await send(evs);
+  await settle(before + 1);
+  log('heatmaps:', evs.length, 'events');
 }
 
 // ---- 4. usage: drop some events past a cap, then restore the limits ----

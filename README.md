@@ -160,7 +160,7 @@ Node 22 or later.
 ```sh
 npm install
 npm run dev          # builds, creates wrangler.jsonc, applies local D1 migrations, runs wrangler dev on :8787
-npm test             # 211 tests: spec vectors, store and insight maths, HTTP, shards, replay, experiments, surveys, cold tier, errors, usage, LLM, public demo
+npm test             # 212 tests: spec vectors, store and insight maths, HTTP, shards, replay, experiments, surveys, cold tier, errors, usage, LLM, public demo
 python3 -m unittest scripts/test_cold_prune.py   # 6 tests for the cold pruning script
 npx playwright install chromium
 E2E_EMAIL=you@example.com npm run e2e   # against the running dev server
@@ -244,7 +244,7 @@ Settings shows the full snippet for your instance. With posthog-node:
 
 ## Test status
 
-- `npm test`: 211/211 pass (0.6 adds the HTML fallback, public demo,
+- `npm test`: 212/212 pass (0.6 adds the HTML fallback, public demo,
   usage counter, error tracking 0.6, LLM analytics and cold Trends tests and
   the source-map-section, LLM cost, suppression rule and release vectors;
   0.5 adds error tracking, source map, usage cap, sampling and alert tests plus their vectors; 0.4 the cold-tier compiler tests, 0.4.1/0.4.2 the ingest-only hostname tests).
@@ -266,6 +266,15 @@ Settings shows the full snippet for your instance. With posthog-node:
   16/16, 0.2 (recorder, surveys, exposure) 22/22 and 0.3 (heatmaps,
   console/network/canvas, continuity, partial surveys) 30/30 SDK requests
   succeed.
+- Live 0.6 (2026-11-20): `npm run e2e` against analytics.beef-able.com
+  85/85; cold-tier Trends 14/14 (events reached Iceberg in about a
+  minute, exact totals, distinct ids and sessions matching the hot engine,
+  a 400-day-old event excluded by the 365-day retention, breakdowns and
+  funnels refused on cold); the signed-out public demo 72/72 (every screen's
+  API answers with demo data, tokens and emails masked, 20/20 writes refused
+  with `demo_read_only`, stranger sign-up 403); analytics.spekkr.com
+  (private) smoke 23/23 (AI batch endpoint, releases, suppression rules
+  through remote config, merge, request counters, signed-out API 401).
 - Live cold tier (0.4, analytics.beef-able.com): events sent to `/batch`
   appeared in the Iceberg table and in cold SQL results after about two
   minutes; an event older than the 365-day retention was excluded; 14/14

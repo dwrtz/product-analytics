@@ -843,8 +843,9 @@ multipart event, then opens the overview and trace screens.
   the test alert answer 403 `{"error": "demo_read_only"}`.
   `ALLOWED_EMAILS` still applies to sign-up and sign-in, and a signed-in
   owner keeps full access.
-- Responses to visitors are redacted: user and alert-recipient emails
-  become `owner@hidden`, `alert_emails` is empty, personal API keys are an
+- Responses to visitors are redacted: user and alert-recipient emails,
+  and the creator and assignee emails stored with insights and issues
+  (even of accounts removed since), become `owner@hidden`, `alert_emails` is empty, personal API keys are an
   empty list and the project API key is replaced by a placeholder.
 - The web app shows a "Read-only public demo" banner with an owner sign-in
   link and disables write controls. `scripts/demo-setup.mjs` builds a demo

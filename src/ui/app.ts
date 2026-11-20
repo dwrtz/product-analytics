@@ -1469,7 +1469,7 @@ async function errorPage(id: string) {
   if (i.status === 'merged' && i.merged_into) return nav(P(`/errors/${i.merged_into}`));
   const users = demo() ? [] : await api<any[]>('/api/users').catch(() => []);
   const assign = h('select', { 'aria-label': 'Assignee', disabled: demo(), onchange: async (e: Event) => { const v = (e.target as HTMLSelectElement).value; await api(apiP(`/error_issues/${id}`), { method: 'PATCH', body: { assignee: v || null } }); errorPage(id); } },
-    opt('', 'Unassigned', i.assignee ? String(i.assignee.id) : ''), users.map((u: any) => opt(String(u.id), u.email, i.assignee ? String(i.assignee.id) : '')),
+    opt('', 'Unassigned', i.assignee ? String(i.assignee.id) : ''), users.map((u: any) => opt(String(u.id), u.email ?? u.name, i.assignee ? String(i.assignee.id) : '')),
     i.assignee && !users.some((u: any) => u.id === i.assignee.id) ? opt(String(i.assignee.id), i.assignee.email ?? `User ${i.assignee.id}`, String(i.assignee.id)) : null);
   const ferr = errBox();
   const split = (fp: string) => async () => { if (!confirm('Move occurrences with this fingerprint to their own issue?')) return; try { const r = await api<any>(apiP(`/error_issues/${id}/split`), { body: { fingerprint: fp } }); nav(P(`/errors/${r.split.id}`)); } catch (e) { ferr.textContent = e instanceof Error ? e.message : String(e); } };

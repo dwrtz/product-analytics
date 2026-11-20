@@ -12,7 +12,9 @@ const call = async (path, method = 'GET', body) => {
 };
 await call('/api/login', 'POST', { email, password });
 const A = `/api/projects/${pid}`;
-const p = await call(A, 'PATCH', { session_recording: true });
+// Record every demo visitor: new projects default to a replay sample rate below 1 (0.5), which could skip all three.
+const cur = await call(A);
+const p = await call(A, 'PATCH', { session_recording: true, replay_config: { ...(cur.replay_config ?? {}), sample_rate: 1, minimum_duration_ms: 0 } });
 const ONLY_REC = process.env.ONLY_REC === '1'; // re-record the browser sessions only
 const flags = await call(`${A}/feature_flags`);
 if (!flags.some(f => f.key === 'checkout-button')) await call(`${A}/feature_flags`, 'POST', { key: 'checkout-button', name: 'Checkout button colour', active: false, filters: { groups: [{ properties: [], rollout_percentage: 100 }], multivariate: { variants: [{ key: 'control', rollout_percentage: 50 }, { key: 'green', rollout_percentage: 50 }] } } });

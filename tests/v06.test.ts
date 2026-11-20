@@ -129,6 +129,33 @@ describe('public demo (PUBLIC_DEMO=1)', { timeout: 20000 }, () => {
   });
 });
 
+describe('public demo after the seeding account is removed', { timeout: 20000 }, () => {
+  it('still hides creator and assignee emails that are no longer in D1', async () => {
+    const DEMO = { ...E, PUBLIC_DEMO: '1' };
+    const body = JSON.stringify({ email: 'seed@example.com', password: 'correct horse battery' });
+    const SEED = { ...E, ALLOWED_EMAILS: 'seed@example.com' };
+    let r = await call('/api/signup', { method: 'POST', body }, SEED); if (r.status !== 201) r = await call('/api/login', { method: 'POST', body }, SEED);
+    const cookie = r.headers.get('set-cookie')!.split(';')[0];
+    const p = await j(call('/api/projects', { method: 'POST', body: JSON.stringify({ name: 'Seeded demo', timezone: 'UTC' }), cookie }));
+    await patch(cookie, p.id, { public_demo: true });
+    await call(`/api/projects/${p.id}/insights`, { method: 'POST', cookie, body: JSON.stringify({ name: 'Visitors', query: { kind: 'TrendsQuery', series: [{ kind: 'EventsNode', event: '$pageview' }] } }) });
+    expect((await capture(p.api_token, [exc('py-1', PY, { $lib: 'posthog-python' })])).status).toBe(200);
+    let l: any;
+    await vi.waitFor(async () => { l = await j(call(`/api/projects/${p.id}/error_issues`, { cookie })); expect(l.results.length).toBe(1); }, { timeout: 8000, interval: 200 });
+    const me = await j(call('/api/me', { cookie }));
+    expect((await call(`/api/projects/${p.id}/error_issues/${l.results[0].id}`, { method: 'PATCH', cookie, body: JSON.stringify({ assignee: String(me.id) }) })).status).toBe(200);
+    // Remove the account the way a deployment does after seeding (D1 rows only; project data stays).
+    await E.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(me.id).run();
+    await E.DB.prepare('DELETE FROM users WHERE id = ?').bind(me.id).run();
+    const ins = await j(call(`/api/projects/${p.id}/insights`, {}, DEMO));
+    expect(ins.length).toBe(1); expect(ins[0].created_by).toBe('owner@hidden');
+    const iss = await j(call(`/api/projects/${p.id}/error_issues?status=`, {}, DEMO));
+    expect(iss.results[0].assignee).toEqual({ id: me.id, email: 'owner@hidden' });
+    const one = await j(call(`/api/projects/${p.id}/error_issues/${l.results[0].id}`, {}, DEMO));
+    expect(JSON.stringify([ins, iss, one])).not.toContain('seed@example.com');
+  });
+});
+
 describe('usage counters and cost', { timeout: 20000 }, () => {
   it('project cache TTL is 10 s', () => { expect(PROJECT_CACHE_TTL_MS).toBe(10_000); });
   it('counts flags, config and API requests and edge drops; cost includes them', async () => {

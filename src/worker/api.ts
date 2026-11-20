@@ -70,11 +70,16 @@ async function redact(env: Env, data: unknown, projects: ProjectRow[]): Promise<
   const walk = (v: unknown, key = ''): unknown => {
     if (typeof v === 'string') {
       if (tokens.has(v)) return DEMO_TOKEN;
+      // Who made or owns something: hidden even when that account no longer exists in D1 (e.g. a removed seeding account).
+      if ((key === 'created_by' || key === 'assignee_email' || key === 'owner_email') && v.includes('@')) return 'owner@hidden';
       let out = v; for (const e of emails) if (e && out.toLowerCase().includes(e)) out = out.replace(new RegExp(e.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), 'owner@hidden');
       return out;
     }
     if (Array.isArray(v)) return key === 'alert_emails' ? [] : v.map(x => walk(x));
-    if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, walk(x, k)]));
+    if (v && typeof v === 'object') {
+      if (key === 'assignee' && typeof (v as any).email === 'string') return { ...(v as object), email: 'owner@hidden' };
+      return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, walk(x, k)]));
+    }
     return v;
   };
   return walk(data);

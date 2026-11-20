@@ -1195,7 +1195,9 @@ without a session or personal key goes to `demoApi()` instead of 401:
 - `redact()` walks the JSON response: strings equal to a project token
   become `phc_demo_token_hidden`; any instance user's email or any alert
   recipient inside a string becomes `owner@hidden`; `alert_emails` arrays
-  become `[]`.
+  become `[]`. `created_by`, `assignee_email` and an `assignee` object's
+  `email` always become `owner@hidden`, even when that account is no longer
+  in D1 (a demo seeded by a temporary account that was removed afterwards).
 - Sign-up and sign-in are unchanged (`ALLOWED_EMAILS` applies). A signed-in
   user never goes through `demoApi()`.
 
