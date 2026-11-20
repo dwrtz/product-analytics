@@ -17,10 +17,11 @@ import { runSql, runShardSql } from './sqlquery';
 import { heatmapQuery, scrollDepthQuery, heatmapUrls } from './heatmaps';
 import { limitsOf, Limits, monthKey, dayKey, THRESHOLDS, estimateCost, PRICES, ASSUMPTIONS } from './usage';
 import { sampled } from '../shared/sample';
-import { exceptionList, fingerprintOf, symbolicate, topFrame, pathOf, refOf } from './errors';
+import { exceptionList, fingerprintOf, symbolicate, topFrame, pathOf, refOf, releaseOf, unresolvedFrames, suppressed, cleanGroupingRule, cleanSuppressionRule, type GroupingRule, type SuppressionRule, type ExceptionEntry } from './errors';
 import { decodeMap, DecodedMap } from '../shared/sourcemap';
 import { Alert, emailAlert, recipients, emailConfigured } from './alerts';
 import { coldEnabled } from './cold';
+import { toLlmRow, llmOverview, llmTraces, llmTrace, llmRange, type LlmFilters } from './llm';
 
 const SCHEMA = [
   ...X.EVENTS_SCHEMA,
@@ -67,6 +68,20 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS error_occ_issue ON error_occurrences (issue_id, ts)`,
   `CREATE TABLE IF NOT EXISTS error_issue_users (issue_id TEXT NOT NULL, distinct_id TEXT NOT NULL, PRIMARY KEY (issue_id, distinct_id))`,
   `CREATE TABLE IF NOT EXISTS symbol_sets (id TEXT PRIMARY KEY, ref TEXT NOT NULL UNIQUE, path TEXT NOT NULL, r2_key TEXT NOT NULL, size INTEGER NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER)`,
+  // 0.6: merged fingerprints, grouping and suppression rules (design.md "Error tracking")
+  `CREATE TABLE IF NOT EXISTS error_fingerprint_aliases (fingerprint TEXT PRIMARY KEY, issue_id TEXT NOT NULL, original_issue_id TEXT, created_at INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS error_alias_issue ON error_fingerprint_aliases (issue_id)`,
+  `CREATE TABLE IF NOT EXISTS error_grouping_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, position INTEGER NOT NULL, field TEXT NOT NULL, match TEXT NOT NULL, pattern TEXT NOT NULL, key TEXT NOT NULL,
+     description TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS error_suppression_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, rule TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)`,
+];
+/** 0.6 symbol sets are unique per (release, ref); a 0.5 table (ref UNIQUE) is rebuilt once, keeping its rows as unversioned. */
+const SYMBOL_SETS_V6 = `CREATE TABLE symbol_sets_v6 (id TEXT PRIMARY KEY, release TEXT NOT NULL DEFAULT '', ref TEXT NOT NULL, path TEXT NOT NULL, r2_key TEXT NOT NULL, size INTEGER NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER, UNIQUE (release, ref))`;
+/** Indexes on columns added by COLUMNS, created after them. */
+const POST_SCHEMA = [
+  `CREATE INDEX IF NOT EXISTS error_occ_release ON error_occurrences (release)`,
+  `CREATE INDEX IF NOT EXISTS error_occ_unresolved ON error_occurrences (resolved, ts)`,
+  `CREATE INDEX IF NOT EXISTS error_issues_assignee ON error_issues (assignee_id)`,
 ];
 /** Columns added after a table first shipped; applied with ALTER TABLE when missing. */
 const COLUMNS: [string, string, string][] = [
@@ -79,6 +94,17 @@ const COLUMNS: [string, string, string][] = [
   ['surveys', 'iteration_frequency_days', 'INTEGER'],
   ['surveys', 'schedule', 'TEXT'],
   ['session_recordings', 'stored', 'INTEGER NOT NULL DEFAULT 0'],
+  // 0.6 error tracking: releases, assignment, merges, retroactive symbolication
+  ['error_issues', 'first_seen_release', 'TEXT'],
+  ['error_issues', 'last_seen_release', 'TEXT'],
+  ['error_issues', 'assignee_id', 'INTEGER'],
+  ['error_issues', 'assignee_email', 'TEXT'],
+  ['error_issues', 'merged_into', 'TEXT'],
+  ['error_occurrences', 'release', 'TEXT'],
+  ['error_occurrences', 'fingerprint', 'TEXT'],
+  ['error_occurrences', 'exception', 'TEXT'],
+  ['error_occurrences', 'raw', 'TEXT'],
+  ['error_occurrences', 'resolved', 'INTEGER NOT NULL DEFAULT 1'],
 ];
 const SURVEY_FLAG_PREFIX = 'survey-targeting-';
 
@@ -100,6 +126,19 @@ export class ProjectStore extends DurableObject<Env> {
       for (const [t, c, def] of COLUMNS) {
         const have = this.sql.exec(`SELECT 1 AS x FROM pragma_table_info(?) WHERE name = ?`, t, c).toArray().length;
         if (!have) this.sql.exec(`ALTER TABLE ${t} ADD COLUMN ${c} ${def}`);
+      }
+      // 0.6 in-place upgrade (idempotent): versioned symbol sets, occurrence fingerprints for split.
+      if (!this.sql.exec(`SELECT 1 AS x FROM pragma_table_info('symbol_sets') WHERE name = 'release'`).toArray().length) {
+        this.ctx.storage.transactionSync(() => {
+          this.sql.exec('DROP TABLE IF EXISTS symbol_sets_v6'); this.sql.exec(SYMBOL_SETS_V6);
+          this.sql.exec(`INSERT INTO symbol_sets_v6 (id, release, ref, path, r2_key, size, created_at, last_used_at) SELECT id, '', ref, path, r2_key, size, created_at, last_used_at FROM symbol_sets`);
+          this.sql.exec('DROP TABLE symbol_sets'); this.sql.exec('ALTER TABLE symbol_sets_v6 RENAME TO symbol_sets');
+        });
+      }
+      for (const s of POST_SCHEMA) this.sql.exec(s);
+      if (!this.sql.exec("SELECT 1 AS x FROM meta WHERE key = 'v06_occ_fp'").toArray().length) {
+        this.sql.exec('UPDATE error_occurrences SET fingerprint = (SELECT i.fingerprint FROM error_issues i WHERE i.id = error_occurrences.issue_id) WHERE fingerprint IS NULL');
+        this.sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('v06_occ_fp', '1')");
       }
     });
   }
@@ -129,7 +168,7 @@ export class ProjectStore extends DurableObject<Env> {
   private local(): ShardApi {
     const q = this.sql;
     return { trend: async s => X.trendRows(q, s), funnel: async s => X.funnelRows(q, s), funnelCounts: async s => X.funnelCountRows(q, s), periods: async s => X.periodRows(q, s), firsts: async s => X.firstRows(q, s),
-      events: async s => X.eventRows(q, s), sqlRows: async s => runShardSql(q, s), heatmap: async s => X.heatmapRows(q, s), scroll: async s => X.scrollRows(q, s) };
+      events: async s => X.eventRows(q, s), llm: async s => X.llmRows(q, s), sqlRows: async s => runShardSql(q, s), heatmap: async s => X.heatmapRows(q, s), scroll: async s => X.scrollRows(q, s) };
   }
   private shardsFor(from: number, to: number): { key: string; api: ShardApi }[] {
     const out: { key: string; api: ShardApi }[] = [];
@@ -178,7 +217,10 @@ export class ProjectStore extends DurableObject<Env> {
     try {
       const info = await this.info(pid);
       // Monthly event cap (design.md "Usage limits"): exact here; the edge only short-cuts once cap_state is written.
-      const { keep, dropped } = this.applyEventCap(fresh, info?.limits ?? null);
+      const capped = this.applyEventCap(fresh, info?.limits ?? null); const dropped = capped.dropped;
+      // Suppression rules (design.md "Suppression rules") also apply here: server SDKs do not read remote config.
+      const sup = this.rules().suppression; let keep = capped.keep; const gone: NormEvent[] = [];
+      if (sup.length) { keep = []; for (const ev of capped.keep) (ev.event === '$exception' && suppressed(sup, exceptionList(ev.properties)) ? gone : keep).push(ev); }
       const before = this.monthTotals().events;
       const exc = keep.filter(e => e.event === '$exception');
       const issueOf = exc.length ? await this.prepareExceptions(exc) : new Map<string, string>();
@@ -189,7 +231,8 @@ export class ProjectStore extends DurableObject<Env> {
       this.ctx.storage.transactionSync(() => {
         for (const [key, g, n] of counts) this.sql.exec('INSERT INTO shards (key, start, end, events) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET events = events + excluded.events', key, g.start, g.end, n);
         const lastSeen = new Map<string, number>();
-        for (const ev of dropped) this.sql.exec('INSERT OR IGNORE INTO ingest_log (uuid, at) VALUES (?, ?)', ev.uuid, now);
+        for (const ev of [...dropped, ...gone]) this.sql.exec('INSERT OR IGNORE INTO ingest_log (uuid, at) VALUES (?, ?)', ev.uuid, now);
+        if (gone.length) this.bump(dayKey(now), 'suppressed', '$exception', gone.length, 0, 0);
         for (const ev of keep) {
           this.sql.exec('INSERT OR IGNORE INTO ingest_log (uuid, at) VALUES (?, ?)', ev.uuid, now);
           this.define(ev);
@@ -203,18 +246,18 @@ export class ProjectStore extends DurableObject<Env> {
       });
       if (info?.limits?.events_monthly !== null && info?.limits?.events_monthly !== undefined) alerts.push(...this.thresholdAlerts('events', before, this.monthTotals().events, info.limits.events_monthly, info.pid));
       await this.afterIngest(info, alerts);
-      return { inserted: keep.length, duplicates: events.length - fresh.length, dropped: dropped.map(e => e.uuid), exceptions: exc };
+      return { inserted: keep.length, duplicates: events.length - fresh.length, dropped: [...dropped, ...gone].map(e => e.uuid), exceptions: exc };
     } finally { for (const u of batch) this.inflight.delete(u); }
   }
 
   // ---------- usage, caps and alerts (design.md "Usage limits", "Alerts") ----------
   private infoCache: { at: number; v: { pid: number; name: string; limits: Limits | null; cap_state: string | null; error_tracking: number } } | null = null;
-  /** The project's row fields the store needs (D1, cached 30 s). The project id is remembered from the first call that passes it. */
+  /** The project's row fields the store needs (D1, cached 10 s). The project id is remembered from the first call that passes it. */
   private async info(pid?: number) {
     if (pid) { const cur = this.one<{ value: string }>("SELECT value FROM meta WHERE key = 'pid'")?.value; if (cur !== String(pid)) this.sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('pid', ?)", String(pid)); }
     const id = pid ?? Number(this.one<{ value: string }>("SELECT value FROM meta WHERE key = 'pid'")?.value ?? 0);
     if (!id) return null;
-    if (this.infoCache && this.infoCache.v.pid === id && Date.now() - this.infoCache.at < 30_000) return this.infoCache.v;
+    if (this.infoCache && this.infoCache.v.pid === id && Date.now() - this.infoCache.at < 10_000) return this.infoCache.v;
     const r = await this.env.DB.prepare('SELECT id, name, limits, cap_state, error_tracking FROM projects WHERE id = ?').bind(id).first<any>();
     if (!r) return null;
     const v = { pid: id, name: String(r.name), limits: r.limits ? limitsOf(r) : null, cap_state: r.cap_state ?? null, error_tracking: Number(r.error_tracking ?? 0) };
@@ -273,7 +316,7 @@ export class ProjectStore extends DurableObject<Env> {
     }
     return out;
   }
-  /** Writes the month's cap state to D1 when it changes, so the edge and remote config can short-cut (30 s cache). */
+  /** Writes the month's cap state to D1 when it changes, so the edge and remote config can short-cut (10 s cache). */
   private async syncCapState(info: { pid: number; limits: Limits | null; cap_state: string | null }) {
     const L = info.limits; const t = this.monthTotals();
     const st = { month: t.month, events: !!L && L.events_monthly !== null && t.events >= L.events_monthly,
@@ -334,6 +377,17 @@ export class ProjectStore extends DurableObject<Env> {
       body: `${y} (UTC) had ${yc.toLocaleString('en-US')} events against a 7-day average of ${Math.round(prev).toLocaleString('en-US')}. Top events: ${top.map(t => `${t.name} ${Number(t.c).toLocaleString('en-US')}`).join(', ')}.`, link: `/project/${pid}/usage` };
     return this.raise(a, info);
   }
+  /** Edge counters flushed by meter.ts: SDK flag/config and owner API requests, and what a cap refused at the edge. */
+  async recordEdgeUsage(day: string, c: Partial<Record<string, number>>) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return;
+    const n = (k: string) => Math.max(0, Math.floor(Number(c[k]) || 0));
+    this.ctx.storage.transactionSync(() => {
+      for (const k of ['flags', 'config', 'api']) if (n(k)) this.bump(day, 'requests', k, n(k), 0, 0);
+      if (n('edge_dropped_events')) this.bump(day, 'edge_dropped', 'events', n('edge_dropped_events'), 0, 0);
+      if (n('edge_dropped_requests')) this.bump(day, 'edge_dropped', 'requests', n('edge_dropped_requests'), 0, 0);
+      if (n('edge_dropped_replay')) this.bump(day, 'edge_dropped', 'replay', n('edge_dropped_replay'), 0, 0);
+    });
+  }
   /** Usage page data: per-day counts by event name, replay, month totals against caps and the cost estimate. */
   async usage(pid: number, days = 30, now = Date.now()) {
     const info = await this.info(pid); const L = info?.limits ?? null;
@@ -346,21 +400,28 @@ export class ProjectStore extends DurableObject<Env> {
     const r2 = this.one<{ b: number }>('SELECT COALESCE(SUM(stored), 0) AS b FROM session_recordings')!.b + this.one<{ b: number }>('SELECT COALESCE(SUM(size), 0) AS b FROM symbol_sets')!.b;
     const d = new Date(now); const dim = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
     const elapsed = Math.max((now - Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)) / 86400_000, 1 / 24); const scale = dim / elapsed;
-    const mtd = { events: sum('event'), event_bytes: sum('event', undefined, 'bytes'), requests: sum('requests'), recordings: sum('replay', 'recordings'), replay_bytes: sum('replay', 'recordings', 'bytes'), replay_chunks: sum('replay', 'chunks'), emails: sum('email'),
-      dropped_events: sum('event', undefined, 'dropped'), dropped_replay_chunks: sum('replay', 'recordings', 'dropped') };
+    const mtd = { events: sum('event'), event_bytes: sum('event', undefined, 'bytes'), requests: sum('requests', ''), recordings: sum('replay', 'recordings'), replay_bytes: sum('replay', 'recordings', 'bytes'), replay_chunks: sum('replay', 'chunks'), emails: sum('email'),
+      dropped_events: sum('event', undefined, 'dropped'), dropped_replay_chunks: sum('replay', 'recordings', 'dropped'),
+      // 0.6: requests besides capture, and what a cap refused at the edge (design.md "Usage limits")
+      flag_requests: sum('requests', 'flags'), config_requests: sum('requests', 'config'), api_requests: sum('requests', 'api'),
+      edge_dropped_events: sum('edge_dropped', 'events'), edge_dropped_requests: sum('edge_dropped', 'requests'), edge_dropped_replay: sum('edge_dropped', 'replay'),
+      suppressed_exceptions: sum('suppressed') };
+    const dropped_past_cap = { events: mtd.dropped_events + mtd.edge_dropped_events, requests: mtd.edge_dropped_requests, replay_uploads: mtd.dropped_replay_chunks + mtd.edge_dropped_replay };
     const proj = (n: number) => Math.round(n * scale);
     const cost = estimateCost({ events: proj(mtd.events), event_bytes: proj(mtd.event_bytes), requests: proj(mtd.requests), recordings: proj(mtd.recordings), replay_bytes: proj(mtd.replay_bytes), replay_chunks: proj(mtd.replay_chunks), emails: proj(mtd.emails),
-      stored_db_bytes: st.database_bytes, stored_r2_bytes: r2, cold_tier: coldEnabled(this.env) });
+      stored_db_bytes: st.database_bytes, stored_r2_bytes: r2, cold_tier: coldEnabled(this.env),
+      flag_requests: proj(mtd.flag_requests), config_requests: proj(mtd.config_requests), api_requests: proj(mtd.api_requests), edge_dropped_requests: proj(mtd.edge_dropped_requests + mtd.edge_dropped_replay) });
     const pct = (n: number, c: number | null | undefined) => c === null || c === undefined ? null : c === 0 ? 100 : Math.round(n / c * 1000) / 10;
     return {
       month, days_in_month: dim, days_elapsed: Math.round(elapsed * 10) / 10,
-      month_to_date: mtd,
+      month_to_date: mtd, dropped_past_cap,
       caps: { limits: L, cap_state: info?.cap_state ? JSON.parse(info.cap_state) : null,
         events: { used: t.events, cap: L?.events_monthly ?? null, pct: pct(t.events, L?.events_monthly) },
         recordings: { used: t.recordings, cap: L?.replay_recordings_monthly ?? null, pct: pct(t.recordings, L?.replay_recordings_monthly) },
         replay_bytes: { used: t.bytes, cap: L?.replay_bytes_monthly ?? null, pct: pct(t.bytes, L?.replay_bytes_monthly) } },
       daily: rows.filter(r => r.kind === 'event').map(r => ({ day: r.day, event: r.name, count: r.count, bytes: r.bytes, dropped: r.dropped })),
-      requests: rows.filter(r => r.kind === 'requests').map(r => ({ day: r.day, count: r.count })),
+      requests: rows.filter(r => r.kind === 'requests').map(r => ({ day: r.day, type: r.name || 'capture', count: r.count })),
+      edge_dropped: rows.filter(r => r.kind === 'edge_dropped').map(r => ({ day: r.day, type: r.name, count: r.count })),
       replay: Object.values(rows.filter(r => r.kind === 'replay').reduce((a: Record<string, any>, r) => { const x = a[r.day] ??= { day: r.day, recordings: 0, bytes: 0, chunks: 0, dropped: 0 }; if (r.name === 'recordings') { x.recordings += r.count; x.bytes += r.bytes; x.dropped += r.dropped; } else if (r.name === 'chunks') x.chunks += r.count; return a; }, {})),
       storage: { database_bytes: st.database_bytes, r2_bytes: r2 },
       cost: { ...cost, projected_from_days: Math.round(elapsed * 10) / 10, prices: PRICES, assumptions: ASSUMPTIONS },
@@ -368,18 +429,53 @@ export class ProjectStore extends DurableObject<Env> {
     };
   }
 
+  // ---------- LLM analytics (design.md "LLM analytics") ----------
+  private async llmRows(from: number, to: number, traceId: string | null = null, full = false, limit = 200_000) {
+    const out: ReturnType<typeof toLlmRow>[] = [];
+    for (const sh of this.shardsFor(from, to)) { for (const r of await sh.api.llm({ from, to: to + 1, traceId, full, limit: limit - out.length })) out.push(toLlmRow(r)); if (out.length >= limit) break; }
+    return out;
+  }
+  async llmAnalytics(kind: 'overview' | 'traces' | 'trace', q: Record<string, string | null | undefined>, tz: string, now = Date.now()) {
+    const f: LlmFilters = { model: q.model || null, provider: q.provider || null, status: q.status === 'ok' || q.status === 'error' ? q.status : null, search: q.search || null };
+    if (kind === 'trace') {
+      const id = String(q.id ?? ''); const at = Number(q.ts);
+      const from = Number.isFinite(at) && at > 0 ? at - 86400_000 : now - 90 * 86400_000; const to = Number.isFinite(at) && at > 0 ? at + 86400_000 : now;
+      const t = llmTrace(await this.llmRows(from, to, id, true, 2000), id); if (!t) return null;
+      const ref = this.engine().resolve([t.distinct_id]).get(t.distinct_id);
+      return { ...t, person: ref?.uuid ? { id: ref.uuid, name: String(ref.props.email ?? ref.props.name ?? t.distinct_id) } : null };
+    }
+    const range = llmRange({ date_from: q.date_from, date_to: q.date_to }, tz, now);
+    const rows = await this.llmRows(range.from, range.to);
+    if (kind === 'overview') {
+      const interval = (['hour', 'day', 'week', 'month'].includes(String(q.interval)) ? q.interval : (range.to - range.from <= 2 * 86400_000 ? 'hour' : 'day')) as 'hour' | 'day' | 'week' | 'month';
+      return { ...llmOverview(rows, { from: range.from, to: range.to, interval, tz, filters: f }), interval, date_from: new Date(range.from).toISOString(), date_to: new Date(range.to).toISOString(), truncated: rows.length >= 200_000 };
+    }
+    const tr = llmTraces(rows, f, Math.min(Math.max(Number(q.limit) || 100, 1), 500));
+    const people = this.engine().resolve([...new Set(tr.results.map(t => t.distinct_id))]);
+    return { ...tr, results: tr.results.map(t => { const ref = people.get(t.distinct_id); return { ...t, person: ref?.uuid ? { id: ref.uuid, name: String(ref.props.email ?? ref.props.name ?? t.distinct_id) } : null }; }),
+      date_from: new Date(range.from).toISOString(), date_to: new Date(range.to).toISOString() };
+  }
+
   // ---------- error tracking (design.md "Error tracking") ----------
-  private symbolList: { id: string; ref: string; path: string; r2_key: string }[] | null = null;
+  private symbolList: { id: string; release: string; ref: string; path: string; r2_key: string }[] | null = null;
   private maps = new Map<string, DecodedMap | null>();
-  private findSymbolSet(file: string) {
-    this.symbolList ??= this.all<any>('SELECT id, ref, path, r2_key FROM symbol_sets ORDER BY created_at DESC LIMIT 2000');
+  /**
+   * The symbol set for a frame file: sets uploaded for the event's release first, then unversioned ones (release '');
+   * an event without a release tries unversioned sets, then the newest set of any release. Within a group: exact URL,
+   * same path, then the longest path-suffix match.
+   */
+  private findSymbolSet(file: string, release: string | null = null) {
+    this.symbolList ??= this.all<any>('SELECT id, release, ref, path, r2_key FROM symbol_sets ORDER BY created_at DESC LIMIT 2000');
     if (!this.symbolList.length) return null;
     const ref = refOf(file); const path = pathOf(file);
-    return this.symbolList.find(x => x.ref === ref) ?? this.symbolList.find(x => x.path === path)
-      ?? this.symbolList.filter(x => path.endsWith('/' + x.path.replace(/^\/+/, '')) || x.path.endsWith('/' + path.replace(/^\/+/, ''))).sort((a, b) => b.path.length - a.path.length)[0] ?? null;
+    const pick = (l: NonNullable<ProjectStore['symbolList']>) => l.find(x => x.ref === ref) ?? l.find(x => x.path === path)
+      ?? l.filter(x => path.endsWith('/' + x.path.replace(/^\/+/, '')) || x.path.endsWith('/' + path.replace(/^\/+/, ''))).sort((a, b) => b.path.length - a.path.length)[0] ?? null;
+    const groups = release ? [this.symbolList.filter(x => x.release === release), this.symbolList.filter(x => x.release === '')] : [this.symbolList.filter(x => x.release === ''), this.symbolList];
+    for (const g of groups) { const r = g.length ? pick(g) : null; if (r) return r; }
+    return null;
   }
-  private async loadMap(file: string): Promise<DecodedMap | null> {
-    const set = this.findSymbolSet(file); if (!set) return null;
+  private async loadMap(file: string, release: string | null = null): Promise<DecodedMap | null> {
+    const set = this.findSymbolSet(file, release); if (!set) return null;
     if (this.maps.has(set.id)) { const m = this.maps.get(set.id)!; this.maps.delete(set.id); this.maps.set(set.id, m); return m; }
     let m: DecodedMap | null = null;
     try { const o = await this.env.REPLAY.get(set.r2_key); if (o) m = decodeMap(JSON.parse(await o.text())); } catch (e) { console.error('source map', set.ref, e instanceof Error ? e.message : String(e)); }
@@ -387,100 +483,261 @@ export class ProjectStore extends DurableObject<Env> {
     this.sql.exec('UPDATE symbol_sets SET last_used_at = ? WHERE id = ?', Date.now(), set.id);
     return m;
   }
+  private rulesCache: { grouping: GroupingRule[]; suppression: SuppressionRule[] } | null = null;
+  private rules() {
+    return this.rulesCache ??= {
+      grouping: this.all<any>('SELECT * FROM error_grouping_rules WHERE enabled = 1 ORDER BY position, id').map(r => ({ id: r.id, field: r.field, match: r.match, pattern: r.pattern, key: r.key, enabled: true })),
+      suppression: this.all<{ rule: string }>('SELECT rule FROM error_suppression_rules WHERE enabled = 1 ORDER BY id').map(r => parse(r.rule) as SuppressionRule).filter(r => Array.isArray(r?.values)),
+    };
+  }
+  /** Suppression rules for remote config (`errorTracking.suppressionRules`). */
+  async suppressionRules(): Promise<SuppressionRule[]> { return this.rules().suppression; }
+  /** The issue a fingerprint belongs to: a merge alias first, then the issue with that fingerprint (following merges). */
+  private issueFor(fp: string): string | null {
+    const a = this.one<{ issue_id: string }>('SELECT issue_id FROM error_fingerprint_aliases WHERE fingerprint = ?', fp)?.issue_id;
+    let id = a ?? this.one<{ id: string }>('SELECT id FROM error_issues WHERE fingerprint = ?', fp)?.id ?? null;
+    for (let i = 0; id && i < 5; i++) { const m = this.one<{ merged_into: string | null }>('SELECT merged_into FROM error_issues WHERE id = ?', id)?.merged_into; if (!m) break; id = m; }
+    return id;
+  }
+  private occMeta = new Map<string, { fp: string; release: string | null; raw: string | null; resolved: boolean }>();
   /** Symbolicates and fingerprints exceptions (rewriting their properties) and makes sure each fingerprint has an issue row. */
   private async prepareExceptions(evs: NormEvent[]): Promise<Map<string, string>> {
-    const out = new Map<string, string>();
+    const out = new Map<string, string>(); const rules = this.rules().grouping;
     for (const ev of evs) {
       let list = exceptionList(ev.properties); if (!list.length) list = [{ type: 'Error', value: String(ev.properties.$exception_message ?? 'Unknown error'), stacktrace: { frames: [] } }];
-      try { const r = await symbolicate(list, f => this.loadMap(f)); if (r.resolved) list = r.list; } catch (e) { console.error('symbolicate', e instanceof Error ? e.message : String(e)); }
-      const fp = await fingerprintOf(ev.properties, list);
+      const release = releaseOf(ev.properties);
+      const original = list;
+      try { const r = await symbolicate(list, f => this.loadMap(f, release)); if (r.resolved) list = r.list; } catch (e) { console.error('symbolicate', e instanceof Error ? e.message : String(e)); }
+      const fp = await fingerprintOf(ev.properties, list, rules);
       ev.properties.$exception_list = list; ev.properties.$exception_fingerprint = fp;
+      if (release && ev.properties.$exception_release === undefined) ev.properties.$exception_release = release;
       const first = list[0] ?? {};
-      let issue = this.one<{ id: string }>('SELECT id FROM error_issues WHERE fingerprint = ?', fp)?.id;
+      let issue = this.issueFor(fp);
       if (!issue) {
         issue = uuidv7(ev.ts); const now = Date.now();
         this.sql.exec('INSERT OR IGNORE INTO error_issues (id, fingerprint, type, message, top_frame, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)', issue, fp, String(first.type ?? 'Error').slice(0, 200), String(first.value ?? '').slice(0, 1000), topFrame(list), now, now);
-        issue = this.one<{ id: string }>('SELECT id FROM error_issues WHERE fingerprint = ?', fp)!.id;
+        issue = this.issueFor(fp)!;
       }
       ev.properties.$exception_issue_id = issue;
       if (!ev.properties.$exception_type && first.type) ev.properties.$exception_type = first.type;
       if (!ev.properties.$exception_message && first.value) ev.properties.$exception_message = String(first.value).slice(0, 1000);
+      const pending = unresolvedFrames(list);
+      this.occMeta.set(ev.uuid, { fp, release, raw: pending ? JSON.stringify(original).slice(0, 200_000) : null, resolved: !pending });
       out.set(ev.uuid, issue);
     }
     return out;
   }
   /** Counts one occurrence (idempotent by event uuid); returns a new-issue or regression alert. Suppressed issues never alert. */
   private recordOccurrence(iid: string, ev: NormEvent, pid: number): Alert | null {
-    const p = ev.properties;
-    const ins = this.sql.exec('INSERT OR IGNORE INTO error_occurrences (uuid, issue_id, ts, distinct_id, session_id, url, handled) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING uuid', ev.uuid, iid, ev.ts, ev.distinct_id,
+    const p = ev.properties; const meta = this.occMeta.get(ev.uuid); this.occMeta.delete(ev.uuid);
+    const release = meta?.release ?? null; const sample = JSON.stringify(p.$exception_list ?? []).slice(0, 200_000);
+    const ins = this.sql.exec('INSERT OR IGNORE INTO error_occurrences (uuid, issue_id, ts, distinct_id, session_id, url, handled, release, fingerprint, exception, raw, resolved) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING uuid', ev.uuid, iid, ev.ts, ev.distinct_id,
       typeof p.$session_id === 'string' ? p.$session_id : null, typeof p.$current_url === 'string' ? p.$current_url.slice(0, 2000) : null,
-      (exceptionList(p)[0]?.mechanism as any)?.handled === false ? 0 : 1).toArray().length;
+      (exceptionList(p)[0]?.mechanism as any)?.handled === false ? 0 : 1, release, meta?.fp ?? String(p.$exception_fingerprint ?? ''), sample.slice(0, 50_000), meta?.raw ?? null, meta?.resolved === false ? 0 : 1).toArray().length;
     if (!ins) return null;
     const cur = this.one<any>('SELECT * FROM error_issues WHERE id = ?', iid)!;
     const newUser = this.sql.exec('INSERT OR IGNORE INTO error_issue_users (issue_id, distinct_id) VALUES (?, ?) RETURNING issue_id', iid, ev.distinct_id).toArray().length;
     const regressed = cur.status === 'resolved' && cur.resolved_at !== null && ev.ts > cur.resolved_at;
     const isNew = cur.occurrences === 0;
     const latest = cur.last_seen === null || ev.ts >= cur.last_seen;
+    const earliest = cur.first_seen === null || ev.ts < cur.first_seen;
     this.sql.exec(`UPDATE error_issues SET occurrences = occurrences + 1, users = users + ?, first_seen = MIN(COALESCE(first_seen, ?), ?), last_seen = MAX(COALESCE(last_seen, ?), ?),
-        status = CASE WHEN ? THEN 'active' ELSE status END, regressions = regressions + ?, sample = CASE WHEN ? THEN ? ELSE sample END, sample_uuid = CASE WHEN ? THEN ? ELSE sample_uuid END, updated_at = ? WHERE id = ?`,
-      newUser, ev.ts, ev.ts, ev.ts, ev.ts, regressed ? 1 : 0, regressed ? 1 : 0, latest ? 1 : 0, JSON.stringify(p.$exception_list ?? []).slice(0, 200_000), latest ? 1 : 0, ev.uuid, Date.now(), iid);
+        status = CASE WHEN ? THEN 'active' ELSE status END, regressions = regressions + ?, sample = CASE WHEN ? THEN ? ELSE sample END, sample_uuid = CASE WHEN ? THEN ? ELSE sample_uuid END,
+        first_seen_release = CASE WHEN ? AND ? IS NOT NULL THEN ? ELSE COALESCE(first_seen_release, ?) END, last_seen_release = CASE WHEN ? AND ? IS NOT NULL THEN ? ELSE last_seen_release END, updated_at = ? WHERE id = ?`,
+      newUser, ev.ts, ev.ts, ev.ts, ev.ts, regressed ? 1 : 0, regressed ? 1 : 0, latest ? 1 : 0, sample, latest ? 1 : 0, ev.uuid,
+      earliest ? 1 : 0, release, release, release, latest ? 1 : 0, release, release, Date.now(), iid);
     if (cur.status === 'suppressed') return null;
     const name = `${cur.type}${cur.message ? ': ' + String(cur.message).slice(0, 120) : ''}`;
-    if (isNew) return { kind: 'error_new', title: `New issue: ${name}`, body: `First seen ${new Date(ev.ts).toISOString()} for ${ev.distinct_id}${typeof p.$current_url === 'string' ? ' on ' + p.$current_url : ''}.${cur.top_frame ? '\nAt ' + cur.top_frame : ''}`, link: `/project/${pid}/errors/${iid}` };
-    if (regressed) return { kind: 'error_regression', title: `Regression: ${name}`, body: `This issue was resolved on ${new Date(cur.resolved_at).toISOString()} and happened again at ${new Date(ev.ts).toISOString()} for ${ev.distinct_id}.`, link: `/project/${pid}/errors/${iid}` };
+    if (isNew) return { kind: 'error_new', title: `New issue: ${name}`, body: `First seen ${new Date(ev.ts).toISOString()} for ${ev.distinct_id}${typeof p.$current_url === 'string' ? ' on ' + p.$current_url : ''}${release ? ` (release ${release})` : ''}.${cur.top_frame ? '\nAt ' + cur.top_frame : ''}`, link: `/project/${pid}/errors/${iid}` };
+    if (regressed) return { kind: 'error_regression', title: `Regression: ${name}`, body: `This issue was resolved on ${new Date(cur.resolved_at).toISOString()} and happened again at ${new Date(ev.ts).toISOString()} for ${ev.distinct_id}${release ? ` in release ${release}` : ''}.`, link: `/project/${pid}/errors/${iid}` };
     return null;
   }
   private issueOut(r: any) {
     return { id: r.id, fingerprint: r.fingerprint, status: r.status, type: r.type, message: r.message, top_frame: r.top_frame, first_seen: r.first_seen, last_seen: r.last_seen,
-      occurrences: r.occurrences, users: r.users, resolved_at: r.resolved_at, regressions: r.regressions };
+      occurrences: r.occurrences, users: r.users, resolved_at: r.resolved_at, regressions: r.regressions, first_seen_release: r.first_seen_release ?? null, last_seen_release: r.last_seen_release ?? null,
+      assignee: r.assignee_id ? { id: r.assignee_id, email: r.assignee_email } : null, merged_into: r.merged_into ?? null };
   }
-  async listIssues(o: { status?: string | null; search?: string | null; order?: string | null; limit?: number }) {
+  async listIssues(o: { status?: string | null; search?: string | null; order?: string | null; limit?: number; release?: string | null; assignee?: string | number | null }) {
     const order = o.order === 'occurrences' ? 'occurrences DESC' : o.order === 'first_seen' ? 'first_seen DESC' : o.order === 'users' ? 'users DESC' : 'last_seen DESC';
     const status = o.status && ['active', 'resolved', 'suppressed'].includes(o.status) ? o.status : null;
     const q = o.search ? '%' + o.search.replace(/[%_]/g, '') + '%' : null;
-    const rows = this.all<any>(`SELECT * FROM error_issues WHERE occurrences > 0 AND (? IS NULL OR status = ?) AND (? IS NULL OR type LIKE ? OR message LIKE ? OR top_frame LIKE ?) ORDER BY ${order} LIMIT ?`,
-      status, status, q, q, q, q, Math.min(Math.max(o.limit ?? 100, 1), 500));
+    const release = o.release ? String(o.release).slice(0, 200) : null;
+    // assignee: a user id, 'none' for unassigned, or null for everyone.
+    const asg = o.assignee === 'none' ? -1 : o.assignee !== null && o.assignee !== undefined && o.assignee !== '' ? Number(o.assignee) : null;
+    const rows = this.all<any>(`SELECT * FROM error_issues WHERE occurrences > 0 AND status != 'merged' AND (? IS NULL OR status = ?) AND (? IS NULL OR type LIKE ? OR message LIKE ? OR top_frame LIKE ?)
+        AND (? IS NULL OR id IN (SELECT issue_id FROM error_occurrences WHERE release = ?)) AND (? IS NULL OR (? = -1 AND assignee_id IS NULL) OR assignee_id = ?) ORDER BY ${order} LIMIT ?`,
+      status, status, q, q, q, q, release, release, asg, asg, asg, Math.min(Math.max(o.limit ?? 100, 1), 500));
     const since = Date.now() - 14 * 86400_000;
     const spark = new Map<string, number[]>();
     for (const r of this.all<{ issue_id: string; d: number; c: number }>(`SELECT issue_id, CAST((ts - ?) / 86400000 AS INTEGER) AS d, COUNT(*) AS c FROM error_occurrences WHERE ts >= ? AND issue_id IN (SELECT value FROM json_each(?)) GROUP BY issue_id, d`, since, since, JSON.stringify(rows.map(r => r.id)))) {
       const a = spark.get(r.issue_id) ?? Array(14).fill(0); if (r.d >= 0 && r.d < 14) a[r.d] = r.c; spark.set(r.issue_id, a);
     }
-    const counts = Object.fromEntries(this.all<{ status: string; c: number }>('SELECT status, COUNT(*) AS c FROM error_issues WHERE occurrences > 0 GROUP BY status').map(r => [r.status, r.c]));
+    const counts = Object.fromEntries(this.all<{ status: string; c: number }>("SELECT status, COUNT(*) AS c FROM error_issues WHERE occurrences > 0 AND status != 'merged' GROUP BY status").map(r => [r.status, r.c]));
     return { results: rows.map(r => ({ ...this.issueOut(r), last_14_days: spark.get(r.id) ?? Array(14).fill(0) })), counts };
+  }
+  /** Releases seen in exceptions, newest first, with occurrence and issue counts. */
+  async errorReleases() {
+    return this.all<any>(`SELECT release, COUNT(*) AS occurrences, COUNT(DISTINCT issue_id) AS issues, MIN(ts) AS first_seen, MAX(ts) AS last_seen FROM error_occurrences WHERE release IS NOT NULL GROUP BY release ORDER BY last_seen DESC LIMIT 200`);
   }
   async getIssue(id: string) {
     const r = this.one<any>('SELECT * FROM error_issues WHERE id = ?', id); if (!r) return null;
-    const occ = this.all<any>('SELECT * FROM error_occurrences WHERE issue_id = ? ORDER BY ts DESC LIMIT 50', id);
+    const occ = this.all<any>('SELECT uuid, ts, distinct_id, session_id, url, handled, release, fingerprint, resolved FROM error_occurrences WHERE issue_id = ? ORDER BY ts DESC LIMIT 50', id);
     const people = this.engine().resolve([...new Set(occ.map(o => o.distinct_id))]);
     const sids = [...new Set(occ.map(o => o.session_id).filter(Boolean))];
     const recs = new Set(this.all<{ s: string }>('SELECT session_id AS s FROM session_recordings WHERE session_id IN (SELECT value FROM json_each(?))', JSON.stringify(sids)).map(x => x.s));
     const since = Date.now() - 30 * 86400_000;
     const daily = this.all<{ d: string; c: number }>(`SELECT strftime('%Y-%m-%d', ts / 1000, 'unixepoch') AS d, COUNT(*) AS c FROM error_occurrences WHERE issue_id = ? AND ts >= ? GROUP BY d ORDER BY d`, id, since);
+    const releases = this.all<any>('SELECT release, COUNT(*) AS occurrences, MIN(ts) AS first_seen, MAX(ts) AS last_seen FROM error_occurrences WHERE issue_id = ? AND release IS NOT NULL GROUP BY release ORDER BY last_seen DESC LIMIT 50', id);
+    const fingerprints = this.all<any>(`SELECT fingerprint, COUNT(*) AS occurrences, MAX(ts) AS last_seen FROM error_occurrences WHERE issue_id = ? GROUP BY fingerprint ORDER BY occurrences DESC LIMIT 50`, id)
+      .map(f => ({ ...f, primary: f.fingerprint === r.fingerprint }));
+    const merged = this.all<any>(`SELECT id, type, message FROM error_issues WHERE merged_into = ?`, id);
     let exception: unknown = []; try { exception = r.sample ? JSON.parse(r.sample) : []; } catch { /* keep empty */ }
-    return { ...this.issueOut(r), exception_list: exception, sample_event_uuid: r.sample_uuid, daily,
-      occurrences_list: occ.map(o => { const ref = people.get(o.distinct_id); return { uuid: o.uuid, timestamp: o.ts, distinct_id: o.distinct_id, session_id: o.session_id, url: o.url, handled: o.handled === null ? null : !!o.handled,
+    return { ...this.issueOut(r), exception_list: exception, sample_event_uuid: r.sample_uuid, daily, releases, fingerprints, merged_issues: merged,
+      occurrences_list: occ.map(o => { const ref = people.get(o.distinct_id); return { uuid: o.uuid, timestamp: o.ts, distinct_id: o.distinct_id, session_id: o.session_id, url: o.url, handled: o.handled === null ? null : !!o.handled, release: o.release ?? null, fingerprint: o.fingerprint, symbolicated: !!o.resolved,
         person: ref?.uuid ? { id: ref.uuid, name: (ref.props.email ?? ref.props.name ?? o.distinct_id) as string } : null, has_recording: !!o.session_id && recs.has(o.session_id) }; }) };
   }
+  /** Status and assignment. `assignee` is resolved to a D1 user by the API: { id, email } or null to unassign. */
   async updateIssue(id: string, b: any) {
-    const r = this.one<any>('SELECT * FROM error_issues WHERE id = ?', id); if (!r) return null;
+    const r = this.one<any>('SELECT * FROM error_issues WHERE id = ?', id); if (!r || r.status === 'merged') return null;
     if (b.status !== undefined) {
       if (!['active', 'resolved', 'suppressed'].includes(b.status)) return { error: "status must be 'active', 'resolved' or 'suppressed'" };
       this.sql.exec('UPDATE error_issues SET status = ?, resolved_at = ?, updated_at = ? WHERE id = ?', b.status, b.status === 'resolved' ? Date.now() : null, Date.now(), id);
     }
+    if (b.assignee !== undefined) this.sql.exec('UPDATE error_issues SET assignee_id = ?, assignee_email = ?, updated_at = ? WHERE id = ?', b.assignee?.id ?? null, b.assignee?.email ?? null, Date.now(), id);
     return this.issueOut(this.one<any>('SELECT * FROM error_issues WHERE id = ?', id));
   }
-  async addSymbolSet(ref: string, r2Key: string, size: number): Promise<{ id: string; replaced: string | null }> {
-    const old = this.one<{ r2_key: string }>('SELECT r2_key FROM symbol_sets WHERE ref = ?', ref);
+  /** Recomputes an issue's counters, users, first/last seen and releases from its occurrences. */
+  private recount(id: string) {
+    this.sql.exec('DELETE FROM error_issue_users WHERE issue_id = ?', id);
+    this.sql.exec('INSERT OR IGNORE INTO error_issue_users (issue_id, distinct_id) SELECT DISTINCT ?, distinct_id FROM error_occurrences WHERE issue_id = ?', id, id);
+    const a = this.one<any>('SELECT COUNT(*) AS n, MIN(ts) AS f, MAX(ts) AS l FROM error_occurrences WHERE issue_id = ?', id)!;
+    const fr = this.one<any>('SELECT release FROM error_occurrences WHERE issue_id = ? AND release IS NOT NULL ORDER BY ts ASC LIMIT 1', id)?.release ?? null;
+    const lr = this.one<any>('SELECT release FROM error_occurrences WHERE issue_id = ? AND release IS NOT NULL ORDER BY ts DESC LIMIT 1', id)?.release ?? null;
+    const latest = this.one<any>('SELECT uuid, exception FROM error_occurrences WHERE issue_id = ? AND exception IS NOT NULL ORDER BY ts DESC LIMIT 1', id);
+    this.sql.exec(`UPDATE error_issues SET occurrences = ?, users = (SELECT COUNT(*) FROM error_issue_users WHERE issue_id = ?), first_seen = ?, last_seen = ?, first_seen_release = ?, last_seen_release = ?,
+        sample = COALESCE(?, sample), sample_uuid = COALESCE(?, sample_uuid), updated_at = ? WHERE id = ?`, a.n, id, a.f, a.l, fr, lr, latest?.exception ?? null, latest?.uuid ?? null, Date.now(), id);
+  }
+  /**
+   * Merges issues into `primary` (design.md "Merge and split"): every fingerprint of a merged issue becomes an alias of
+   * the primary, so later occurrences land there; past occurrences and affected users move over and counters roll up.
+   * Merged issues stay as rows with status 'merged' so a split can bring them back.
+   */
+  async mergeIssues(primary: string, others: string[]): Promise<{ error: string } | ReturnType<ProjectStore['issueOut']>> {
+    const p = this.one<any>('SELECT * FROM error_issues WHERE id = ?', primary); if (!p || p.status === 'merged') return { error: 'not_found' };
+    const ids = [...new Set(others.map(String))].filter(x => x !== primary);
+    if (!ids.length) return { error: 'ids must list at least one other issue' };
+    const rows = ids.map(i => this.one<any>('SELECT * FROM error_issues WHERE id = ?', i));
+    if (rows.some(r => !r || r.status === 'merged')) return { error: 'every issue to merge must exist and not be merged already' };
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      for (const r of rows) {
+        this.sql.exec('INSERT OR REPLACE INTO error_fingerprint_aliases (fingerprint, issue_id, original_issue_id, created_at) VALUES (?, ?, ?, ?)', r.fingerprint, primary, r.id, now);
+        this.sql.exec('UPDATE error_fingerprint_aliases SET issue_id = ? WHERE issue_id = ?', primary, r.id);
+        this.sql.exec('UPDATE error_occurrences SET issue_id = ? WHERE issue_id = ?', primary, r.id);
+        this.sql.exec('DELETE FROM error_issue_users WHERE issue_id = ?', r.id);
+        this.sql.exec('UPDATE error_issues SET merged_into = ? WHERE merged_into = ?', primary, r.id);
+        this.sql.exec("UPDATE error_issues SET status = 'merged', merged_into = ?, occurrences = 0, users = 0, updated_at = ? WHERE id = ?", primary, now, r.id);
+      }
+      this.recount(primary);
+    });
+    return this.issueOut(this.one<any>('SELECT * FROM error_issues WHERE id = ?', primary));
+  }
+  /**
+   * Splits one fingerprint out of an issue: its alias is removed and its occurrences move to the issue that owns the
+   * fingerprint (the merged issue is restored) or to a new issue; later occurrences follow.
+   */
+  async splitIssue(id: string, fingerprint: string): Promise<{ error: string } | { issue: ReturnType<ProjectStore['issueOut']>; split: ReturnType<ProjectStore['issueOut']> }> {
+    const p = this.one<any>('SELECT * FROM error_issues WHERE id = ?', id); if (!p || p.status === 'merged') return { error: 'not_found' };
+    if (fingerprint === p.fingerprint) return { error: "the issue's own fingerprint cannot be split out" };
+    const n = this.one<{ c: number }>('SELECT COUNT(*) AS c FROM error_occurrences WHERE issue_id = ? AND fingerprint = ?', id, fingerprint)!.c;
+    const alias = this.one<any>('SELECT * FROM error_fingerprint_aliases WHERE fingerprint = ? AND issue_id = ?', fingerprint, id);
+    if (!n && !alias) return { error: 'that fingerprint is not part of this issue' };
+    const now = Date.now(); let target = '';
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec('DELETE FROM error_fingerprint_aliases WHERE fingerprint = ?', fingerprint);
+      const own = this.one<any>('SELECT * FROM error_issues WHERE fingerprint = ?', fingerprint);
+      if (own) { target = own.id; this.sql.exec("UPDATE error_issues SET status = 'active', merged_into = NULL, resolved_at = NULL, updated_at = ? WHERE id = ?", now, own.id); }
+      else {
+        const occ = this.one<any>('SELECT exception, ts FROM error_occurrences WHERE issue_id = ? AND fingerprint = ? ORDER BY ts DESC LIMIT 1', id, fingerprint);
+        let list: ExceptionEntry[] = []; try { list = occ?.exception ? JSON.parse(occ.exception) : []; } catch { /* empty */ }
+        const e = list[0] ?? {}; target = uuidv7(occ?.ts ?? now);
+        this.sql.exec('INSERT INTO error_issues (id, fingerprint, type, message, top_frame, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)', target, fingerprint, String(e.type ?? p.type).slice(0, 200), String(e.value ?? p.message ?? '').slice(0, 1000), topFrame(list) ?? p.top_frame, now, now);
+      }
+      this.sql.exec('UPDATE error_occurrences SET issue_id = ? WHERE issue_id = ? AND fingerprint = ?', target, id, fingerprint);
+      this.recount(id); this.recount(target);
+    });
+    return { issue: this.issueOut(this.one<any>('SELECT * FROM error_issues WHERE id = ?', id)), split: this.issueOut(this.one<any>('SELECT * FROM error_issues WHERE id = ?', target)) };
+  }
+  // Grouping and suppression rules (design.md "Grouping rules", "Suppression rules").
+  async listGroupingRules() { return this.all<any>('SELECT * FROM error_grouping_rules ORDER BY position, id').map(r => ({ ...r, enabled: !!r.enabled })); }
+  async saveGroupingRule(id: number | null, b: any): Promise<{ error: string } | Record<string, unknown>> {
+    // PATCH merges into the stored rule, so { enabled: false } alone works.
+    if (id !== null) { const cur = this.one<any>('SELECT * FROM error_grouping_rules WHERE id = ?', id); if (!cur) return { error: 'not_found' }; b = { field: cur.field, match: cur.match, pattern: cur.pattern, key: cur.key, description: cur.description, enabled: !!cur.enabled, ...b }; }
+    let rule: GroupingRule; try { rule = cleanGroupingRule(b); } catch (e) { return { error: e instanceof Error ? e.message : String(e) }; }
+    const pos = b.position !== undefined ? Math.max(0, Math.floor(Number(b.position) || 0)) : null;
+    let r: any;
+    if (id === null) r = this.one('INSERT INTO error_grouping_rules (position, field, match, pattern, key, description, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *',
+      pos ?? (this.one<{ m: number }>('SELECT COALESCE(MAX(position), -1) + 1 AS m FROM error_grouping_rules')!.m), rule.field, rule.match, rule.pattern, rule.key, rule.description ?? '', rule.enabled ? 1 : 0, Date.now());
+    else r = this.one('UPDATE error_grouping_rules SET position = COALESCE(?, position), field = ?, match = ?, pattern = ?, key = ?, description = ?, enabled = ? WHERE id = ? RETURNING *', pos, rule.field, rule.match, rule.pattern, rule.key, rule.description ?? '', rule.enabled ? 1 : 0, id);
+    if (!r) return { error: 'not_found' };
+    this.rulesCache = null; return { ...r, enabled: !!r.enabled };
+  }
+  async deleteGroupingRule(id: number) { const n = this.sql.exec('DELETE FROM error_grouping_rules WHERE id = ? RETURNING id', id).toArray().length; this.rulesCache = null; return n > 0; }
+  async listSuppressionRules() { return this.all<any>('SELECT * FROM error_suppression_rules ORDER BY id').map(r => ({ id: r.id, ...parse(r.rule), description: r.description, enabled: !!r.enabled, created_at: r.created_at })); }
+  async saveSuppressionRule(id: number | null, b: any): Promise<{ error: string } | Record<string, unknown>> {
+    if (id !== null) { const cur = this.one<any>('SELECT * FROM error_suppression_rules WHERE id = ?', id); if (!cur) return { error: 'not_found' }; b = { ...parse(cur.rule), description: cur.description, enabled: !!cur.enabled, ...b }; }
+    let rule: SuppressionRule; try { rule = cleanSuppressionRule(b); } catch (e) { return { error: e instanceof Error ? e.message : String(e) }; }
+    const desc = String(b.description ?? '').slice(0, 300); const en = b.enabled === false ? 0 : 1;
+    const r = id === null ? this.one<any>('INSERT INTO error_suppression_rules (rule, description, enabled, created_at) VALUES (?, ?, ?, ?) RETURNING *', JSON.stringify(rule), desc, en, Date.now())
+      : this.one<any>('UPDATE error_suppression_rules SET rule = ?, description = ?, enabled = ? WHERE id = ? RETURNING *', JSON.stringify(rule), desc, en, id);
+    if (!r) return { error: 'not_found' };
+    this.rulesCache = null; return { id: r.id, ...rule, description: r.description, enabled: !!r.enabled, created_at: r.created_at };
+  }
+  async deleteSuppressionRule(id: number) { const n = this.sql.exec('DELETE FROM error_suppression_rules WHERE id = ? RETURNING id', id).toArray().length; this.rulesCache = null; return n > 0; }
+
+  async addSymbolSet(ref: string, r2Key: string, size: number, release = ''): Promise<{ id: string; replaced: string | null }> {
+    const old = this.one<{ r2_key: string }>('SELECT r2_key FROM symbol_sets WHERE release = ? AND ref = ?', release, ref);
     const id = uuidv7();
-    this.sql.exec('INSERT INTO symbol_sets (id, ref, path, r2_key, size, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(ref) DO UPDATE SET id = excluded.id, path = excluded.path, r2_key = excluded.r2_key, size = excluded.size, created_at = excluded.created_at, last_used_at = NULL',
-      id, ref, pathOf(ref), r2Key, size, Date.now());
+    this.sql.exec('INSERT INTO symbol_sets (id, release, ref, path, r2_key, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(release, ref) DO UPDATE SET id = excluded.id, path = excluded.path, r2_key = excluded.r2_key, size = excluded.size, created_at = excluded.created_at, last_used_at = NULL',
+      id, release, ref, pathOf(ref), r2Key, size, Date.now());
     this.symbolList = null; this.maps.clear();
     return { id, replaced: old && old.r2_key !== r2Key ? old.r2_key : null };
   }
-  async listSymbolSets() { return this.all<any>('SELECT id, ref, path, size, created_at, last_used_at FROM symbol_sets ORDER BY created_at DESC'); }
+  /**
+   * Retroactive symbolication (design.md "Source maps"): after an upload, occurrences from the last 30 days that still
+   * have unresolved frames in that file are symbolicated again; their stored stack, the issue's sample stack and top
+   * frame are updated, and the resolved fingerprint becomes an alias of the issue so later, already-symbolicated
+   * occurrences group with it. Events already stored in the shards keep the frames they arrived with.
+   */
+  async resymbolicate(ref: string, release = '', limit = 2000, now = Date.now()): Promise<{ scanned: number; symbolicated: number; issues: number }> {
+    const base = pathOf(ref).split('/').pop() || ref;
+    const rows = this.all<any>(`SELECT uuid, issue_id, fingerprint, raw, release FROM error_occurrences WHERE resolved = 0 AND raw IS NOT NULL AND ts >= ? AND instr(raw, ?) > 0 AND (? = '' OR release = ?) ORDER BY ts DESC LIMIT ?`,
+      now - 30 * 86400_000, base, release, release, limit);
+    const rules = this.rules().grouping; const touched = new Set<string>(); let done = 0;
+    for (const o of rows) {
+      let raw: ExceptionEntry[]; try { raw = JSON.parse(o.raw); } catch { continue; }
+      let r: { list: ExceptionEntry[]; resolved: number };
+      try { r = await symbolicate(raw, f => this.loadMap(f, o.release ?? null)); } catch { continue; }
+      if (!r.resolved) continue;
+      done++; const pending = unresolvedFrames(r.list); const text = JSON.stringify(r.list);
+      this.sql.exec('UPDATE error_occurrences SET exception = ?, resolved = ?, raw = ? WHERE uuid = ?', text.slice(0, 50_000), pending ? 0 : 1, pending ? o.raw : null, o.uuid);
+      const iss = this.one<any>('SELECT sample_uuid, sample FROM error_issues WHERE id = ?', o.issue_id);
+      if (iss && (iss.sample_uuid === o.uuid || !String(iss.sample ?? '').includes('"resolved":true'))) {
+        this.sql.exec('UPDATE error_issues SET sample = ?, sample_uuid = ?, top_frame = ?, updated_at = ? WHERE id = ?', text.slice(0, 200_000), o.uuid, topFrame(r.list), Date.now(), o.issue_id);
+      }
+      if (!String(o.fingerprint ?? '').startsWith('custom:') && !String(o.fingerprint ?? '').startsWith('rule:')) {
+        const fp2 = await fingerprintOf({}, r.list, rules);
+        if (fp2 !== o.fingerprint && !this.issueFor(fp2)) this.sql.exec('INSERT OR IGNORE INTO error_fingerprint_aliases (fingerprint, issue_id, original_issue_id, created_at) VALUES (?, ?, NULL, ?)', fp2, o.issue_id, Date.now());
+      }
+      touched.add(o.issue_id);
+    }
+    return { scanned: rows.length, symbolicated: done, issues: touched.size };
+  }
+  async listSymbolSets() { return this.all<any>('SELECT id, release, ref, path, size, created_at, last_used_at FROM symbol_sets ORDER BY created_at DESC'); }
   async deleteSymbolSet(id: string): Promise<string | null> {
     const r = this.one<{ r2_key: string }>('DELETE FROM symbol_sets WHERE id = ? RETURNING r2_key', id); this.symbolList = null; this.maps.clear(); return r?.r2_key ?? null;
   }
+
 
   private define(ev: NormEvent) {
     if (!this.seenEvents.has(ev.event)) {

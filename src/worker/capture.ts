@@ -5,9 +5,16 @@ import { parseDate, parseEventTimestamp } from '../shared/timestamp';
 import { isUuid, uuidv7 } from '../shared/ids';
 import { projectByToken, validToken } from './projects';
 import { gateEvents } from './usage';
+import { meter } from './meter';
 
 export const LEGACY_PATHS = new Set(['/e', '/batch', '/capture', '/track', '/engage', '/i/v0/e', '/i/v0/ai/batch']);
 export const V1_PATH = '/i/v1/analytics/events';
+/** LLM analytics endpoints (protocol.md "LLM analytics"): JSON batch like legacy capture, one multipart event, or a v1 batch.
+ * They only take `$ai_*` events; anything else is dropped as misrouted. */
+export const AI_BATCH_PATH = '/i/v0/ai/batch';
+export const AI_MULTIPART_PATH = '/i/v0/ai';
+export const AI_V1_PATH = '/i/v1/ai/events';
+export const isAiEvent = (name: unknown) => typeof name === 'string' && name.startsWith('$ai_');
 const DROPPED_EVENTS = new Set(['$performance_event', '$snapshot', '$snapshot_items']);
 const MSG_BUDGET = 100_000; // bytes of JSON per queue message (queue limit is 128 KB)
 
@@ -107,7 +114,7 @@ function reqCtx(req: Request, sentAt: number | null): Ctx {
   return { now: Date.now(), sentAt, ip: req.headers.get('cf-connecting-ip'), geo: geoProps(req) };
 }
 
-export async function handleLegacyCapture(req: Request, env: Env, url: URL): Promise<Response> {
+export async function handleLegacyCapture(req: Request, env: Env, url: URL, ectx?: ExecutionContext): Promise<Response> {
   let bytes: Uint8Array;
   if (req.method === 'GET') {
     const d = url.searchParams.get('data');
@@ -144,13 +151,15 @@ export async function handleLegacyCapture(req: Request, env: Env, url: URL): Pro
   if (!project) return ok(); // unknown project: accepted and dropped, as the reference service does
   const ctx = reqCtx(req, sentAt);
   const events: NormEvent[] = [];
-  for (const r of rawEvents) { const n = normalize(r, ctx, { v1: false, anonymizeIps: !!project.anonymize_ips }); if (!('drop' in n)) events.push(n); }
+  const aiOnly = path === AI_BATCH_PATH;
+  for (const r of rawEvents) { if (aiOnly && !isAiEvent(obj(r)?.event)) continue; const n = normalize(r, ctx, { v1: false, anonymizeIps: !!project.anonymize_ips }); if (!('drop' in n)) events.push(n); }
   const g = gateEvents(project, events, ctx.now); quota = g.quotaLimited;
+  meterCap(env, ectx, project.id, g.capDropped, g.keep.length);
   if (g.keep.length) await enqueue(env, project.id, g.keep);
   return ok();
 }
 
-export async function handleV1Capture(req: Request, env: Env): Promise<Response> {
+export async function handleV1Capture(req: Request, env: Env, ectx?: ExecutionContext, aiOnly = false): Promise<Response> {
   const auth = req.headers.get('authorization') ?? '';
   const m = /^(\S+)\s+(.+)$/.exec(auth);
   if (!m) return err(req, 401, 'invalid_api_key', 'Missing Authorization header.', 'authentication_error');
@@ -178,13 +187,62 @@ export async function handleV1Capture(req: Request, env: Env): Promise<Response>
     const key = id || ('drop' in n ? uuidv7() : n.uuid);
     seen.set(key, 1);
     if ('drop' in n) { results[key] = { result: 'drop', details: n.drop }; continue; }
+    if (aiOnly && !isAiEvent(n.event)) { results[key] = { result: 'drop', details: 'misrouted_event' }; continue; }
     results[key] = { result: 'ok' };
     if (project) events.push(n);
   }
   let quota: string[] | null = null;
   if (project && events.length) {
     const g = gateEvents(project, events, ctx.now); quota = g.quotaLimited;
+    meterCap(env, ectx, project.id, g.capDropped, g.keep.length);
     if (g.keep.length) await enqueue(env, project.id, g.keep);
   }
   return json(quota ? { results, quota_limited: quota } : { results }, 200, cors(req));
+}
+/** Counts events a spending cap dropped at the edge, and the request when nothing of it was kept. */
+function meterCap(env: Env, ectx: ExecutionContext | undefined, pid: number, capDropped: number, kept: number) {
+  if (capDropped <= 0) return;
+  meter(env, ectx, pid, 'edge_dropped_events', capDropped);
+  if (!kept) meter(env, ectx, pid, 'edge_dropped_requests', 1);
+}
+
+/**
+ * POST /i/v0/ai (protocol.md "LLM analytics"): one `$ai_*` event as multipart/form-data with an `event` part (the event
+ * JSON) and an optional `event.properties` part (its properties, merged over the event's own), project token as
+ * `Authorization: Bearer`, body optionally gzip (Content-Encoding). Any other part is refused with 400.
+ */
+export async function handleAiMultipart(req: Request, env: Env, ectx?: ExecutionContext): Promise<Response> {
+  const auth = /^Bearer\s+(\S+)$/i.exec(req.headers.get('authorization') ?? '');
+  if (!auth || !validToken(auth[1])) return err(req, 401, 'invalid_api_key', 'Use Authorization: Bearer <project token>.', 'authentication_error');
+  const ct = req.headers.get('content-type') ?? '';
+  if (!ct.toLowerCase().startsWith('multipart/form-data')) return err(req, 400, 'invalid_payload', 'Content-Type must be multipart/form-data');
+  let bytes = new Uint8Array(await req.arrayBuffer());
+  if (!bytes.length) return err(req, 400, 'no_data', 'Empty request body.');
+  if (bytes.length > 25 * 1024 * 1024) return err(req, 413, 'payload_too_large', 'Payload too large.');
+  const ce = (req.headers.get('content-encoding') ?? '').toLowerCase().trim();
+  try { if (ce === 'gzip') bytes = new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer()); }
+  catch { return err(req, 400, 'invalid_payload', 'Body is not valid gzip.'); }
+  let form: FormData;
+  try { form = await new Response(bytes, { headers: { 'content-type': ct } }).formData(); }
+  catch { return err(req, 400, 'invalid_payload', 'Malformed multipart body.'); }
+  const names = [...new Set([...form.keys()])];
+  const bad = names.find(n => n !== 'event' && n !== 'event.properties');
+  if (bad) return err(req, 400, 'invalid_payload', `Unknown multipart part ${bad.slice(0, 80)}; only event and event.properties are accepted.`);
+  if (form.getAll('event').length !== 1 || form.getAll('event.properties').length > 1) return err(req, 400, 'invalid_payload', 'Send exactly one event part and at most one event.properties part.');
+  const text = async (v: string | File | null) => v === null ? null : typeof v === 'string' ? v : await v.text();
+  let event: any; let props: any = null;
+  try { event = JSON.parse((await text(form.get('event')))!); const pt = await text(form.get('event.properties')); if (pt !== null) props = JSON.parse(pt); }
+  catch { return err(req, 400, 'invalid_payload', 'The event and event.properties parts must be JSON.'); }
+  if (!obj(event) || (props !== null && !obj(props))) return err(req, 400, 'invalid_payload', 'The event part must be a JSON object.');
+  if (!isAiEvent(event.event)) return err(req, 400, 'misrouted_event', 'Only $ai_* events are accepted here.');
+  if (event.uuid !== undefined && !isUuid(event.uuid)) return err(req, 400, 'invalid_uuid', 'uuid must be a UUID.');
+  const project = await projectByToken(env, auth[1]);
+  if (!project) return json({ status: 1 }, 200, cors(req));
+  const ctx = reqCtx(req, null);
+  const n = normalize({ ...event, properties: { ...(obj(event.properties) ?? {}), ...(props ?? {}) } }, ctx, { v1: true, anonymizeIps: !!project.anonymize_ips });
+  if ('drop' in n) return err(req, 400, 'invalid_payload', `Event dropped: ${n.drop}`);
+  const g = gateEvents(project, [n], ctx.now);
+  meterCap(env, ectx, project.id, g.capDropped, g.keep.length);
+  if (g.keep.length) await enqueue(env, project.id, g.keep);
+  return json(g.quotaLimited ? { status: 1, quota_limited: g.quotaLimited } : { status: 1 }, 200, cors(req));
 }

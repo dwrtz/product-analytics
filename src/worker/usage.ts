@@ -60,15 +60,16 @@ export function capStateOf(p: Pick<ProjectRow, 'cap_state'> | null | undefined, 
 }
 
 /** Edge gate for captured events: autocapture sampling, then the cap (protocol.md "Quota limiting"). */
-export function gateEvents<E extends { event: string; distinct_id: string; properties: Record<string, unknown> }>(p: ProjectRow, events: E[], now = Date.now()): { keep: E[]; quotaLimited: string[] | null } {
-  if (!p.limits) return { keep: events, quotaLimited: null };
+export function gateEvents<E extends { event: string; distinct_id: string; properties: Record<string, unknown> }>(p: ProjectRow, events: E[], now = Date.now()): { keep: E[]; quotaLimited: string[] | null; capDropped: number } {
+  if (!p.limits) return { keep: events, quotaLimited: null, capDropped: 0 };
   const L = limitsOf(p); const st = capStateOf(p, now);
   let keep = L.autocapture_sample_rate >= 1 ? events : events.filter(e => e.event !== '$autocapture' || sampled('ac:' + String(e.properties.$session_id ?? e.distinct_id), L.autocapture_sample_rate));
   if (st.events) {
-    if (L.over_cap === 'drop') return { keep: [], quotaLimited: ['events', 'exceptionEvent'] };
-    keep = keep.filter(e => sampled('cap:' + e.distinct_id, L.over_cap_sample_rate));
+    if (L.over_cap === 'drop') return { keep: [], quotaLimited: ['events', 'exceptionEvent'], capDropped: keep.length };
+    const n = keep.length; keep = keep.filter(e => sampled('cap:' + e.distinct_id, L.over_cap_sample_rate));
+    return { keep, quotaLimited: null, capDropped: n - keep.length };
   }
-  return { keep, quotaLimited: null };
+  return { keep, quotaLimited: null, capDropped: 0 };
 }
 /** Edge gate for replay: false drops the session's snapshots. */
 export function replayAllowed(p: ProjectRow, sessionId: string, now = Date.now()): boolean {
@@ -105,23 +106,33 @@ export const PRICES = {
 export const ASSUMPTIONS = {
   cpu_ms_per_request: 3, do_requests_per_message: 2, do_seconds_per_request: 0.01, do_memory_gb: 0.128,
   rows_written_per_event: 8, rows_read_per_event: 5, queue_ops_per_message: 3, r2_reads_per_recording: 2,
+  do_requests_per_flag_request: 1, do_requests_per_config_request: 3, do_requests_per_api_request: 2,
 };
 export type UsageTotals = {
   events: number; event_bytes: number; requests: number; recordings: number; replay_bytes: number; replay_chunks: number;
   emails: number; stored_db_bytes: number; stored_r2_bytes: number; cold_tier: boolean;
+  /** 0.6: SDK flag (/flags, /decide, local evaluation) and remote-config requests, owner API requests, and requests a cap refused at the edge. */
+  flag_requests?: number; config_requests?: number; api_requests?: number; edge_dropped_requests?: number;
 };
 export type CostLine = { key: keyof typeof PRICES; label: string; quantity: number; unit: string; list_usd: number; after_included_usd: number };
 
-/** Month cost from usage totals (already projected to a full month by the caller). */
+/**
+ * Month cost from usage totals (already projected to a full month by the caller). The headline is the standalone list
+ * price; `after_included_usd` subtracts the Workers Paid plan's monthly allowance and so assumes this project is the
+ * only workload on the Cloudflare account.
+ */
 export function estimateCost(u: UsageTotals) {
   const A = ASSUMPTIONS; const GB = 1024 ** 3;
   const msgs = u.requests + u.replay_chunks;
+  const flags = u.flag_requests ?? 0, config = u.config_requests ?? 0, apiReq = u.api_requests ?? 0, edge = u.edge_dropped_requests ?? 0;
+  const allRequests = msgs + flags + config + apiReq + edge;
+  const doReq = msgs * A.do_requests_per_message + flags * A.do_requests_per_flag_request + config * A.do_requests_per_config_request + apiReq * A.do_requests_per_api_request;
   const q: [keyof typeof PRICES, string, number][] = [
-    ['workers_requests', 'Workers requests (capture + replay uploads)', msgs],
-    ['workers_cpu_ms', 'Workers CPU time', msgs * A.cpu_ms_per_request * 2],
+    ['workers_requests', 'Workers requests (capture, replay, flags, config, dashboard, refused over cap)', allRequests],
+    ['workers_cpu_ms', 'Workers CPU time (requests + queue consumer)', (allRequests + msgs) * A.cpu_ms_per_request],
     ['queue_ops', 'Queues (write, read, delete per message)', msgs * A.queue_ops_per_message],
-    ['do_requests', 'Durable Object requests (project store + event shard)', msgs * A.do_requests_per_message],
-    ['do_gb_s', 'Durable Object duration', msgs * A.do_requests_per_message * A.do_seconds_per_request * A.do_memory_gb],
+    ['do_requests', 'Durable Object requests (ingest, flags, config, dashboard)', doReq],
+    ['do_gb_s', 'Durable Object duration', doReq * A.do_seconds_per_request * A.do_memory_gb],
     ['do_rows_written', 'SQLite rows written (events, indexes, persons)', u.events * A.rows_written_per_event],
     ['do_rows_read', 'SQLite rows read at ingest', u.events * A.rows_read_per_event],
     ['do_storage_gb', 'SQLite storage (events, persons)', u.stored_db_bytes / GB],
@@ -136,7 +147,8 @@ export function estimateCost(u: UsageTotals) {
     return { key, label, quantity, unit: p.unit, list_usd: quantity / p.per * p.usd, after_included_usd: Math.max(0, quantity - p.included) / p.per * p.usd };
   });
   return { lines, list_usd: lines.reduce((a, l) => a + l.list_usd, 0), after_included_usd: lines.reduce((a, l) => a + l.after_included_usd, 0), assumptions: A,
-    notes: ['Estimate at Cloudflare list prices, not a bill. "After included" assumes this project is the only usage on the account; the Workers Paid plan itself is $5/month.',
-      'Requests are counted at ingest (one per capture request); SDK config and flag requests, dashboard use and events dropped at the edge are not counted.',
+    notes: ['Estimate at Cloudflare list prices, not a bill. The headline is the standalone list price of this project\'s usage.',
+      '"After Workers Paid included allowance" subtracts the plan\'s monthly allowance and assumes this project is the only workload on the Cloudflare account; the Workers Paid plan itself is $5/month.',
+      'Requests include capture, replay uploads, SDK flag and remote-config requests, dashboard API calls and requests refused at the edge over a cap. Edge counts are batched per isolate and can miss a few requests.',
       ...(u.cold_tier ? ['Pipelines billing is not yet switched on by Cloudflare; the line shows the published price.'] : [])] };
 }

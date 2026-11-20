@@ -276,3 +276,19 @@ export function scrollRows(sql: SqlStorage, s: { from: number; to: number; pathn
     FROM events e WHERE e.event IN ('$pageview', '$pageleave') AND e.timestamp >= ? AND e.timestamp < ?
       AND json_extract(e.properties, '$."$prev_pageview_max_scroll_percentage"') IS NOT NULL ${path.sql} GROUP BY b`, s.from, s.to, ...path.params).raw()];
 }
+
+// ---------- 0.6: LLM analytics (design.md "LLM analytics") ----------
+export const LLM_EVENTS = ['$ai_generation', '$ai_trace', '$ai_span', '$ai_embedding'];
+export type LlmSpec = { from: number; to: number; traceId?: string | null; full?: boolean; limit: number };
+/** Property columns read for LLM analytics, in row order after uuid, event, distinct_id, timestamp. */
+export const LLM_PROPS = ['$ai_trace_id', '$ai_span_id', '$ai_parent_id', '$ai_span_name', '$ai_model', '$ai_provider', '$ai_input_tokens', '$ai_output_tokens',
+  '$ai_cache_read_input_tokens', '$ai_cache_creation_input_tokens', '$ai_total_cost_usd', '$ai_input_cost_usd', '$ai_output_cost_usd', '$ai_latency', '$ai_is_error', '$ai_error', '$ai_http_status', '$session_id', '$ai_trace_name'];
+/** Compact rows of `$ai_*` events in [from, to); with traceId, only that trace (or the generation with that uuid), and `full` adds the properties JSON. */
+export function llmRows(sql: SqlStorage, s: LlmSpec): unknown[][] {
+  const cols = LLM_PROPS.map((_, i) => `json_extract(e.properties, ?) AS p${i}`).join(', ');
+  const paths = LLM_PROPS.map(k => '$.' + JSON.stringify(k));
+  const where = ['e.event IN (SELECT value FROM json_each(?))', 'e.timestamp >= ?', 'e.timestamp < ?']; const params: SqlStorageValue[] = [JSON.stringify(LLM_EVENTS), s.from, s.to];
+  if (s.traceId) { where.push('(json_extract(e.properties, ?) = ? OR e.uuid = ?)'); params.push('$."$ai_trace_id"', s.traceId, s.traceId); }
+  return sql.exec(`SELECT e.uuid, e.event, e.distinct_id, e.timestamp, ${cols}${s.full ? ', e.properties' : ''} FROM events e WHERE ${where.join(' AND ')} ORDER BY e.timestamp DESC LIMIT ?`,
+    ...paths, ...params, Math.min(Math.max(1, s.limit), 200_000)).toArray().map(r => Object.values(r));
+}

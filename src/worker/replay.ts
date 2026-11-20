@@ -6,6 +6,7 @@ import { cors } from './capture';
 import { decodeBody, DecodeError } from '../shared/decode';
 import { projectByToken, validToken } from './projects';
 import { replayAllowed, replayQuotaLimited } from './usage';
+import { meter } from './meter';
 
 export type ReplayMeta = {
   session_id: string; distinct_id: string; start_ts: number; end_ts: number; clicks: number; keypresses: number;
@@ -37,7 +38,7 @@ export function summarize(items: any[]) {
   return { start, end, clicks, keypresses, errors, url };
 }
 
-export async function handleSnapshots(req: Request, env: Env, url: URL): Promise<Response> {
+export async function handleSnapshots(req: Request, env: Env, url: URL, ectx?: ExecutionContext): Promise<Response> {
   if (req.method !== 'POST') return json({ status: 1 }, 200, cors(req));
   let body: any;
   try {
@@ -57,7 +58,7 @@ export async function handleSnapshots(req: Request, env: Env, url: URL): Promise
     const project = await projectByToken(env, token);
     if (!project || !project.session_recording) continue;
     const sid = String(p.$session_id ?? ''); if (!SAFE.test(sid)) continue;
-    if (!replayAllowed(project, sid)) { if (replayQuotaLimited(project)) quota = true; continue; }
+    if (!replayAllowed(project, sid)) { if (replayQuotaLimited(project)) quota = true; meter(env, ectx, project.id, 'edge_dropped_replay', 1); continue; }
     const items = Array.isArray(p.$snapshot_data) ? p.$snapshot_data : Array.isArray(p.$snapshot_items) ? p.$snapshot_items : obj(p.$snapshot_data) ? [p.$snapshot_data] : [];
     if (!items.length) continue;
     const did = String(e.distinct_id ?? p.distinct_id ?? '');

@@ -1,0 +1,38 @@
+# Example GitHub Actions workflow: weekly physical pruning of cold-tier (R2 Iceberg) events past retention.
+# Copy to .github/workflows/cold-prune.yml in your fork. Add repository secret R2_CATALOG_TOKEN (an R2 Data Catalog
+# token with read and write access to the bucket) and repository variables CF_ACCOUNT_ID, COLD_BUCKET and
+# RETENTION_DAYS (the same retention the instance uses). The token is passed through the environment only.
+name: cold-prune
+on:
+  schedule:
+    - cron: "17 3 * * 0"   # Sundays 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only count what would be deleted"
+        type: boolean
+        default: true
+permissions:
+  contents: read
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "pyiceberg[pyarrow]>=0.10,<1"
+      - name: Test the script
+        run: python3 -m unittest scripts/test_cold_prune.py
+      - name: Prune
+        env:
+          R2_CATALOG_TOKEN: ${{ secrets.R2_CATALOG_TOKEN }}
+        run: >
+          python3 scripts/cold-prune.py
+          --warehouse "${{ vars.CF_ACCOUNT_ID }}_${{ vars.COLD_BUCKET }}"
+          --catalog-uri "https://catalog.cloudflarestorage.com/${{ vars.CF_ACCOUNT_ID }}/${{ vars.COLD_BUCKET }}"
+          --retention-days "${{ vars.RETENTION_DAYS }}"
+          --expire-older-than-days 7
+          ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '--dry-run' || '' }}

@@ -31,6 +31,9 @@ export interface Env {
   EMAIL?: { send(m: { from: string; to: string | string[]; subject: string; text?: string; html?: string }): Promise<unknown> };
   /** Sender address for alert emails, on a domain onboarded to Email Sending; unset = in-app alerts only. */
   ALERT_EMAIL_FROM?: string;
+  /** Optional read-only public demo (design.md "Public demo"): "1" lets signed-out visitors browse projects marked
+   * public_demo, read-only, with owner-only data redacted. Off by default. */
+  PUBLIC_DEMO?: string;
 }
 /** One queue message: events for one project, already normalized by the capture endpoint. */
 export type IngestMsg = { pid: number; events?: NormEvent[]; replay?: import('./replay').ReplayMeta[] };
@@ -38,7 +41,7 @@ export type NormEvent = {
   uuid: string; event: string; distinct_id: string; ts: number; properties: Record<string, unknown>;
   set?: Record<string, unknown>; set_once?: Record<string, unknown>; unset?: string[]; person: boolean; received_at: number;
 };
-export interface ProjectRow { id: number; name: string; api_token: string; timezone: string; retention_days: number; anonymize_ips: number; autocapture_opt_out: number; session_recording?: number; replay_config?: string | null; heatmaps?: number; limits?: string | null; cap_state?: string | null; error_tracking?: number; created_at: string }
+export interface ProjectRow { id: number; name: string; api_token: string; timezone: string; retention_days: number; anonymize_ips: number; autocapture_opt_out: number; session_recording?: number; replay_config?: string | null; heatmaps?: number; limits?: string | null; cap_state?: string | null; error_tracking?: number; public_demo?: number; created_at: string }
 export interface UserRow { id: number; email: string; name: string; pw_hash: string; pw_salt: string; created_at: string }
 
 export class HttpError extends Error {
@@ -58,3 +61,5 @@ export const ingestHost = (env: Env, url: URL) => {
 };
 /** The project's store stub, typed as the class (RPC types are too deep for tsc). */
 export const storeFor = (env: Env, pid: number) => env.STORE.get(env.STORE.idFromName(`project:${pid}`)) as unknown as ProjectStore;
+/** True when the instance runs the read-only public demo (PUBLIC_DEMO=1). */
+export const publicDemo = (env: Env) => env.PUBLIC_DEMO === '1';

@@ -118,3 +118,18 @@ tr.unread td { background: #fffbeb; }
 pre.ctx { margin: 0; background: #0f172a; color: #cbd5e1; font-size: 12px; padding: 6px 0; overflow-x: auto; border-radius: 0 0 6px 6px; }
 pre.ctx > div { padding: 0 10px; white-space: pre; } pre.ctx > div.hl { background: #7f1d1d; color: #fff; } pre.ctx .ln { display: inline-block; width: 3.5em; color: #64748b; user-select: none; }
 .exception h3 { text-transform: none; letter-spacing: 0; color: inherit; }
+/* 0.6: public demo, stat tiles, LLM analytics waterfall */
+.demo-banner { background: #fef3c7; border: 1px solid #f59e0b; color: #78350f; border-radius: 8px; padding: 8px 12px; margin-bottom: 14px; font-size: 13px; }
+.demo-hidden { display: none !important; } button.demo-locked { opacity: .5; cursor: not-allowed; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin: 4px 0 8px; }
+.stat-v { font-size: 20px; font-weight: 650; } .stat-l { color: var(--muted); font-size: 12px; }
+.waterfall { display: flex; flex-direction: column; gap: 2px; }
+.wf-row { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 10px; align-items: center; padding: 4px 6px; border-radius: 6px; cursor: pointer; }
+.wf-row:hover, .wf-row.active { background: #f3f4f6; } .wf-row.wf-err .wf-bar { background: var(--danger); }
+.wf-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+.wf-track { position: relative; height: 18px; background: #f9fafb; border-radius: 4px; }
+.wf-bar { position: absolute; top: 3px; height: 12px; background: var(--accent); border-radius: 3px; min-width: 2px; }
+.wf-ms { position: absolute; right: 4px; top: 0; }
+.tag.wf-generation { background: #e0e7ff; color: #3730a3; } .tag.wf-span { background: #ecfdf5; color: #065f46; } .tag.wf-embedding { background: #fef3c7; color: #92400e; }
+.msgs { display: flex; flex-direction: column; gap: 6px; } .msg { border-left: 3px solid var(--border); padding-left: 8px; } .msg.role-assistant { border-color: var(--accent); } .msg.role-system { border-color: #f59e0b; }
+pre.code.wrap { white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow: auto; }

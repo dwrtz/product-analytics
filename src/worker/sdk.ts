@@ -7,31 +7,34 @@ import { uuidv7 } from '../shared/ids';
 import { recordingConfig, performanceConfig } from './replay';
 import { authenticate } from './auth';
 import { eventsQuotaLimited } from './usage';
+import { meter } from './meter';
+import type { SuppressionRule } from './errors';
 
-export function remoteConfig(p: ProjectRow, hasFlags: boolean, hasSurveys = false) {
+export function remoteConfig(p: ProjectRow, hasFlags: boolean, hasSurveys = false, suppressionRules: SuppressionRule[] = []) {
   // Exception autocapture (protocol.md "Exceptions"): posthog-js turns on window.onerror / unhandledrejection capture when
   // `autocaptureExceptions` is truthy; `errorTracking` is the newer home of the same switch. Off while events are capped.
   const exc = !!p.error_tracking && !eventsQuotaLimited(p);
   return {
     token: p.api_token, supportedCompression: ['gzip', 'gzip-js'], hasFeatureFlags: hasFlags,
     analytics: { endpoint: '/i/v0/e/' }, elementsChainAsString: true, defaultIdentifiedOnly: true,
-    autocapture_opt_out: !!p.autocapture_opt_out, autocaptureExceptions: exc, errorTracking: { autocaptureExceptions: exc, suppressionRules: [], captureExtensionExceptions: false }, captureDeadClicks: !!p.heatmaps, capturePerformance: performanceConfig(p),
+    autocapture_opt_out: !!p.autocapture_opt_out, autocaptureExceptions: exc, errorTracking: { autocaptureExceptions: exc, suppressionRules, captureExtensionExceptions: false }, captureDeadClicks: !!p.heatmaps, capturePerformance: performanceConfig(p),
     sessionRecording: recordingConfig(p), heatmaps: !!p.heatmaps, surveys: hasSurveys, productTours: false, siteApps: [],
   };
 }
 
-export async function handleConfig(req: Request, env: Env, token: string, js: boolean): Promise<Response> {
+export async function handleConfig(req: Request, env: Env, token: string, js: boolean, ectx?: ExecutionContext): Promise<Response> {
   const p = validToken(token) ? await projectByToken(env, token) : null;
+  if (p) meter(env, ectx, p.id, 'config');
   if (!p) return js ? new Response('/* unknown project */', { status: 404, headers: { 'content-type': 'application/javascript', ...cors(req) } }) : json({ type: 'authentication_error', code: 'invalid_api_key', detail: 'Unknown project token.' }, 404, cors(req));
   const st = storeFor(env, p.id);
-  const cfg = remoteConfig(p, await st.hasActiveFlags(), await st.hasActiveSurveys());
+  const cfg = remoteConfig(p, await st.hasActiveFlags(), await st.hasActiveSurveys(), await st.suppressionRules());
   const headers = { ...cors(req), 'cache-control': 'public, max-age=300' };
   if (!js) return json(cfg, 200, headers);
   const body = `(function(){window._POSTHOG_REMOTE_CONFIG=window._POSTHOG_REMOTE_CONFIG||{};window._POSTHOG_REMOTE_CONFIG[${JSON.stringify(p.api_token)}]={config:${JSON.stringify(cfg)},siteApps:[]}})();`;
   return new Response(body, { headers: { 'content-type': 'application/javascript', ...headers } });
 }
 
-export async function handleFlags(req: Request, env: Env, url: URL, legacyDecide: boolean): Promise<Response> {
+export async function handleFlags(req: Request, env: Env, url: URL, legacyDecide: boolean, ectx?: ExecutionContext): Promise<Response> {
   let body: any = {};
   if (req.method === 'POST') {
     try {
@@ -43,6 +46,7 @@ export async function handleFlags(req: Request, env: Env, url: URL, legacyDecide
   if (!validToken(token)) return json({ type: 'authentication_error', code: 'invalid_api_key', detail: 'Project API key invalid.' }, 401, cors(req));
   const p = await projectByToken(env, token);
   if (!p) return json({ type: 'authentication_error', code: 'invalid_api_key', detail: 'Project API key invalid.' }, 401, cors(req));
+  meter(env, ectx, p.id, 'flags');
   let did = body.distinct_id; if (typeof did === 'number') did = String(did);
   const store = storeFor(env, p.id);
   // posthog-js sends `$anon_distinct_id` once after identify (experience continuity, protocol.md "Flags").
@@ -55,7 +59,7 @@ export async function handleFlags(req: Request, env: Env, url: URL, legacyDecide
     if (f.enabled && f.metadata.payload !== null) featureFlagPayloads[f.key] = f.metadata.payload;
   }
   const out: Record<string, unknown> = { flags: byKey, featureFlags, featureFlagPayloads, errorsWhileComputingFlags: typeof did !== 'string' || !did, requestId: uuidv7(), evaluatedAt: Date.now() };
-  if (legacyDecide || url.searchParams.get('config') === 'true') Object.assign(out, remoteConfig(p, flags.length > 0, await store.hasActiveSurveys()), { config: { enable_collect_everything: !p.autocapture_opt_out } });
+  if (legacyDecide || url.searchParams.get('config') === 'true') Object.assign(out, remoteConfig(p, flags.length > 0, await store.hasActiveSurveys(), await store.suppressionRules()), { config: { enable_collect_everything: !p.autocapture_opt_out } });
   return json(out, 200, cors(req));
 }
 
@@ -64,7 +68,7 @@ export async function handleFlags(req: Request, env: Env, url: URL, legacyDecide
  * GET /flags/definitions?token=<project token>&send_cohorts with `Authorization: Bearer <personal API key>`; older SDKs use
  * /api/feature_flag/local_evaluation. Answers carry an ETag and honour If-None-Match with 304.
  */
-export async function handleLocalEvaluation(req: Request, env: Env, url: URL, project?: ProjectRow): Promise<Response> {
+export async function handleLocalEvaluation(req: Request, env: Env, url: URL, project?: ProjectRow, ectx?: ExecutionContext): Promise<Response> {
   if (req.method !== 'GET') return json({ type: 'invalid_request', code: 'method_not_allowed', detail: 'Use GET.' }, 405);
   const auth = req.headers.get('authorization')?.startsWith('Bearer ') ? await authenticate(env, req) : null;
   if (!auth) return json({ type: 'authentication_error', code: 'not_authenticated', detail: 'A personal API key is required (Authorization: Bearer phx_...).' }, 401);
@@ -75,6 +79,7 @@ export async function handleLocalEvaluation(req: Request, env: Env, url: URL, pr
     p = await projectByToken(env, token);
     if (!p) return json({ type: 'authentication_error', code: 'invalid_api_key', detail: 'Project API key invalid.' }, 401);
   }
+  meter(env, ectx, p.id, 'flags');
   const body = JSON.stringify(await storeFor(env, p.id).flagDefinitions(url.searchParams.has('send_cohorts')));
   const d = new Uint8Array(await crypto.subtle.digest('SHA-1', new TextEncoder().encode(body)));
   const etag = '"' + [...d].map(x => x.toString(16).padStart(2, '0')).join('') + '"';

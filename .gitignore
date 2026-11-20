@@ -7,3 +7,4 @@ src/worker/ui.gen.ts
 .e2e
 test-results
 wrangler.deploy*.jsonc
+__pycache__

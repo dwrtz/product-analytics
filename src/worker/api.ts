@@ -1,12 +1,12 @@
 // Owner API under /api (spec R7-R12). Session cookie or personal API key.
-import { Env, HttpError, json, nowIso, origin, ProjectRow, storeFor } from './env';
+import { Env, HttpError, json, nowIso, origin, ProjectRow, storeFor, publicDemo, UserRow } from './env';
 import { authenticate, createPersonalKey, login, logout, signup, signupOpen } from './auth';
 import { randomToken } from '../shared/ids';
 import { forgetToken } from './projects';
 import { QueryError } from './query';
 import { chunkPrefix, deletePrefix, readSnapshots, readSnapshotsPage, cleanReplayConfig, ReplayConfigError } from './replay';
 import { handleLocalEvaluation } from './sdk';
-import { coldEnabled, runColdSql } from './cold';
+import { coldEnabled, runColdSql, runColdTrends } from './cold';
 import { cleanLimits, limitsOf, capStateOf, LimitsError, NEW_PROJECT_LIMITS, NEW_PROJECT_REPLAY_SAMPLE_RATE } from './usage';
 import { validateMap } from '../shared/sourcemap';
 import { refOf } from './errors';
@@ -18,7 +18,7 @@ const validTz = (tz: string) => { try { new Intl.DateTimeFormat('en', { timeZone
 export async function handleApi(req: Request, env: Env, url: URL, appName: string): Promise<Response> {
   const path = url.pathname.replace(/\/+$/, '');
   const m = req.method;
-  if (path === '/api/config' && m === 'GET') return json({ app_name: appName, site_url: origin(env), signup_open: await signupOpen(env), cold_tier: coldEnabled(env) });
+  if (path === '/api/config' && m === 'GET') return json({ app_name: appName, site_url: origin(env), signup_open: await signupOpen(env), cold_tier: coldEnabled(env), public_demo: publicDemo(env) });
   const cookieAuthWrite = m !== 'GET' && m !== 'HEAD' && !req.headers.get('authorization');
   if (cookieAuthWrite && req.headers.get('origin') !== origin(env)) throw new HttpError(403, 'bad_origin', 'Origin does not match SITE_URL.');
   if (path === '/api/signup' && m === 'POST') { const r = await signup(env, await readJson(req)); return json({ ok: true }, 201, { 'set-cookie': r.cookie }); }
@@ -26,9 +26,62 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
   if (path === '/api/logout' && m === 'POST') return json({ ok: true }, 200, { 'set-cookie': await logout(env, req) });
 
   const auth = await authenticate(env, req);
-  if (!auth) throw new HttpError(401, 'unauthenticated', 'Sign in first.');
+  // Public demo (design.md "Public demo"): with PUBLIC_DEMO=1 a signed-out visitor browses projects marked public_demo,
+  // read-only: GETs and the read-only query POSTs only, every other write is 403 demo_read_only, owner data redacted.
+  if (!auth && !publicDemo(env)) throw new HttpError(401, 'unauthenticated', 'Sign in first.');
+  if (!auth) return demoApi(req, env, url, path, m);
   const user = auth.user;
-  if (path === '/api/me' && m === 'GET') return json({ id: user.id, email: user.email, name: user.name });
+  if (path === '/api/me' && m === 'GET') return json({ id: user.id, email: user.email, name: user.name, demo: false });
+  if (path === '/api/users' && m === 'GET') return json((await env.DB.prepare('SELECT id, email, name FROM users ORDER BY id').all()).results);
+  return ownerApi(req, env, url, path, m, user);
+}
+
+/** Owner API calls a public-demo visitor may make: reads and the read-only query endpoints. */
+const DEMO_POSTS = [/^\/query$/, /^\/sql$/];
+async function demoApi(req: Request, env: Env, url: URL, path: string, m: string): Promise<Response> {
+  const deny = () => { throw new HttpError(403, 'demo_read_only', 'This is a read-only public demo. Sign in to make changes.'); };
+  if (path === '/api/me' && m === 'GET') return json({ id: 0, email: null, name: 'Demo visitor', demo: true });
+  if (path === '/api/personal_api_keys' && m === 'GET') return json([]);
+  if (path === '/api/users' && m === 'GET') return json((await env.DB.prepare('SELECT id, name FROM users ORDER BY id').all<{ id: number; name: string }>()).results.map(u => ({ id: u.id, email: null, name: u.name || 'Owner' })));
+  if (path === '/api/projects' && m === 'GET') {
+    const rows = (await env.DB.prepare('SELECT * FROM projects WHERE public_demo = 1 ORDER BY id').all<ProjectRow>()).results;
+    return json(await redact(env, rows.map(projectOut), rows));
+  }
+  const mm = /^\/api\/projects\/(\d+)(\/.*)?$/.exec(path);
+  if (!mm) { if (m !== 'GET' && m !== 'HEAD') deny(); throw new HttpError(404, 'not_found'); }
+  const project = await env.DB.prepare('SELECT * FROM projects WHERE id = ? AND public_demo = 1').bind(+mm![1]).first<ProjectRow>();
+  if (!project) { if (m !== 'GET' && m !== 'HEAD') deny(); throw new HttpError(404, 'not_found', 'No such project.'); }
+  const sub = mm![2] ?? '';
+  if (m !== 'GET' && m !== 'HEAD' && !(m === 'POST' && DEMO_POSTS.some(r => r.test(sub)))) deny();
+  if (sub === '/feature_flags/local_evaluation' || sub === '/alerts/test') deny();
+  const visitor = { id: 0, email: '', name: 'Demo visitor', pw_hash: '', pw_salt: '', created_at: '' } as UserRow;
+  const r = await ownerApi(req, env, url, path, m, visitor);
+  if (!(r.headers.get('content-type') ?? '').includes('application/json')) return r;
+  return json(await redact(env, await r.json(), [project]), r.status);
+}
+/**
+ * Removes owner-only data from a demo response: every instance user's email and every alert recipient becomes
+ * "owner@hidden", and the projects' write tokens become a placeholder so the demo cannot be scraped for a capture key.
+ */
+async function redact(env: Env, data: unknown, projects: ProjectRow[]): Promise<unknown> {
+  const emails = new Set((await env.DB.prepare('SELECT email FROM users').all<{ email: string }>()).results.map(u => u.email.toLowerCase()));
+  for (const p of projects) { try { for (const e of (JSON.parse(p.limits ?? '{}').alert_emails ?? [])) emails.add(String(e).toLowerCase()); } catch { /* none */ } }
+  const tokens = new Set(projects.map(p => p.api_token));
+  const walk = (v: unknown, key = ''): unknown => {
+    if (typeof v === 'string') {
+      if (tokens.has(v)) return DEMO_TOKEN;
+      let out = v; for (const e of emails) if (e && out.toLowerCase().includes(e)) out = out.replace(new RegExp(e.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), 'owner@hidden');
+      return out;
+    }
+    if (Array.isArray(v)) return key === 'alert_emails' ? [] : v.map(x => walk(x));
+    if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, walk(x, k)]));
+    return v;
+  };
+  return walk(data);
+}
+export const DEMO_TOKEN = 'phc_demo_token_hidden';
+
+async function ownerApi(req: Request, env: Env, url: URL, path: string, m: string, user: UserRow): Promise<Response> {
 
   if (path === '/api/personal_api_keys') {
     if (m === 'GET') return json((await env.DB.prepare('SELECT id, label, mask, created_at, last_used_at FROM personal_api_keys WHERE user_id = ? ORDER BY id DESC').bind(user.id).all()).results);
@@ -75,7 +128,8 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
       let lim = project.limits ?? null;
       if (b.limits !== undefined) { try { lim = b.limits === null ? null : JSON.stringify(cleanLimits(b.limits, limitsOf(project))); } catch (e) { if (e instanceof LimitsError) throw new HttpError(400, 'bad_request', e.message); throw e; } }
       const et = b.error_tracking !== undefined ? (b.error_tracking ? 1 : 0) : (project.error_tracking ?? 0);
-      let r = await env.DB.prepare('UPDATE projects SET name = ?, timezone = ?, retention_days = ?, anonymize_ips = ?, autocapture_opt_out = ?, session_recording = ?, heatmaps = ?, replay_config = ?, limits = ?, error_tracking = ? WHERE id = ? RETURNING *').bind(name, tz, ret, anon, ac, rec, hm, rc, lim, et, pid).first<ProjectRow>();
+      const pd = b.public_demo !== undefined ? (b.public_demo ? 1 : 0) : (project.public_demo ?? 0);
+      let r = await env.DB.prepare('UPDATE projects SET name = ?, timezone = ?, retention_days = ?, anonymize_ips = ?, autocapture_opt_out = ?, session_recording = ?, heatmaps = ?, replay_config = ?, limits = ?, error_tracking = ?, public_demo = ? WHERE id = ? RETURNING *').bind(name, tz, ret, anon, ac, rec, hm, rc, lim, et, pd, pid).first<ProjectRow>();
       if (b.limits !== undefined) { await store.refreshCaps(pid); r = await env.DB.prepare('SELECT * FROM projects WHERE id = ?').bind(pid).first<ProjectRow>(); }
       forgetToken(project.api_token);
       return json(projectOut(r!));
@@ -91,6 +145,8 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
   const asQueryError = (e: unknown): never => { const msg = e instanceof Error ? e.message : String(e); if (e instanceof QueryError || /unsupported|needs|must|at least|at most|unknown|bad |not supported|not allowed|expected|unexpected|timed out|too many|too long|cannot/.test(msg)) throw new HttpError(400, 'invalid_query', msg); throw e; };
   if (sub === '/query' && m === 'POST') {
     const b = await readJson(req);
+    // Trends over the cold tier (design.md "Cold Trends"): { source: 'cold', query: TrendsQuery }.
+    if (b.source === 'cold') { try { return json(await runColdTrends(env, b.query ?? b, { projectId: pid, retentionDays: project.retention_days, timezone: project.timezone })); } catch (e) { return asQueryError(e); } }
     try { return json(await store.query(b.query ?? b, qc)); } catch (e) { return asQueryError(e); }
   }
   // SQL editor (design.md "SQL"): read-only SELECT over events and persons.
@@ -209,27 +265,71 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
   if (sub === '/alerts' && m === 'GET') return json(await store.listAlerts(Number(url.searchParams.get('limit')) || 50));
   if (sub === '/alerts/read' && m === 'POST') return json(await store.markAlertsRead());
   if (sub === '/alerts/test' && m === 'POST') return json(await store.testAlert(pid));
-  if (sub === '/error_issues' && m === 'GET') return json(await store.listIssues({ status: url.searchParams.get('status'), search: url.searchParams.get('search'), order: url.searchParams.get('order'), limit: Number(url.searchParams.get('limit')) || 100 }));
-  s = /^\/error_issues\/([0-9a-f-]{36})$/.exec(sub);
-  if (s) {
-    if (m === 'GET') { const r = await store.getIssue(s[1]); if (!r) throw new HttpError(404, 'not_found'); return json(r); }
-    if (m === 'PATCH') { const r = await store.updateIssue(s[1], await readJson(req)); if (!r) throw new HttpError(404, 'not_found'); if ('error' in r) throw new HttpError(400, 'bad_request', r.error as string); return json(r); }
+  if (sub === '/error_issues' && m === 'GET') {
+    // ?assignee= me | none | <user id> | <email>
+    let asg: string | number | null = url.searchParams.get('assignee') || null;
+    if (asg === 'me') asg = user.id; else if (asg && asg !== 'none' && !/^\d+$/.test(asg)) asg = (await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(asg.toLowerCase()).first<{ id: number }>())?.id ?? -2;
+    return json(await store.listIssues({ status: url.searchParams.get('status'), search: url.searchParams.get('search'), order: url.searchParams.get('order'), limit: Number(url.searchParams.get('limit')) || 100, release: url.searchParams.get('release'), assignee: asg }));
   }
+  if (sub === '/error_issues/releases' && m === 'GET') return json(await store.errorReleases());
+  s = /^\/error_issues\/([0-9a-f-]{36})(\/merge|\/split)?$/.exec(sub);
+  if (s) {
+    if (!s[2] && m === 'GET') { const r = await store.getIssue(s[1]); if (!r) throw new HttpError(404, 'not_found'); return json(r); }
+    if (!s[2] && m === 'PATCH') {
+      const b = await readJson(req);
+      // assignee: a user's email or id on this instance, or null to unassign (design.md "Assignment").
+      if (b.assignee !== undefined && b.assignee !== null) {
+        const v = String(b.assignee).trim().toLowerCase();
+        const u = await env.DB.prepare(/^\d+$/.test(v) ? 'SELECT id, email FROM users WHERE id = ?' : 'SELECT id, email FROM users WHERE email = ?').bind(/^\d+$/.test(v) ? Number(v) : v).first<{ id: number; email: string }>();
+        if (!u) throw new HttpError(400, 'bad_request', 'assignee must be a user of this instance (email or id).');
+        b.assignee = { id: u.id, email: u.email };
+      }
+      const r = await store.updateIssue(s[1], b); if (!r) throw new HttpError(404, 'not_found'); if ('error' in r) throw new HttpError(400, 'bad_request', r.error as string); return json(r);
+    }
+    if (s[2] === '/merge' && m === 'POST') {
+      const b = await readJson(req); if (!Array.isArray(b.ids) || b.ids.length > 50) throw new HttpError(400, 'bad_request', 'ids: a list of up to 50 issue ids to merge into this one.');
+      const r = await store.mergeIssues(s[1], b.ids.map(String)); if ('error' in r) throw new HttpError(r.error === 'not_found' ? 404 : 400, r.error === 'not_found' ? 'not_found' : 'bad_request', r.error); return json(r);
+    }
+    if (s[2] === '/split' && m === 'POST') {
+      const b = await readJson(req); if (typeof b.fingerprint !== 'string' || !b.fingerprint) throw new HttpError(400, 'bad_request', 'fingerprint is required.');
+      const r = await store.splitIssue(s[1], b.fingerprint); if ('error' in r) throw new HttpError(r.error === 'not_found' ? 404 : 400, r.error === 'not_found' ? 'not_found' : 'bad_request', r.error); return json(r, 201);
+    }
+  }
+  for (const [base, list, save, del] of [['/error_grouping_rules', 'listGroupingRules', 'saveGroupingRule', 'deleteGroupingRule'], ['/error_suppression_rules', 'listSuppressionRules', 'saveSuppressionRule', 'deleteSuppressionRule']] as const) {
+    if (sub === base) {
+      if (m === 'GET') return json(await store[list]());
+      if (m === 'POST') { const r = await store[save](null, await readJson(req)); if ('error' in r) throw new HttpError(400, 'bad_request', r.error as string); return json(r, 201); }
+    }
+    const rr = new RegExp(`^${base}/(\\d+)$`).exec(sub);
+    if (rr) {
+      if (m === 'PATCH') { const r = await store[save](+rr[1], await readJson(req)); if ('error' in r) throw new HttpError(r.error === 'not_found' ? 404 : 400, r.error === 'not_found' ? 'not_found' : 'bad_request', r.error as string); return json(r); }
+      if (m === 'DELETE') { if (!await store[del](+rr[1])) throw new HttpError(404, 'not_found'); return json({ ok: true }); }
+    }
+  }
+  // LLM analytics (design.md "LLM analytics")
+  if (sub === '/llm/overview' && m === 'GET') return json(await store.llmAnalytics('overview', Object.fromEntries(url.searchParams), project.timezone));
+  if (sub === '/llm/traces' && m === 'GET') return json(await store.llmAnalytics('traces', Object.fromEntries(url.searchParams), project.timezone));
+  s = /^\/llm\/traces\/([^/]{1,200})$/.exec(sub);
+  if (s && m === 'GET') { const t = await store.llmAnalytics('trace', { ...Object.fromEntries(url.searchParams), id: decodeURIComponent(s[1]) }, project.timezone); if (!t) throw new HttpError(404, 'not_found'); return json(t); }
   // Source maps (design.md "Source maps"): PUT/POST ?url=<URL of the minified file> with the map JSON as the body.
   if (sub === '/symbol_sets') {
     if (m === 'GET') return json(await store.listSymbolSets());
     if (m === 'POST' || m === 'PUT') {
       const ref = refOf(url.searchParams.get('url') ?? '');
       if (!ref || ref.length > 2000) throw new HttpError(400, 'bad_request', 'url (the minified file URL or path the stack frames show) is required.');
+      const release = (url.searchParams.get('release') ?? '').trim();
+      if (release.length > 200) throw new HttpError(400, 'bad_request', 'release is at most 200 characters.');
       const text = await req.text();
       if (text.length > 25 * 1024 * 1024) throw new HttpError(413, 'payload_too_large', 'Source map over 25 MB.');
       let map: unknown; try { map = JSON.parse(text); } catch { throw new HttpError(400, 'bad_request', 'Body must be the source map JSON.'); }
       const bad = validateMap(map); if (bad) throw new HttpError(400, 'bad_request', bad);
       const key = `sourcemaps/${pid}/${uuidv7()}.map`;
       await env.REPLAY.put(key, text, { httpMetadata: { contentType: 'application/json' } });
-      const r = await store.addSymbolSet(ref, key, text.length);
+      const r = await store.addSymbolSet(ref, key, text.length, release);
       if (r.replaced) await env.REPLAY.delete(r.replaced);
-      return json({ id: r.id, url: ref, size: text.length, replaced: !!r.replaced }, 201);
+      // Retroactive symbolication of recent occurrences that arrived before this map (design.md "Source maps").
+      const retro = await store.resymbolicate(ref, release);
+      return json({ id: r.id, url: ref, release: release || null, size: text.length, replaced: !!r.replaced, resymbolicated: retro }, 201);
     }
   }
   s = /^\/symbol_sets\/([0-9a-f-]{36})$/.exec(sub);
@@ -255,7 +355,7 @@ export async function handleApi(req: Request, env: Env, url: URL, appName: strin
 function projectOut(p: ProjectRow) {
   let rc: unknown = null; try { rc = p.replay_config ? JSON.parse(p.replay_config) : null; } catch { rc = null; }
   return { id: p.id, name: p.name, api_token: p.api_token, timezone: p.timezone, retention_days: p.retention_days, anonymize_ips: !!p.anonymize_ips, autocapture_opt_out: !!p.autocapture_opt_out,
-    session_recording: !!p.session_recording, replay_config: rc, heatmaps: !!p.heatmaps, limits: p.limits ? limitsOf(p) : null, cap_state: capStateOf(p), error_tracking: !!p.error_tracking, created_at: p.created_at };
+    session_recording: !!p.session_recording, replay_config: rc, heatmaps: !!p.heatmaps, limits: p.limits ? limitsOf(p) : null, cap_state: capStateOf(p), error_tracking: !!p.error_tracking, public_demo: !!p.public_demo, created_at: p.created_at };
 }
 /** Cohort bodies are JSON, or a CSV upload (text/csv) of distinct ids or emails for a static cohort. */
 async function readCohortBody(req: Request) {

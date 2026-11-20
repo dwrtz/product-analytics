@@ -17,7 +17,12 @@ posthog-js shows to visitors. Since 0.5 it also groups posthog-js and
 posthog-node exceptions into issues (with source-map symbolication), keeps
 each project inside monthly usage caps with sampling, shows what drives
 volume and an estimated Cloudflare cost, and alerts the owner in the app
-and by email.
+and by email. Since 0.6 it adds LLM analytics (generations, traces, costs
+and latency from the PostHog AI SDKs), release tracking, merging and
+splitting, assignment, grouping and suppression rules and retroactive
+symbolication for errors, Python, Go and Rust stack traces, Trends over
+the cold tier, request and dropped-past-cap counters, and an optional
+read-only public demo mode.
 
 Every deploy is one *instance* on one domain. An instance holds one or more
 *projects*; each project has a public *project API key* (`phc_…`) that SDKs
@@ -70,10 +75,10 @@ unknown; it is context, not extra requirements.
   own, short and plain. Icons are inline SVG or text; no images or fonts are
   copied from anywhere.
 
-## Out of scope for 0.5
+## Out of scope for 0.6
 
-- Web experiments, product tours, early access features, logs, LLM
-  analytics, data warehouse, CDP destinations and notebooks. The
+- Web experiments, product tours, early access features, logs, data
+  warehouse, CDP destinations and notebooks. The
   SDK endpoints for these answer "nothing configured" (`protocol.md` 9) so
   the SDKs stay quiet.
 - Heatmaps: element-level click maps ("clickmaps" of autocapture elements
@@ -94,17 +99,25 @@ unknown; it is context, not extra requirements.
   HogQL language; the editor takes the subset in `design.md` ("SQL").
 - Feature flags: flag-dependency conditions, group-aggregated flags,
   encrypted payloads, remote config flags.
-- Cold tier (R27): insights, funnels and the other screens read the hot
-  shards only; cold data is reached through the SQL editor. Rows in the
-  Iceberg table are not physically deleted by the app (Basin SQL is
-  read-only); retention is enforced in every cold query.
-- Error tracking (R28-R29): issue assignment, merging and splitting issues,
-  custom grouping rules in the UI, suppression rules sent to the SDK,
-  release tracking, indexed (sectioned) source maps, symbolication of
-  exceptions that arrived before their map was uploaded, native (non-JS)
-  stack traces. Usage (R30): billing, per-person or per-event-name caps,
-  counting events dropped at the edge after a cap is reached, load testing.
-- Per-project permissions, organizations, invitations, SSO, billing.
+- Cold tier (R27): Trends (total, daily users, unique sessions, no
+  breakdown or compare) and the SQL editor read it; funnels, retention and
+  the other screens read the hot shards only. The Worker never deletes
+  Iceberg rows (Basin SQL is read-only); retention is enforced in every
+  cold query and rows past it are physically deleted outside the Worker by
+  `scripts/cold-prune.py`.
+- Error tracking (R28-R29): native mobile symbolication (iOS dSYM, Android
+  ProGuard/R8, React Native Hermes); server stacks (Python, Go, Rust, Node)
+  are shown as the SDK sent them. Source maps with `url` sections. Teams
+  and roles as assignees (assignees are users of the instance). Re-grouping
+  issues already stored when a grouping rule changes.
+- LLM analytics (R31): prompt management, evaluations, playground,
+  datasets, sentiment and clustering; costs come from the SDK or a
+  built-in list-price table, not from provider invoices.
+- Usage (R30): billing, per-person or per-event-name caps, scale and load
+  testing.
+- Per-project permissions, organizations, invitations, SSO, billing. The
+  public demo (R32) is read-only for everyone who is not signed in; it is
+  not a sharing or permissions system.
 - Ingestion transformations, plugins, webhooks, GeoIP lookups beyond what
   Cloudflare puts on the request.
 
@@ -128,7 +141,7 @@ Each requirement has an id. Tests name the id they cover.
   Assets `ASSETS`; optional `send_email` binding `EMAIL` (R30).
   Vars `SITE_URL`, `ALLOWED_EMAILS`, `DEFAULT_RETENTION_DAYS`,
   `REPLAY_RETENTION_DAYS` and optional `INGEST_HOSTS` (R2) and
-  `ALERT_EMAIL_FROM` (R30) (`SHARD_PERIOD` exists for tests only). No
+  `ALERT_EMAIL_FROM` (R30) and `PUBLIC_DEMO` (R32) (`SHARD_PERIOD` exists for tests only). No
   secrets. A daily cron trigger applies data retention and checks for
   usage spikes. Exact config in
   `design.md`; no domain, account id or resource id is hard-coded anywhere.
@@ -331,10 +344,17 @@ API keys, sign out). 0.3 adds SQL, Actions, Action editor, Cohorts, Cohort
 (editor and members), Heatmaps, replay settings in Settings, console and
 network panels on Recording, targeting and schedule in the Survey editor,
 cohort conditions and continuity in the Flag editor, and an event/action
-picker for series. Usable on a phone (390 px wide).
+picker for series. 0.6 adds LLM analytics (overview, traces, trace),
+release, assignee and merge controls on Error tracking, grouping and
+suppression rules in Settings, and a Hot / Cold source on Trends. Usable
+on a phone (390 px wide).
+- Any `GET` or `HEAD` that is not an API, SDK or static path and has no
+  file extension serves the app's HTML (deep links and reloads work),
+  unless `Accept` asks for JSON without HTML or `*/*`; then it is a JSON
+  404.
 
-Check: the screenshots in `shots/` and `shots03/` are taken from the
-reference build.
+Check: the screenshots in `shots/`, `shots03/` and `shots06/` are taken
+from the reference build; `tests/v06.test.ts` covers the HTML fallback.
 
 ### R14. Quality
 
@@ -597,11 +617,32 @@ console panel.
   R22 shape plus `source: "cold"` and `scanned: {bytes, files}`.
 - The SQL screen shows a Hot / Cold source picker only when `cold_tier`
   is true. Without the bindings nothing changes.
+- 0.6: `POST /api/projects/:id/query` with `{"source": "cold", "query":
+  <TrendsQuery>}` answers Trends from the cold table: one Basin SQL
+  `GROUP BY` per series over the same interval buckets as the hot engine
+  (time zone and DST aware, at most 400 buckets), with the project and
+  retention conditions always added. `total`, `dau` (distinct ids, not
+  merged persons) and `unique_session` are supported; breakdowns, compare,
+  actions, cohort and person filters and other maths answer 400 with a
+  message naming the hot source. The Trends editor shows a Source picker
+  when `cold_tier` is true; a saved cold insight on an instance without a
+  cold tier falls back to hot with a note. Without the cold tier the API
+  answers 400 "not configured".
+- 0.6: `scripts/cold-prune.py` (PyIceberg against the R2 Data Catalog REST
+  API; `--warehouse`, `--catalog-uri`, `--retention-days`,
+  `--project-id`, `--dry-run`; token from `R2_CATALOG_TOKEN`, never
+  printed) physically deletes rows past retention, and
+  `scripts/cold-prune.workflow.example.yml` runs it weekly from GitHub
+  Actions.
 
 Check: `tests/cold.test.ts` (forced filters, quoting, numeric property
 access, week start, rejections); a live run sends events, waits for the
 pipeline (about two minutes with a 60 s roll) and finds them with a cold
-query, with an event older than the retention period excluded.
+query, with an event older than the retention period excluded. 0.6:
+`tests/v06.test.ts` "cold Trends" (statements, forced filters, retention
+clamp, rejections, a stubbed Basin run) and
+`python3 -m unittest scripts/test_cold_prune.py` (`--help`, cutoff,
+arguments, token never printed).
 
 ### R28. Error tracking
 
@@ -631,17 +672,50 @@ query, with an event older than the retention period excluded.
   when one exists).
 - Owner API: `GET /api/projects/:id/error_issues?status=&search=&order=`,
   `GET` and `PATCH` (`{status}`) `/api/projects/:id/error_issues/:issue`.
+- 0.6 releases: an exception's release is the first non-empty of
+  `$release`, `release`, `$app_version`, `app_version`
+  (`test-vectors.json` "releases"). Occurrences store it; issues have
+  first and last seen release; `?release=` filters the list;
+  `GET /error_issues/releases` lists releases with counts.
+- 0.6 merge and split: `POST /error_issues/:id/merge {ids}` folds up to 50
+  issues into one (their fingerprints point to it, counts are recomputed,
+  merged issues are hidden but kept); `POST /error_issues/:id/split
+  {fingerprint}` moves that fingerprint's occurrences to their own issue
+  (restoring a merged issue when there was one). The issue page lists its
+  fingerprints with a Split action; the list has checkboxes and "Merge
+  selected".
+- 0.6 assignment: `PATCH {assignee}` takes a user of the instance by email
+  or id (or `null`); `?assignee=me|none|<id>|<email>` filters.
+- 0.6 grouping rules: `/error_grouping_rules` (CRUD; field `type`,
+  `value`, `filename` or `function`; match `contains`, `exact` or
+  `regex`; a group key). The first enabled rule that matches sets the
+  fingerprint `rule:<key>`; `$exception_fingerprint` still wins and the
+  default fingerprint applies when no rule matches.
+- 0.6 suppression rules: `/error_suppression_rules` (CRUD) in posthog-js's
+  shape `{type: AND|OR, values: [{key: $exception_types|$exception_values,
+  operator, value, type}]}`. Remote config sends them as
+  `errorTracking.suppressionRules`, so posthog-js drops matching exceptions
+  before sending; any that still arrive are dropped at ingest and counted
+  as suppressed on the Usage screen (`test-vectors.json`
+  "suppression_rules").
+- 0.6 server stacks: `$exception_list` frames from posthog-python,
+  posthog-go and posthog-rs (any `platform` other than JavaScript or Node)
+  are kept as sent: they are fingerprinted and shown with their module
+  and source context but never sent to source-map symbolication.
 
 Check: `tests/v05.test.ts` groups the recorded posthog-js and posthog-node
 exceptions into five issues, resolves one and sees the regression; the
 e2e captures an unhandled error with real posthog-js and a posthog-node
-exception and opens the issue page.
+exception and opens the issue page. 0.6: `tests/v06.test.ts` (releases,
+merge, split, assignment, grouping and suppression rules, Python, Go and
+Rust stacks); the e2e sends server-SDK stacks through `/batch/`, merges,
+splits, assigns and checks the suppression rules in remote config.
 
 ### R29. Source maps
 
 - `PUT` (or `POST`) `/api/projects/:id/symbol_sets?url=<URL or path of the
   minified file>` with the source map JSON as the body (version 3, not
-  sectioned, at most 25 MB) stores the map in R2 under
+  sectioned or an index map with inline `map` sections, at most 25 MB) stores the map in R2 under
   `sourcemaps/<project>/`. Personal API keys work, so CI can upload; the
   same URL replaces the old map. `GET` lists maps, `DELETE
   /symbol_sets/:id` removes one. Deleting the project deletes its maps.
@@ -654,10 +728,23 @@ exception and opens the issue page.
 - `scripts/upload-sourcemaps.mjs --host --project --dir --url-prefix`
   (Node 18+, no dependencies, key in `PA_PERSONAL_API_KEY`) uploads the map
   of every `.js` file under a build directory.
+- 0.6 releases: `?release=` (and `--release` on the script) scopes a map
+  to exceptions from that release; one URL can have a map per release. An
+  exception uses its release's map, else the map uploaded without a
+  release.
+- 0.6 retroactive symbolication: an upload re-symbolicates up to 2,000
+  occurrences from the last 30 days that still have unresolved frames in
+  that file (and release): the issue's sample stack and top frame are
+  updated and the resolved fingerprint is linked to the issue, so later
+  occurrences group with it. Events already stored in the shards keep the
+  frames they arrived with. The response reports `resymbolicated:
+  {scanned, symbolicated, issues}`.
 
 Check: the VLQ decoder and frame resolution against an esbuild map
-(`test-vectors.json` "source_maps"); the upload, symbolicated stored event
-and issue frames over HTTP.
+(`test-vectors.json` "source_maps" and, for index maps,
+"source_map_sections"); the upload, symbolicated stored event and issue
+frames over HTTP; 0.6 per-release maps and retroactive symbolication in
+`tests/v06.test.ts` and the e2e.
 
 ### R30. Usage limits, sampling, usage page and alerts
 
@@ -675,15 +762,24 @@ and issue frames over HTTP.
   (`test-vectors.json` "sampling"): by distinct id for events past a cap,
   by session id for replay and autocapture.
 - When a cap is reached the store writes the month's `cap_state` to D1.
-  The capture endpoints read it (cached up to 30 s per isolate) and in
+  The capture endpoints read it (cached up to 10 s per isolate) and in
   drop mode answer `quota_limited` (`protocol.md` 20) so posthog-js
   pauses sending; remote config then turns session recording and
   exception autocapture off. Raising a cap lifts the state at once.
 - The Usage screen shows month-to-date meters against each cap, events per
   day stacked by event type with a table of what drives volume, replay
   recordings and bytes per day, and an estimated Cloudflare cost for the
-  month at public list prices, before and after the plan's included
-  usage, labelled as an estimate with its assumptions.
+  month. 0.6: the headline is the list price; "After Workers Paid
+  included allowance" is a secondary toggle that notes it assumes this is
+  the only workload on the account. The estimate counts every Worker
+  request: capture, flags (`/flags`, `/decide`, flag definitions, local
+  evaluation), remote config (`/array/…/config`), owner API and requests
+  refused at the edge.
+- 0.6 counters: the edge counts flag, config and owner API requests and
+  events, requests and replay uploads dropped past a cap without waiting
+  (batched per isolate, flushed within about 2 s through the project
+  store). The Usage screen and API show "Dropped past cap" (`events`,
+  `requests`, `replay_uploads`) and requests by type.
 - Alerts are stored per project and shown on the Usage screen (with an
   unread badge in the navigation): 50%, 80% and 100% of each cap, a daily
   spike (yesterday over 3x the previous 7-day average, at least 100
@@ -703,6 +799,63 @@ sample mode, autocapture sampling, replay cap with chunk deletion and
 recorder off, spike alert, email delivery through a stub binding); the
 e2e shows real posthog-js stopping after a `quota_limited` answer.
 
+### R31. LLM analytics
+
+- Ingestion: `$ai_generation`, `$ai_trace`, `$ai_span`, `$ai_embedding`
+  (and any `$ai_*` event) are stored like other events from the standard
+  capture paths (`/i/v0/e`, `/batch`, `/e`, v1) and from the AI endpoints
+  the PostHog AI SDKs use (`protocol.md` 21): `/i/v0/ai/batch` (legacy
+  batch body), `/i/v1/ai/events` (v1 batch) and `/i/v0/ai` (multipart with
+  exactly an `event` part and an optional `event.properties` part, Bearer
+  token, optional gzip). The AI endpoints drop non-`$ai_` events as
+  `misrouted_event`.
+- Cost per generation or embedding: the SDK's `$ai_total_cost_usd`, else
+  `$ai_input_cost_usd + $ai_output_cost_usd`, else list prices from
+  `src/shared/llm-pricing.ts` by model (OpenAI, Anthropic, Google, xAI,
+  DeepSeek, Llama), with cached input tokens priced as cached
+  (`test-vectors.json` "llm_costs"). Unknown models have no cost and are
+  counted as unpriced.
+- Screens (nav "LLM analytics"): Overview (generations, embeddings,
+  traces, users, input and output tokens, cost, p50 and p95 latency, error
+  rate, generations and errors per interval, cost per interval, a model and
+  provider table); Traces (filters for model, provider, status and search;
+  name, person, models, spans, tokens, cost, latency, status); Trace (span
+  tree by `$ai_parent_id` with a latency waterfall, a selected span's
+  model, tokens, cost, error and expandable `$ai_input` and
+  `$ai_output_choices`, the trace's input and output state, person and
+  session links).
+- Owner API: `GET /api/projects/:id/llm/overview?date_from=&date_to=&interval=&model=&provider=`,
+  `GET /llm/traces?…&status=&search=`, `GET /llm/traces/:trace_id?ts=`.
+
+Check: `tests/v06.test.ts` "LLM analytics" (pricing; batch, multipart and
+v1 endpoints; misrouted events; overview totals, traces filters and the
+trace tree); the e2e sends a generation with posthog-node, a batch and a
+multipart event, then opens the overview and trace screens.
+
+### R32. Public demo (optional)
+
+- With the var `PUBLIC_DEMO` set to `1` (off by default), signed-out
+  visitors can open every screen of projects the owner marked
+  `public_demo` (Settings, or `PATCH {public_demo: true}`), read only. Other
+  projects stay private (404).
+- Reads and read-only posts (`/query`, `/sql`) work; every other `POST`,
+  `PATCH`, `PUT` and `DELETE`, flag definitions for local evaluation and
+  the test alert answer 403 `{"error": "demo_read_only"}`.
+  `ALLOWED_EMAILS` still applies to sign-up and sign-in, and a signed-in
+  owner keeps full access.
+- Responses to visitors are redacted: user and alert-recipient emails
+  become `owner@hidden`, `alert_emails` is empty, personal API keys are an
+  empty list and the project API key is replaced by a placeholder.
+- The web app shows a "Read-only public demo" banner with an owner sign-in
+  link and disables write controls. `scripts/demo-setup.mjs` builds a demo
+  project with data on every screen and marks it `public_demo`, against
+  `wrangler dev` or a live URL.
+
+Check: `tests/v06.test.ts` "public demo" (off by default, reads, 403s,
+redaction, private projects, ALLOWED_EMAILS); the e2e checks the API and
+the banner as a signed-out browser when the instance runs with
+`PUBLIC_DEMO=1`.
+
 ## Definition of done
 
 `npm test` and `npm run e2e` pass, and a deploy following `design.md`
@@ -711,4 +864,8 @@ Events within a few seconds, records and plays back a session with its
 console log, shows a running survey, reports an experiment's exposures,
 draws a click heatmap and answers a SQL query; since 0.5 it also groups a
 real browser exception into an issue with a symbolicated stack trace,
-shows the Usage screen and answers `quota_limited` past a cap.
+shows the Usage screen and answers `quota_limited` past a cap; since 0.6
+it also shows a posthog-node LLM generation in LLM analytics with its
+trace, re-symbolicates an exception when its release's map is uploaded,
+counts events and requests dropped past a cap, and (with `PUBLIC_DEMO=1`)
+shows a demo project read-only to a signed-out visitor.

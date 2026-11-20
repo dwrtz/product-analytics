@@ -6,13 +6,21 @@ your instance and you get events, identified people, groups, trends,
 funnels, retention, dashboards, feature flags (also evaluated locally by
 posthog-node), session replay with console and network logs, heatmaps and
 scroll depth, actions, cohorts, a read-only SQL editor, experiments,
-targeted surveys, error tracking with source maps, and per-project usage
-caps with a usage page, cost estimate and alerts. Events live in SQLite Durable Objects sharded by
+targeted surveys, error tracking with source maps and releases, LLM
+analytics for the PostHog AI SDKs, and per-project usage caps with a usage
+page, cost estimate and alerts. Events live in SQLite Durable Objects sharded by
 month, so a project is not limited to 10 GB and every count stays exact.
 
 **Spec:** [spekkr.com/dwrtz/product-analytics](https://spekkr.com/dwrtz/product-analytics/)
-(version 0.5.0, also in [`spec/`](spec/)). This repo is the reference
-implementation of that spec.
+(version 0.6.0, also in [`spec/`](spec/)). This repo is the reference
+implementation of that spec. To build your own from the spec, tell a coding
+agent:
+
+> Build the spec at https://spekkr.com/dwrtz/product-analytics/start.md
+
+**Live demo:** [analytics.beef-able.com](https://analytics.beef-able.com),
+a read-only public demo with synthetic data (no sign-in needed; see
+"Public demo" below).
 
 This is not PostHog and contains no PostHog code. The wire format was
 reconstructed from PostHog's MIT-licensed sources and recorded SDK traffic
@@ -29,7 +37,8 @@ reconstructed from PostHog's MIT-licensed sources and recorded SDK traffic
 ## What works
 
 - **Capture**, as the SDKs send it: `/e`, `/i/v0/e`, `/batch`, `/capture`,
-  `/track`, `/engage`, `/i/v0/ai/batch` and v1 `/i/v1/analytics/events`.
+  `/track`, `/engage`, v1 `/i/v1/analytics/events`, and the AI endpoints
+  `/i/v0/ai/batch`, multipart `/i/v0/ai` and `/i/v1/ai/events`.
   Every body encoding (gzip with or without a hint, LZ64, base64, form
   `data=`), clock-skew correction, dedupe by uuid, Cloudflare geo as
   `$geoip_*`.
@@ -99,6 +108,36 @@ reconstructed from PostHog's MIT-licensed sources and recorded SDK traffic
 
 ![Usage page](shots05/usage.png)
 
+- **0.6**: **LLM analytics**: `$ai_generation`, `$ai_trace`, `$ai_span`
+  and `$ai_embedding` events from the PostHog AI SDKs (or any sender) give
+  an overview (generations, tokens, cost from the SDK or a built-in price
+  table, p50/p95 latency, error rate, per-model table) with model,
+  provider and error filters, a traces list and a trace page with a span
+  tree and latency waterfall. **Error tracking**: releases (`$release` /
+  `$app_version`) with per-release source maps and retroactive
+  symbolication when a map is uploaded later, index (sectioned) source
+  maps, merge and split issues, assign issues to a user, custom grouping
+  rules, suppression rules (sent to posthog-js through remote config and
+  enforced at ingest), and Python, Go and Rust stacks. **Cold Trends**:
+  Trends can read the Basin cold tier (Hot/Cold source), and
+  `scripts/cold-prune.py` (PyIceberg, with a scheduled workflow example)
+  physically deletes cold rows past retention. **Usage**: flags, remote
+  config and API requests are counted, plus events and requests dropped
+  past a cap; the cost estimate leads with list price (toggle: after the
+  Workers Paid allowance); caps reach every isolate within about 10 s.
+  **Public demo** mode (below), and a deep link to any screen loads the
+  app directly.
+
+![LLM analytics](shots06/llm-analytics.png)
+
+![LLM trace waterfall](shots06/llm-trace.png)
+
+![Error tracking with releases and assignees](shots06/error-tracking.png)
+
+![Usage with requests and drops past the cap](shots06/usage.png)
+
+![Read-only public demo](shots06/public-demo.png)
+
 Full, normative detail: [`spec/protocol.md`](spec/protocol.md), with worked
 examples in [`spec/test-vectors.json`](spec/test-vectors.json).
 
@@ -109,9 +148,9 @@ examples in [`spec/test-vectors.json`](spec/test-vectors.json).
 | `src/shared/` | Pure wire library: body decoding, tokens, timestamps, ids, flag hashing and matching, date buckets |
 | `src/worker/` | The Worker: capture, flags and remote config, queue consumer, owner API, auth, `ProjectStore` (head) and `EventShard` Durable Objects, queries, replay, experiments, surveys, error tracking, usage limits and alerts |
 | `src/ui/` | Web app (no framework, SVG charts), bundled into the Worker by `scripts/build-ui.mjs` |
-| `migrations/` | D1 schema (instance data: users, sessions, keys, projects; 0002 adds the recording switch, 0004 usage limits and error tracking) |
+| `migrations/` | D1 schema (instance data: users, sessions, keys, projects; 0002 adds the recording switch, 0004 usage limits and error tracking, 0005 the public demo flag) |
 | `tests/`, `e2e/` | Vitest in workerd on the spec vectors and a fixed dataset; end-to-end with posthog-js in Chromium and posthog-node |
-| `scripts/` | UI build, SDK copy, demo data, screenshots |
+| `scripts/` | UI build, SDK copy, demo data, screenshots, source map upload, `cold-prune.py` |
 | `spec/` | The Spekkr spec this was built from |
 
 ## Run locally
@@ -121,14 +160,17 @@ Node 22 or later.
 ```sh
 npm install
 npm run dev          # builds, creates wrangler.jsonc, applies local D1 migrations, runs wrangler dev on :8787
-npm test             # 163 tests: spec vectors, store and insight maths, HTTP, shards, replay, experiments, surveys, cold tier, errors, usage
+npm test             # 211 tests: spec vectors, store and insight maths, HTTP, shards, replay, experiments, surveys, cold tier, errors, usage, LLM, public demo
+python3 -m unittest scripts/test_cold_prune.py   # 6 tests for the cold pruning script
 npx playwright install chromium
 E2E_EMAIL=you@example.com npm run e2e   # against the running dev server
 ```
 
 Open http://localhost:8787, sign up (the first account owns the instance),
 create a project and copy the snippet from Settings. For demo data:
-`node scripts/demo-setup.mjs http://localhost:8787 <email> <password>`.
+`PA_DEMO_PASSWORD=<password> node scripts/demo-setup.mjs http://localhost:8787 <email>`
+(traffic, errors across releases, LLM traces and a capped period, all
+idempotent; it ends with the project marked as a public demo).
 
 ## Deploy
 
@@ -161,12 +203,32 @@ and R2, and a zone for the hostname.
    `ALERT_EMAIL_FROM` var (see `wrangler.example.jsonc`). Without them
    alerts appear in the app only.
 
-No secrets are needed. Upgrading from 0.4: run step 4 again (migration
+9. Optional public demo: set the `PUBLIC_DEMO` var to `1` and turn on
+   "Public demo" in a project's Settings (see below).
+10. Optional cold pruning: copy `scripts/cold-prune.workflow.example.yml`
+    into `.github/workflows/` with a `R2_CATALOG_TOKEN` secret and the
+    `CF_ACCOUNT_ID`, `COLD_BUCKET` and `RETENTION_DAYS` variables, or run
+    `python3 scripts/cold-prune.py --help` by hand.
+
+No secrets are needed by the Worker. Upgrading from 0.5: run step 4 again
+(migration 0005, adds `projects.public_demo`) and `npm run deploy`; Durable
+Objects upgrade their own tables. Upgrading from 0.4: run step 4 again (migration
 0004) and `npm run deploy`; existing projects keep no caps and exception
 autocapture off until changed in Settings. Upgrading from 0.2: run step 4 again (migration
 0003) and `npm run deploy` (adds the hourly cohort cron). Upgrading from 0.1: create the R2 bucket, run step
 4 again (migration 0002) and `npm run deploy`; existing events stay where
 they are and new ones go to monthly shards.
+
+## Public demo
+
+With `PUBLIC_DEMO=1`, signed-out visitors can browse every project whose
+"Public demo" switch is on, read-only: all screens, insights, SQL and
+recordings work, a banner says it is a demo, every write is refused (403
+`demo_read_only`) and secrets are redacted (the project token shows as
+`phc_demo_token_hidden` and account and alert emails as `owner@hidden`).
+Sign-up stays limited by `ALLOWED_EMAILS`, and owners still sign in as
+usual. Leave `PUBLIC_DEMO` unset (the default) for a private instance;
+[analytics.beef-able.com](https://analytics.beef-able.com) runs with it on.
 
 ## Use it from your site
 
@@ -182,9 +244,18 @@ Settings shows the full snippet for your instance. With posthog-node:
 
 ## Test status
 
-- `npm test`: 163/163 pass (0.5 adds error tracking, source map, usage cap, sampling and alert tests plus their vectors; 0.4 the cold-tier compiler tests, 0.4.1/0.4.2 the ingest-only hostname tests).
+- `npm test`: 211/211 pass (0.6 adds the HTML fallback, public demo,
+  usage counter, error tracking 0.6, LLM analytics and cold Trends tests and
+  the source-map-section, LLM cost, suppression rule and release vectors;
+  0.5 adds error tracking, source map, usage cap, sampling and alert tests plus their vectors; 0.4 the cold-tier compiler tests, 0.4.1/0.4.2 the ingest-only hostname tests).
 - `npm run typecheck`: passes.
-- `npm run e2e`: 57/57 checks pass (0.5 adds exception autocapture with real posthog-js, a posthog-node exception, the issues and issue pages, the usage page, and posthog-js pausing after `quota_limited`; 0.3 adds actions, cohorts, SQL,
+- `python3 -m unittest scripts/test_cold_prune.py`: 6/6 pass.
+- `npm run e2e`: 85/85 checks pass (0.6 adds deep links, Python/Go/Rust
+  stacks, releases with retroactive symbolication, grouping and
+  suppression rules in remote config and at ingest, merge/split/assign,
+  LLM events through posthog-node, the AI batch and multipart endpoints
+  and their screens, request and dropped-past-cap counters, and the public
+  demo as a signed-out visitor; 0.5 adds exception autocapture with real posthog-js, a posthog-node exception, the issues and issue pages, the usage page, and posthog-js pausing after `quota_limited`; 0.3 adds actions, cohorts, SQL,
   heatmaps, scroll depth, console/network capture, continuity, partial
   survey responses, posthog-node local evaluation and their screens; earlier: (posthog-js snippet on a separate
   origin, posthog-node capture, identify, alias and flags; stored events,
@@ -200,12 +271,21 @@ Settings shows the full snippet for your instance. With posthog-node:
   minutes; an event older than the 365-day retention was excluded; 14/14
   checks.
 
-## Not in 0.4
+## Not in 0.6
 
-Data warehouse exports; insights over the cold tier (it is reachable from
-SQL only) and physical deletion of expired cold rows (Basin SQL is
-read-only; retention is applied to every cold query); full HogQL (joins, subqueries); lifecycle, stickiness and paths;
-toolbar and element clickmaps; web experiments and product tours.
+- Data warehouse, CDP / data pipelines and notebooks.
+- Full HogQL (joins, subqueries); the SQL screen is a project-scoped
+  subset.
+- Lifecycle, stickiness and paths insights.
+- The toolbar and element clickmaps.
+- Web experiments and product tours.
+- Organizations, SSO and billing (one instance, an email allow list).
+- Native mobile (iOS/Android) symbolication (dSYM, ProGuard).
+- Physical deletion of cold rows inside the Worker: Basin SQL is
+  read-only, so retention is applied to every cold query and
+  [`scripts/cold-prune.py`](scripts/cold-prune.py) deletes expired rows
+  outside it.
+- Scale and load testing (no published numbers for 10M+ events a month).
 
 ## License
 

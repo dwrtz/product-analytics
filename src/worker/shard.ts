@@ -30,6 +30,7 @@ export class EventShard extends DurableObject<Env> {
   async periods(s: X.PeriodSpec) { return X.periodRows(this.sql, s); }
   async firsts(s: { node: X.NodeSpec; global?: X.PropertyFilter[]; before: number }) { return X.firstRows(this.sql, s); }
   async events(s: X.EventsSpec) { return X.eventRows(this.sql, s); }
+  async llm(s: X.LlmSpec) { return X.llmRows(this.sql, s); }
   async propertyValues(key: string) { return X.propertyValueRows(this.sql, key); }
   async stats(since: number) { return { ...X.eventStats(this.sql, since), bytes: this.sql.databaseSize }; }
   async purge(before: number) { return X.purgeBefore(this.sql, before); }

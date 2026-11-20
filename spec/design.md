@@ -185,6 +185,7 @@ committed. Vars:
 | `INGEST_HOSTS` | Optional, empty by default: comma-separated hostnames that only receive SDK traffic ("Hostnames"). |
 | `SHARD_PERIOD` | `month` (default) or `day`; read once per project. For tests. |
 | `ALERT_EMAIL_FROM` | Optional (0.5): sender address for alert emails, on a domain onboarded to Cloudflare Email Sending. Needs the `EMAIL` binding; unset = alerts in the app only ("Alerts"). |
+| `PUBLIC_DEMO` | Optional (0.6): `1` lets signed-out visitors browse projects marked `public_demo` read-only ("Public demo"); anything else is off. |
 
 Crons: `17 3 * * *` purges by retention; `41 * * * *` (0.3) recalculates
 dynamic cohorts. The optional cold tier (0.4, "Cold tier") adds a
@@ -247,6 +248,18 @@ Upgrades: `npm run deploy`; new D1 migrations with step 4 (0.3 adds
 `migrations/0003_v03.sql`, two additive columns on `projects`). The Durable
 Objects create and upgrade their own tables on start (`CREATE ... IF NOT
 EXISTS`), so a new store schema version adds statements there.
+
+**Upgrading 0.5 → 0.6:** apply `migrations/0005_v06.sql` (adds
+`projects.public_demo INTEGER NOT NULL DEFAULT 0`), then deploy. The head
+Durable Object upgrades itself on start, idempotently: new tables
+(`error_fingerprint_aliases`, `error_grouping_rules`,
+`error_suppression_rules`), new columns on `error_issues` and
+`error_occurrences`, `symbol_sets` rebuilt in place with a `release`
+column and `UNIQUE (release, ref)` (existing maps get release `''`, which
+applies to every release), and a one-time backfill of occurrence
+fingerprints (guarded by `meta` key `v06_occ_fp`). No Durable Object class
+migration is needed. Set `PUBLIC_DEMO` only on an instance meant to be a
+public demo.
 
 **Upgrading 0.1 → 0.2:** create the R2 bucket, apply D1 migration
 `0002_replay.sql` (adds `projects.session_recording`, default 0; existing
@@ -803,7 +816,7 @@ to be best" across more than two variants directly. No PostHog code or
 - A query's final aggregation runs in the head with a 30-second CPU
   budget; see "Event shards" for memory guidance.
 - The token cache can serve a reset or deleted token, or an old
-  recording/survey setting, for up to 30 seconds in other isolates.
+  recording/survey setting, for up to 10 seconds in other isolates (30 s before 0.6).
 - Recording chunks are one per request; snapshots are served in pages of
   about 16 MB (no total cap). The one-shot snapshots route still stops at
   64 MB; the player uses pages.
@@ -1039,13 +1052,14 @@ Enforcement has two layers:
 2. **Short-cut at the edge.** After a batch the store compares the month
    totals with the caps and writes `{month, events, replay}` to
    `projects.cap_state` when it changes. Capture reads it from the cached
-   project row (up to 30 s per isolate; a PATCH clears the cache of the
+   project row (up to 10 s per isolate since 0.6; a PATCH clears the cache of the
    isolate that served it). In drop mode capture keeps nothing and answers
    `quota_limited` (`protocol.md` 20); `/s/` refuses snapshots and answers
    `["recordings"]`; remote config turns session recording and exception
    autocapture off. In sample mode the edge applies the same hash. A state
    from an earlier month means "not capped", so caps reset by themselves.
-   Events dropped at the edge are not counted (documented on the screen).
+   Since 0.6 events, requests and replay uploads dropped at the edge are
+   counted ("Edge usage counters" below).
 
 Autocapture sampling runs only at the edge:
 `sampled('ac:' + ($session_id ?? distinct_id), autocapture_sample_rate)`,
@@ -1153,3 +1167,225 @@ enclosing declaration's name from `sourcesContent`. Source paths lose `webpack:/
 - **Error tracking** (`/project/:id/errors`, `/errors/:issue`): R28.
 - **Settings** gains "Usage limits and alerts" and "Error tracking"
   (exception autocapture switch, source maps list, upload command).
+
+## HTML fallback (`worker/routing.ts`, 0.6)
+
+`wantsApp(method, path, accept)`: `GET`/`HEAD` only; never for `/api`,
+`/static`, `/i`, `/s`, `/e`, `/batch`, `/capture`, `/track`, `/engage`,
+`/flags`, `/decide`, `/array`, `/_health` or a path with a file extension;
+not when `Accept` names `application/json` without `text/html` or `*/*`.
+Otherwise the Worker answers the app's HTML, so deep links such as
+`/project/3/llm/traces/<id>` load the app and the client router draws the
+screen. `routing.ts` is a separate module because the Worker entry module
+may only export handlers and classes.
+
+## Public demo (`worker/api.ts`, 0.6)
+
+`PUBLIC_DEMO=1` (var; any other value is off). A request to `/api/*`
+without a session or personal key goes to `demoApi()` instead of 401:
+
+- `GET /api/me` → `{id: 0, email: null, name: "Demo visitor", demo: true}`;
+  `/api/personal_api_keys` → `[]`; `/api/users` → ids and names only;
+  `/api/projects` → projects with `public_demo = 1`.
+- `/api/projects/:id/*` exists only for `public_demo` projects (404
+  otherwise). `GET`/`HEAD` and `POST /query`, `POST /sql` run through the
+  normal owner handler with a visitor user (id 0); anything else, plus
+  `/feature_flags/local_evaluation` and `/alerts/test`, throws 403
+  `demo_read_only`.
+- `redact()` walks the JSON response: strings equal to a project token
+  become `phc_demo_token_hidden`; any instance user's email or any alert
+  recipient inside a string becomes `owner@hidden`; `alert_emails` arrays
+  become `[]`.
+- Sign-up and sign-in are unchanged (`ALLOWED_EMAILS` applies). A signed-in
+  user never goes through `demoApi()`.
+
+The web app reads `me.demo`: a banner, "Sign in" instead of Account, and a
+MutationObserver that disables buttons whose label starts with a write
+verb (New, Save, Delete, Merge, Resolve, …), hides `/new` and `/edit`
+links and disables Settings inputs; the API wrapper refuses writes locally
+with the same message. Owners pick demo projects with the "Public demo"
+switch in Settings (shown only when `cfg.public_demo`).
+
+## Edge usage counters (`worker/meter.ts`, 0.6)
+
+`meter(env, ctx, pid, kind, n)` adds to an in-memory per-isolate,
+per-project counter: `flags` (`/flags`, `/decide`, flag definitions, local
+evaluation), `config` (`/array/<token>/config(.js)`), `api` (owner API
+calls on a project), `edge_dropped_events`, `edge_dropped_requests`
+(nothing in the request was kept) and `edge_dropped_replay`. The first
+count for a project, and then any count at least 2 s after the last flush
+or with 200 pending, flushes with `ctx.waitUntil(store.recordEdgeUsage(day,
+counts))`, never delaying the response. `recordEdgeUsage` bumps
+`usage_daily` rows `requests/flags|config|api` and
+`edge_dropped/events|requests|replay`. Counts left in an isolate that is
+evicted before its next flush are lost, so the numbers are close
+approximations; store-side counts (accepted, dropped in the store,
+suppressed) stay exact.
+
+`usage()` adds `month_to_date.flag_requests`, `config_requests`,
+`api_requests`, `edge_dropped_*`, `suppressed_exceptions`, and
+`dropped_past_cap = {events: store-dropped + edge-dropped events, requests:
+edge-dropped requests, replay_uploads: refused chunks + edge-refused
+uploads}`. `estimateCost` counts every Worker request (capture + flags +
+config + API + edge-dropped) for Workers requests and CPU, and weights
+Durable Object requests per kind (`ASSUMPTIONS`: 1 per flag request, 3 per
+config request, 2 per API request). The Usage screen leads with the list
+price; the "After Workers Paid included allowance" toggle assumes this is
+the only workload on the account.
+
+## Error tracking 0.6 (`worker/errors.ts`, `worker/store.ts`)
+
+Schema additions in the head:
+
+```sql
+ALTER TABLE error_issues ADD first_seen_release TEXT, last_seen_release TEXT, assignee_id INTEGER, assignee_email TEXT, merged_into TEXT;
+ALTER TABLE error_occurrences ADD release TEXT, fingerprint TEXT, exception TEXT, raw TEXT, resolved INTEGER NOT NULL DEFAULT 1;
+CREATE TABLE error_fingerprint_aliases (fingerprint TEXT PRIMARY KEY, issue_id TEXT NOT NULL, original_issue_id TEXT, created_at INTEGER NOT NULL);
+CREATE TABLE error_grouping_rules (id INTEGER PRIMARY KEY, position INTEGER NOT NULL, field TEXT NOT NULL, match TEXT NOT NULL,
+  pattern TEXT NOT NULL, key TEXT NOT NULL, description TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL);
+CREATE TABLE error_suppression_rules (id INTEGER PRIMARY KEY, rule TEXT NOT NULL, description TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL);
+CREATE TABLE symbol_sets (id TEXT PRIMARY KEY, release TEXT NOT NULL DEFAULT '', ref TEXT NOT NULL, path TEXT NOT NULL, r2_key TEXT NOT NULL,
+  size INTEGER NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER, UNIQUE (release, ref));
+```
+
+- **Issue lookup.** `issueFor(fp)` checks `error_issues.fingerprint`, then
+  `error_fingerprint_aliases`, and follows `merged_into`. Merge sets the
+  merged issues' `status = 'merged'`, `merged_into`, adds aliases for their
+  fingerprints and recounts the primary from `error_occurrences`; split
+  moves occurrences with one fingerprint to the issue that owned it
+  (restoring it if it was merged) or a new one, removes the alias and
+  recounts both.
+- **Fingerprint order.** `$exception_fingerprint` (`custom:<value>`), then
+  the first enabled grouping rule that matches (`rule:<key>`; `type` and
+  `value` test any exception in the list, `filename` and `function` any
+  frame; regex patterns at most 200 characters, compiled once), then the
+  default fingerprint.
+- **Suppression.** Rules are cleaned into posthog-js's wire shape and sent
+  in remote config. At ingest, after the cap, `suppressed(rules, list)`
+  drops matching `$exception` events (written to `ingest_log`, counted as
+  `suppressed`). Operators mirror posthog-js: `exact`/`is_not` compare
+  strings (a list value matches any item), `icontains`/`not_icontains`
+  are case-insensitive, `regex`/`not_regex` use JavaScript regexes; `AND`
+  needs every value to match, `OR` any; a value matches if any exception's
+  type (or message) matches.
+- **Releases.** `releaseOf(props)`; maps are looked up for `(release,
+  ref)` then `('', ref)` (and the same path rules as 0.5).
+- **Retroactive symbolication.** Each occurrence stores its exception list
+  as stored (`exception`) and, when frames were left unresolved, the raw
+  list (`raw`, `resolved = 0`). After an upload, `resymbolicate(ref,
+  release)` selects up to 2,000 unresolved occurrences from the last 30
+  days whose raw list mentions the file's basename (and release when
+  given), symbolicates them again, updates the occurrence, the issue's
+  sample and top frame, and adds the resolved list's default fingerprint
+  as an alias of the issue so later, already-resolved occurrences group
+  with it. Events in the shards are not rewritten.
+- **Server stacks.** Frames with a `platform` that is not JavaScript or
+  Node (posthog-python `python`, posthog-go, posthog-rs) are never sent to
+  source-map lookup; they keep `module`, `pre_context`, `context_line`
+  and `post_context` as sent, and the issue page shows them like resolved
+  frames with a platform tag.
+- **Index maps.** `validateMap` accepts `sections` (sorted, non-overlapping
+  `offset {line, column}`, inline `map`, no nesting, no `url`);
+  `decodeSections` shifts each section's segments by its offset (column
+  offset on the section's first line only) and concatenates sources
+  (`test-vectors.json` "source_map_sections").
+
+## LLM analytics (`worker/llm.ts`, `shared/llm-pricing.ts`, 0.6)
+
+Ingestion: the capture handlers accept `/i/v0/ai/batch` (legacy body,
+`$ai_*` events only), `/i/v1/ai/events` (v1 body; other events get
+`{result: "drop", details: "misrouted_event"}`) and `/i/v0/ai`
+(multipart/form-data, Bearer token, optional `Content-Encoding: gzip`,
+exactly one `event` part and at most one `event.properties` part merged
+into the event's properties; anything else is 400). They then go through
+the same normalize, gate and queue path as every event; no separate store.
+
+Queries: `EventShard.llm(spec)` selects `$ai_generation`, `$ai_embedding`,
+`$ai_span`, `$ai_trace` (and other `$ai_` events) in a time range with
+`json_extract` of 19 properties (`eventsql.ts` `LLM_PROPS`, each aliased),
+optionally one trace and the full properties. The head fans out over the
+range's shards (at most 200,000 rows) and `llm.ts` builds:
+
+- `llmOverview`: totals (generations, embeddings, traces, users, tokens,
+  cost, priced/unpriced calls, p50/p95 latency, errors, error rate),
+  per-interval series (generations, errors, cost, tokens) in the project's
+  time zone, and a model × provider table.
+- `llmTraces`: rows grouped by `$ai_trace_id` (a call without one is its
+  own trace), the trace name from the `$ai_trace` event or the root span,
+  models, providers, spans, tokens, cost, latency (`$ai_trace` latency or
+  the span extent), status and first error; filters model, provider,
+  status, search; facets.
+- `llmTrace`: ±1 day around `?ts=` (else the last 90 days); nodes linked
+  by `$ai_parent_id` to `$ai_span_id` (a parent equal to the trace id means
+  top level), each with `offset_ms` from the earliest start (start =
+  timestamp − latency) for the waterfall, inputs and outputs clipped at
+  100 KB, the trace's input and output state, and the person.
+
+An error is `$ai_is_error` true, an HTTP status ≥ 400 or an `$ai_error`.
+Cost: `costOf()` (`spec.md` R31); prices are USD per million tokens, matched
+by the normalized model id (lower case, no provider prefix, no date or
+version suffix) or the longest known prefix.
+
+## Cold Trends (`buildColdTrends` in `worker/cold.ts`, 0.6)
+
+For a TrendsQuery with `source: "cold"` the range and buckets come from
+the same `resolveRange`/bucket code as the hot engine (time zone aware),
+clamped to the retention window. Each series becomes
+
+```sql
+SELECT CASE WHEN ts < <b1> THEN 0 WHEN ts < <b2> THEN 1 … ELSE n END AS b, COUNT(*) AS c
+FROM <table> WHERE project_id = <id> AND timestamp >= to_timestamp_millis(<cutoff>) AND ts >= <cutoff>
+  AND ts >= <from> AND ts < <to> AND event = '<event>' AND <property filters> GROUP BY 1 ORDER BY 1
+```
+
+with `COUNT(DISTINCT distinct_id)` for `dau` and
+`COUNT(DISTINCT json_get_str(properties, '$session_id'))` for
+`unique_session`. Bucket boundaries are literal epoch ms, so DST and
+month lengths match the hot engine; at most 400 buckets. Property filters
+reuse the cold SQL compiler's quoting. Results have the hot Trends shape
+plus `source: "cold"` and `scanned`. A missing table answers empty
+series.
+
+## Cold tier: retention and pruning (`scripts/cold-prune.py`, 0.6)
+
+Retention in the cold tier is enforced at query time (every statement
+carries the project and cutoff conditions). Physical deletion runs outside
+the Worker: `cold-prune.py` loads the table from the R2 Data Catalog REST
+endpoint with PyIceberg (`RestCatalog(warehouse, uri, token)`), deletes
+`ts < now - retention_days` (optionally `AND project_id = <id>`) with an
+Iceberg row-level delete, and with `--expire-older-than-days` expires old
+snapshots so R2 Data Catalog's snapshot expiration and compaction reclaim
+the files. `--dry-run` counts matching files and rows. The token comes
+from `R2_CATALOG_TOKEN` (or `CLOUDFLARE_API_TOKEN`) and is never printed.
+`scripts/cold-prune.workflow.example.yml` runs it weekly in GitHub Actions
+with the token as a repository secret. Tests: `python3 -m unittest
+scripts/test_cold_prune.py`.
+
+## Screens (0.6)
+
+- **LLM analytics** (`/project/:id/llm`, `?tab=traces`,
+  `/llm/traces/:trace_id?ts=`): R31.
+- **Error tracking**: release and assignee filters, Releases and Assignee
+  columns, checkboxes with "Merge selected"; the issue page adds releases,
+  an assignee picker, fingerprints with Split, merged issues and release
+  per occurrence. Settings adds grouping rules, suppression rules and the
+  release column for source maps.
+- **Usage**: "Dropped past cap", "Requests this month" by type, list-price
+  headline with the included-allowance toggle.
+- **Insight editor (Trends)**: Source (Hot / Cold) when the cold tier is
+  on.
+- **Public demo**: banner, Sign in link, write controls disabled.
+
+## Tests (0.6)
+
+`tests/v06.test.ts` (24 tests: HTML fallback; public demo; usage counters,
+cost and the 10 s cache; index maps; releases, grouping and suppression
+rules and server stacks as units; retroactive symbolication, merge, split,
+assignment and rules over HTTP; `symbol_sets` keyed by release; LLM
+pricing, endpoints, overview, traces and trace; cold Trends) and the 0.6
+vectors in `tests/vectors.test.ts`. The e2e adds 0.6 checks (HTML
+fallback, server stacks through `/batch/`, rules in remote config,
+retroactive symbolication, merge/split/assign, LLM ingestion through
+posthog-node, batch and multipart with the overview and trace screens,
+usage counters and dropped-past-cap, cold Trends degrading, and the public
+demo as a signed-out browser when `PUBLIC_DEMO=1`).

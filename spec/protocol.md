@@ -12,7 +12,10 @@ point to the PostHog MIT source the rule was read from (commit and paths in
 | Path (trailing slash optional) | Methods | Used by | Section |
 |---|---|---|---|
 | `/e`, `/i/v0/e` | POST, GET | posthog-js events (observed: `/e/` before remote config loads, `/i/v0/e/` after) | 2-5 |
-| `/batch`, `/capture`, `/track`, `/engage`, `/i/v0/ai/batch` | POST, GET | older SDKs, server SDKs, imports | 2-5 |
+| `/batch`, `/capture`, `/track`, `/engage` | POST, GET | older SDKs, server SDKs, imports | 2-5 |
+| `/i/v0/ai/batch` | POST, GET | PostHog AI SDKs; legacy bodies, `$ai_*` events only (0.6) | 2-5, 21 |
+| `/i/v0/ai` | POST | PostHog AI SDKs, large payloads: multipart (0.6) | 21 |
+| `/i/v1/ai/events` | POST | v1 AI senders (0.6) | 6, 21 |
 | `/i/v1/analytics/events` | POST | posthog-node 6 and other v1 senders | 6 |
 | `/flags`, `/decide` | POST, GET | flag evaluation (`/flags/?v=2` from posthog-js, `?v=4` from posthog-node) | 8 |
 | `/array/<token>/config`, `/array/<token>/config.js` | GET | posthog-js remote config | 9 |
@@ -644,3 +647,62 @@ sending them (observed: after one limited answer, four further clicks and a
 In sample mode the answer stays `{"status": 1}` and a deterministic share
 is kept (`test-vectors.json` "sampling"). Events dropped because of a cap
 are accepted with status 200 like events of an unknown project.
+
+0.6: events, requests and replay uploads refused this way are counted per
+project ("Dropped past cap" on the Usage screen); the answer is unchanged.
+
+## 21. LLM analytics capture [PostHog docs "LLM analytics", posthog-js packages/ai; observed shapes]
+
+AI events are ordinary events with reserved names and properties. Names:
+`$ai_generation` (one model call), `$ai_embedding`, `$ai_span` (a step),
+`$ai_trace` (the whole run); other `$ai_*` names are stored as sent.
+Properties read by this instance (all optional):
+
+| property | meaning |
+|---|---|
+| `$ai_trace_id` | groups a run; a call without one is its own trace |
+| `$ai_span_id`, `$ai_parent_id` | tree links; a parent equal to the trace id is top level |
+| `$ai_span_name`, `$ai_trace_name` | display name |
+| `$ai_model`, `$ai_provider` | e.g. `gpt-4o-mini`, `openai` |
+| `$ai_input_tokens`, `$ai_output_tokens` | token counts (OpenAI-style input includes cached tokens) |
+| `$ai_cache_read_input_tokens`, `$ai_cache_creation_input_tokens` | cache tokens (Anthropic reports them apart from input) |
+| `$ai_total_cost_usd`, `$ai_input_cost_usd`, `$ai_output_cost_usd` | SDK-computed cost; wins over list prices |
+| `$ai_latency` | seconds |
+| `$ai_is_error`, `$ai_error`, `$ai_http_status` | errors (status ≥ 400 counts as an error) |
+| `$ai_input`, `$ai_output_choices` | messages in and out (any JSON) |
+| `$ai_input_state`, `$ai_output_state` | a trace's or span's input and output |
+
+Endpoints (in addition to every capture path in section 1):
+
+- `POST /i/v0/ai/batch/`: legacy bodies (section 2); events whose name does
+  not start with `$ai_` are dropped (counted as misrouted), the rest are
+  normalized like `/batch`. Answer `{"status": 1}` (or `quota_limited`,
+  section 20).
+- `POST /i/v1/ai/events`: v1 body (section 6); a non-AI event's result is
+  `{"result": "drop", "details": "misrouted_event"}`.
+- `POST /i/v0/ai`: `Authorization: Bearer <project token>` (401
+  `invalid_api_key` otherwise), `Content-Type: multipart/form-data`,
+  optional `Content-Encoding: gzip`, at most 25 MB. Exactly one part named
+  `event` (JSON object with `event`, `distinct_id`, optional `uuid`,
+  `timestamp`, `properties`) and at most one part named `event.properties`
+  (JSON object merged over the event's properties). Any other part name,
+  a second `event`, a non-AI event (`misrouted_event`) or a bad uuid
+  (`invalid_uuid`) is 400 with the section 6 error shape. Success is
+  `{"status": 1}`.
+
+## 22. Exceptions 0.6: releases, server SDKs, suppression rules [posthog-js @posthog/browser-common remote-config types; posthog-python, posthog-go, posthog-rs]
+
+- Release: the first non-empty of `$release`, `release`, `$app_version`,
+  `app_version` (`test-vectors.json` "releases").
+- Server SDK `$exception_list` frames carry their own `platform`
+  (`python`, `go`, `rust`, …), `filename`, `abs_path`, `function`,
+  `module`, `lineno`, optional `colno`, `in_app` and, from posthog-python,
+  `pre_context` / `context_line` / `post_context`. They arrive
+  symbolicated; the server never applies source maps to them.
+- Remote config `errorTracking.suppressionRules` is a list of
+  `{"type": "AND" | "OR", "values": [{"key": "$exception_types" |
+  "$exception_values", "operator": "exact" | "is_not" | "icontains" |
+  "not_icontains" | "regex" | "not_regex", "value": string | string[],
+  "type": "error_tracking_issue_property"}]}`. posthog-js evaluates it
+  before sending an exception; the server applies the same rules at
+  ingest (`test-vectors.json` "suppression_rules").

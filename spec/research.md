@@ -252,6 +252,23 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
 - **Cold tier** (0.4): enabled on the reference deploy. A token scoped only
   to the bucket was refused by the sink (code 1012) and needed the catalog
   and SQL groups on the account (`design.md`, "Cold tier").
+- **Edge counters** (0.6) are per-isolate batches flushed through the
+  project store; counts in an isolate evicted before its next flush are
+  lost. Store-side counts stay exact.
+- **Cold Trends `dau`** (0.6) counts distinct ids in the cold table, not
+  merged persons (the cold tier has no person table).
+- **Retroactive symbolication** (0.6) updates issues and occurrences, not
+  events already in the shards.
+- **LLM costs** (0.6) use the SDK's cost when sent, else a list-price table
+  read from the providers' public pricing pages in November 2026; Anthropic
+  cache writes are priced as input (providers charge more). Not billing
+  data.
+- **AI endpoints** (0.6): the `/i/v0/ai` multipart rules (exact part names,
+  Bearer token, gzip) were taken from PostHog's public capture
+  documentation and the MIT capture service's description, not recorded
+  from an SDK in this build. The e2e sends AI events through
+  posthog-node's standard capture (the path `@posthog/ai` uses through its
+  posthog-node client) plus hand-built batch and multipart requests.
 - Not studied: web analytics, the data warehouse, the toolbar.
 
 ## Licensing
@@ -334,7 +351,7 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
 - Caps are enforced exactly in the project store and short-cut at the
   edge from a D1 cap state, instead of a global counter service: one
   writer per project already exists, and a lag of up to 30 s past a cap
-  is acceptable. Edge drops are not counted.
+  is acceptable. Edge drops were not counted (they are since 0.6).
 - Fingerprints ignore line numbers so a rebuild does not split issues;
   build hashes are removed from filenames for the same reason.
 - Symbolication happens at ingest (the stored event is symbolicated);
@@ -343,3 +360,30 @@ Source paths are in `PostHog/posthog-foss` at commit `0f73d659`
   binding (no secret, no extra credential); in-app alerts work without it.
 - The cost estimate uses list prices and simple per-event assumptions and
   is labelled an estimate; it is not billing data.
+
+## Choices made for 0.6
+
+- Public demo is per project (`projects.public_demo`) on an instance that
+  opts in with `PUBLIC_DEMO=1`, so a demo instance can still hold private
+  projects; visitors get redacted JSON from the same handlers rather than
+  a separate read-only API, which keeps every screen working.
+- The suppression-rule wire shape and operator semantics were read from
+  posthog-js 1.450.1 as installed (`@posthog/browser-common` remote-config
+  types and the bundled evaluator); rules are enforced again at ingest so
+  older SDKs and server SDKs are covered.
+- Grouping rules run after `$exception_fingerprint` and before the default
+  fingerprint and only affect new exceptions; merge and split use
+  fingerprint aliases instead of rewriting events.
+- Source maps per release fall back to the release-less map, so 0.5
+  uploads keep working unchanged.
+- Cold Trends compile to one `GROUP BY` per series with literal bucket
+  boundaries (`CASE WHEN ts < …`) instead of date functions, so time zones
+  and DST match the hot engine exactly; physical cold deletion lives in a
+  PyIceberg script because Basin SQL is read-only.
+- LLM analytics reads `$ai_*` events from the existing shards (no new
+  storage), with 19 properties extracted in SQL and full properties only
+  for one trace.
+- The project cache TTL went from 30 s to 10 s: caps and settings reach
+  every isolate faster for a few more D1 reads.
+- Scale and load testing (10M-20M+ events a month) was out of scope for
+  0.6.

@@ -4,6 +4,7 @@
 import http from 'node:http';
 import { chromium } from 'playwright';
 import { PostHog } from 'posthog-node';
+import FX from '../tests/fixtures/v05-errors.json';
 
 const SITE = (process.env.SITE ?? 'http://localhost:8787').replace(/\/$/, '');
 const EMAIL = process.env.E2E_EMAIL ?? 'e2e@example.com';
@@ -240,12 +241,120 @@ check('usage counts events by type and replay', usage.month_to_date.events > 10 
 await up.goto(`${SITE}/project/${project.id}/usage`);
 check('usage page draws events per day and the cost estimate', await up.waitForSelector('text=Estimated Cloudflare cost', { timeout: 10000 }).then(() => true).catch(() => false) && (await up.locator('svg.chart').count()) >= 1, null);
 if (web) { await up.goto(`${SITE}/project/${project.id}/errors/${web.id}`); check('issue page shows the stack trace', await up.waitForSelector('text=Stack trace', { timeout: 10000 }).then(() => true).catch(() => false) && (await up.locator('.frame').count()) > 0, null); }
+// ---------- 0.6 ----------
+const cfg = await api('/api/config');
+// HTML fallback: deep links load the app; JSON clients get 404 JSON.
+{
+  const h = await fetch(`${SITE}/project/${project.id}/llm/traces/x`, { headers: { accept: 'text/html' } });
+  const jn = await fetch(`${SITE}/project/${project.id}/llm/traces/x`, { headers: { accept: 'application/json' } });
+  check('0.6 non-API GETs serve the app; JSON Accept gets 404', h.status === 200 && (h.headers.get('content-type') ?? '').includes('text/html') && jn.status === 404, [h.status, jn.status]);
+}
+// Server SDK exception lists (posthog-python, posthog-go, posthog-rs shapes) through /batch/.
+const pyList = [{ type: 'ValueError', value: 'e2e python failure', mechanism: { type: 'generic', handled: false }, stacktrace: { type: 'raw', frames: [
+  { platform: 'python', filename: 'app/views.py', abs_path: '/srv/app/views.py', function: 'post', module: 'app.views', lineno: 20, in_app: true, context_line: '    return place(cart)' },
+  { platform: 'python', filename: 'app/orders.py', abs_path: '/srv/app/orders.py', function: 'place', module: 'app.orders', lineno: 7, in_app: true, pre_context: ['def place(cart):'], context_line: '    raise ValueError("e2e python failure")', post_context: [] }] } }];
+const goList = [{ type: '*errors.errorString', value: 'e2e go failure', mechanism: { type: 'generic', handled: true }, stacktrace: { type: 'raw', frames: [{ platform: 'go', filename: 'main.go', function: 'main.main', lineno: 12, in_app: true }, { platform: 'go', filename: 'pay/pay.go', function: 'pay.Charge', lineno: 33, in_app: true }] } }];
+const rsList = [{ type: 'std::io::Error', value: 'e2e rust failure', mechanism: { type: 'generic', handled: true }, stacktrace: { type: 'raw', frames: [{ platform: 'rust', filename: 'src/main.rs', function: 'svc::main', lineno: 5, in_app: true }, { platform: 'rust', filename: 'src/net.rs', function: 'svc::net::dial', lineno: 41, in_app: true }] } }];
+const rule = await api(`${A}/error_grouping_rules`, 'POST', { field: 'value', match: 'contains', pattern: 'e2e grouped', key: 'e2e-grouped' });
+const supp = await api(`${A}/error_suppression_rules`, 'POST', { type: 'OR', values: [{ key: '$exception_types', operator: 'exact', value: ['E2ENoise'] }] });
+const remote = await (await fetch(`${SITE}/array/${project.api_token}/config`)).json();
+check('0.6 suppression rules reach posthog-js remote config in its wire shape', JSON.stringify(remote.errorTracking?.suppressionRules) === JSON.stringify([{ type: 'OR', values: [{ key: '$exception_types', operator: 'exact', value: ['E2ENoise'], type: 'error_tracking_issue_property' }] }]), remote.errorTracking);
+const batchExc = (did: string, list: any[], props: Record<string, unknown> = {}) => ({ event: '$exception', distinct_id: did, uuid: crypto.randomUUID(), properties: { $exception_list: list, ...props } });
+const g1 = structuredClone(goList); g1[0].value = 'e2e grouped A'; const g2 = structuredClone(rsList); g2[0].value = 'e2e grouped B';
+const JS0 = (FX as any).posthog_js_exceptions[0];
+const br = await fetch(`${SITE}/batch/`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ api_key: project.api_token, batch: [
+  batchExc('py-e2e', pyList, { $lib: 'posthog-python', $release: 'py-1.0' }), batchExc('go-e2e', goList, { $lib: 'posthog-go' }), batchExc('rs-e2e', rsList, { $lib: 'posthog-rs' }),
+  batchExc('g-1', g1), batchExc('g-2', g2), batchExc('noise', [{ type: 'E2ENoise', value: 'drop me' }]),
+  { ...JS0, uuid: crypto.randomUUID(), timestamp: new Date().toISOString(), properties: { ...JS0.properties, $app_version: 'e2e-1.0', distinct_id: 'js-e2e', $session_id: undefined } }] }) });
+check('0.6 /batch/ accepts server SDK exceptions', br.status === 200, br.status);
+const all6 = await until('0.6 issues', () => api(`${A}/error_issues?status=`), (v: any) => ['ValueError', 'std::io::Error', '*errors.errorString'].every(t => v.results.some((i: any) => i.type === t && i.message?.startsWith('e2e '))) && v.results.some((i: any) => i.fingerprint === 'rule:e2e-grouped') && v.results.some((i: any) => i.message === 'Price must be a number, got string'), 20000);
+const byType = (t: string, m: string) => all6.results.find((i: any) => i.type === t && i.message === m);
+const pyI = byType('ValueError', 'e2e python failure'), goI = byType('*errors.errorString', 'e2e go failure'), rsI = byType('std::io::Error', 'e2e rust failure');
+check('0.6 Python, Go and Rust stacks group with their own top frames', pyI?.top_frame === 'place (app/orders.py:7)' && goI?.top_frame === 'pay.Charge (pay/pay.go:33)' && rsI?.top_frame === 'svc::net::dial (src/net.rs:41)', [pyI?.top_frame, goI?.top_frame, rsI?.top_frame]);
+check('0.6 release is read from $release', pyI?.first_seen_release === 'py-1.0', pyI);
+const grouped = all6.results.find((i: any) => i.fingerprint === 'rule:e2e-grouped');
+check('0.6 a grouping rule puts two different exceptions in one issue', grouped?.occurrences === 2, grouped);
+check('0.6 suppressed exceptions never become issues', !all6.results.some((i: any) => i.type === 'E2ENoise'), null);
+// Retroactive symbolication: the JS exception arrived before its map; upload the map for that release now.
+const jsI = all6.results.find((i: any) => i.message === 'Price must be a number, got string' && i.first_seen_release === 'e2e-1.0');
+const up6 = await api(`${A}/symbol_sets?url=${encodeURIComponent('http://172.17.0.1:8797/app.min.js')}&release=e2e-1.0`, 'PUT', (FX as any).app_min_js_map);
+const jsD = jsI ? await api(`${A}/error_issues/${jsI.id}`) : null;
+check('0.6 uploading a release source map re-symbolicates earlier exceptions', up6.resymbolicated?.symbolicated >= 1 && jsD?.top_frame === 'parsePrice (app-src.js:4)', [up6.resymbolicated, jsD?.top_frame]);
+check('0.6 ?release= filters issues', (await api(`${A}/error_issues?status=&release=e2e-1.0`)).results.every((i: any) => i.id === jsI?.id), null);
+// Merge, split, assign.
+const merged = await api(`${A}/error_issues/${goI.id}/merge`, 'POST', { ids: [rsI.id] });
+const mList = await api(`${A}/error_issues?status=`);
+check('0.6 merge folds issues into one', merged.occurrences === 2 && !mList.results.some((i: any) => i.id === rsI.id), merged);
+const mD = await api(`${A}/error_issues/${goI.id}`);
+const rsFp = mD.fingerprints.find((f: any) => !f.primary)?.fingerprint;
+const split = await api(`${A}/error_issues/${goI.id}/split`, 'POST', { fingerprint: rsFp });
+check('0.6 split moves a fingerprint back to its own issue', split.split?.occurrences === 1 && split.issue?.occurrences === 1, split);
+const asg = await api(`${A}/error_issues/${pyI.id}`, 'PATCH', { assignee: EMAIL });
+check('0.6 assign an issue and filter by assignee', asg.assignee?.email === EMAIL.toLowerCase() && (await api(`${A}/error_issues?status=&assignee=me`)).results.map((i: any) => i.id).join() === pyI.id, asg.assignee);
+// LLM analytics: posthog-node capture (what @posthog/ai sends), /i/v0/ai/batch, and the multipart /i/v0/ai endpoint.
+const trace = 'e2e-trace-' + Date.now(); const span = crypto.randomUUID();
+const ai = new PostHog(project.api_token, { host: SITE, flushAt: 1, flushInterval: 0 });
+ai.capture({ distinct_id: 'llm-e2e', event: '$ai_generation', properties: { $ai_trace_id: trace, $ai_parent_id: span, $ai_span_name: 'answer', $ai_model: 'gpt-4o-mini', $ai_provider: 'openai', $ai_input_tokens: 1200, $ai_output_tokens: 300, $ai_latency: 1.2, $ai_http_status: 200, $ai_input: [{ role: 'user', content: 'e2e question' }], $ai_output_choices: [{ role: 'assistant', content: 'e2e answer' }] } });
+await ai.shutdown();
+const aiB = await fetch(`${SITE}/i/v0/ai/batch/`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ api_key: project.api_token, batch: [
+  { event: '$ai_trace', distinct_id: 'llm-e2e', uuid: crypto.randomUUID(), properties: { $ai_trace_id: trace, $ai_span_name: 'e2e-bot', $ai_latency: 2 } },
+  { event: '$ai_span', distinct_id: 'llm-e2e', uuid: crypto.randomUUID(), properties: { $ai_trace_id: trace, $ai_span_id: span, $ai_parent_id: trace, $ai_span_name: 'plan', $ai_latency: 1.5 } },
+  { event: 'not_ai', distinct_id: 'llm-e2e', properties: {} }] }) });
+const fd = new FormData();
+fd.append('event', new Blob([JSON.stringify({ event: '$ai_generation', distinct_id: 'llm-e2e', uuid: crypto.randomUUID(), properties: { $ai_trace_id: trace } })], { type: 'application/json' }), 'event');
+fd.append('event.properties', new Blob([JSON.stringify({ $ai_parent_id: span, $ai_span_name: 'critique', $ai_model: 'claude-haiku-4-5', $ai_provider: 'anthropic', $ai_input_tokens: 800, $ai_output_tokens: 90, $ai_latency: 0.6, $ai_is_error: true, $ai_error: 'overloaded_error', $ai_http_status: 529 })], { type: 'application/json' }), 'event.properties');
+const aiM = await fetch(`${SITE}/i/v0/ai`, { method: 'POST', headers: { authorization: `Bearer ${project.api_token}` }, body: fd });
+check('0.6 AI endpoints accept batch and multipart', aiB.status === 200 && aiM.status === 200, [aiB.status, aiM.status]);
+const ov = await until('llm overview', () => api(`${A}/llm/overview`), (v: any) => v.totals.generations >= 2, 15000);
+check('0.6 LLM overview: generations, tokens, cost, latency, errors, models', ov.totals.generations === 2 && ov.totals.input_tokens === 2000 && ov.totals.cost_usd > 0 && ov.totals.latency_p95_ms > 0 && ov.totals.errors === 1 && ov.models.length === 2, ov.totals);
+const trs = await api(`${A}/llm/traces?search=e2e-bot`);
+check('0.6 LLM traces list filters', trs.total === 1 && trs.results[0].status === 'error' && (await api(`${A}/llm/traces?provider=anthropic`)).total === 1, trs.results[0]);
+const td = await api(`${A}/llm/traces/${encodeURIComponent(trace)}`);
+check('0.6 LLM trace detail: span tree with generations, inputs and outputs', td.tree.length === 1 && td.tree[0].name === 'plan' && td.tree[0].children.length === 2 && td.tree[0].children.some((c: any) => c.output?.[0]?.content === 'e2e answer'), td.tree);
+check('0.6 non-AI events on the AI endpoint are dropped', !(await api(`${A}/events?event=not_ai&limit=5`)).results.length, null);
+await up.goto(`${SITE}/project/${project.id}/llm`);
+check('0.6 LLM analytics page shows the overview', await up.waitForSelector('h2:has-text("Models")', { timeout: 10000 }).then(() => true).catch(() => false), null);
+await up.goto(`${SITE}/project/${project.id}/llm/traces/${encodeURIComponent(trace)}`);
+check('0.6 trace page draws the waterfall', await up.waitForSelector('.wf-bar', { timeout: 10000 }).then(() => true).catch(() => false) && (await up.locator('.wf-row').count()) === 3, null);
+await up.goto(`${SITE}/project/${project.id}/errors/${pyI.id}`);
+check('0.6 issue page shows releases, assignee and fingerprints', await up.waitForSelector('#fingerprints', { timeout: 10000 }).then(() => true).catch(() => false) && (await up.locator('text=py-1.0').count()) > 0, null);
+// Usage counters.
+const u6 = await until('usage counters', () => api(`${A}/usage`), (v: any) => v.month_to_date.flag_requests > 0 && v.month_to_date.api_requests > 0, 10000);
+check('0.6 usage counts flag/decide, config and API requests and suppressed exceptions', u6.month_to_date.flag_requests > 0 && u6.month_to_date.api_requests > 0 && u6.month_to_date.suppressed_exceptions === 1, u6.month_to_date);
+check('0.6 cost headline is the list price with an included-allowance alternative', u6.cost.list_usd >= u6.cost.after_included_usd && u6.cost.notes.join(' ').includes('only workload'), u6.cost.notes);
+// Cold Trends degrade without a cold tier.
+const coldR = await fetch(`${SITE}${A}/query`, { method: 'POST', headers: { origin: SITE, cookie, 'content-type': 'application/json' }, body: JSON.stringify({ source: 'cold', query: { kind: 'TrendsQuery', series: [{ kind: 'EventsNode', event: '$pageview' }] } }) });
+check('0.6 cold Trends answers (or says the cold tier is off)', cfg.cold_tier ? coldR.status === 200 : coldR.status === 400 && (await coldR.text()).includes('not configured'), coldR.status);
+// Public demo (only when the instance runs with PUBLIC_DEMO=1).
+if (cfg.public_demo) {
+  await api(A, 'PATCH', { public_demo: true });
+  const anon = async (path: string, init: RequestInit = {}) => fetch(SITE + path, { ...init, headers: { origin: SITE, 'content-type': 'application/json', ...(init.headers ?? {}) } });
+  const me = await (await anon('/api/me')).json();
+  const ps = await (await anon('/api/projects')).json();
+  const mine = ps.find((x: any) => x.id === project.id);
+  check('0.6 public demo: signed-out visitors see demo projects with the key masked', me.demo === true && !!mine && mine.api_token !== project.api_token && !JSON.stringify(ps).includes(EMAIL), [me, mine?.api_token]);
+  const w = await anon(`${A}/insights`, { method: 'POST', body: JSON.stringify({ name: 'x', query: {} }) });
+  const q = await anon(`${A}/query`, { method: 'POST', body: JSON.stringify({ query: { kind: 'TrendsQuery', series: [{ kind: 'EventsNode', event: '$pageview' }] } }) });
+  check('0.6 public demo: mutations get 403 demo_read_only, queries work', w.status === 403 && (await w.json()).error === 'demo_read_only' && q.status === 200, [w.status, q.status]);
+  const stranger = await anon('/api/signup', { method: 'POST', body: JSON.stringify({ email: `stranger-${Date.now()}@example.invalid`, password: 'correct horse battery staple' }) });
+  check('0.6 public demo: ALLOWED_EMAILS still blocks strangers', stranger.status === 403, stranger.status);
+  const vctx = await browser.newContext(); const vp = await vctx.newPage();
+  await vp.goto(`${SITE}/project/${project.id}/errors`);
+  const banner = await vp.waitForSelector('text=Read-only public demo', { timeout: 10000 }).then(() => true).catch(() => false);
+  check('0.6 public demo: the UI shows the banner and disables write actions', banner && (await vp.locator('button:has-text("Merge selected")').isDisabled().catch(() => false)), null);
+  await vctx.close();
+  await api(A, 'PATCH', { public_demo: false });
+} else {
+  check('0.6 public demo off: signed-out API calls get 401', (await fetch(`${SITE}/api/me`)).status === 401, null);
+}
+await api(`${A}/error_grouping_rules/${rule.id}`, 'DELETE'); await api(`${A}/error_suppression_rules/${supp.id}`, 'DELETE');
+
 const capped = await api(A, 'PATCH', { limits: { events_monthly: 1, over_cap: 'drop' } });
 check('a cap below usage marks the project capped at once', capped.cap_state.events === true, capped.cap_state);
-// Other isolates keep the project row for up to 30 s (design.md "Usage limits"), so wait for the edge to see the cap.
+// Other isolates keep the project row for up to 10 s (design.md "Usage limits"), so wait for the edge to see the cap.
 const cappedAt = Date.now();
-await until('edge cap state', async () => (await fetch(`${SITE}/e/`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ api_key: project.api_token, event: 'cap probe', distinct_id: 'cap-probe', properties: {} }) })).text(), t => t.includes('quota_limited'), 45000);
-if (Date.now() - cappedAt < 31000) await sleep(31000 - (Date.now() - cappedAt));
+await until('edge cap state', async () => (await fetch(`${SITE}/e/`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ api_key: project.api_token, event: 'cap probe', distinct_id: 'cap-probe', properties: {} }) })).text(), t => t.includes('quota_limited'), 15000);
+if (Date.now() - cappedAt < 11000) await sleep(11000 - (Date.now() - cappedAt));
 const replies: string[] = []; const sent: string[] = [];
 p.on('response', async r => { const u = new URL(r.url()); if (u.origin === SITE && /^\/(e|i\/v0\/e)\/?$/.test(u.pathname)) replies.push(await r.text().catch(() => '')); });
 p.on('request', r => { const u = new URL(r.url()); if (u.origin === SITE && /^\/(e|i\/v0\/e)\/?$/.test(u.pathname)) sent.push(r.postData() ?? ''); });
@@ -256,6 +365,9 @@ const before = sent.length;
 await p.click('#cta'); await p.click('#pricing'); await sleep(5000);
 check('capture answers quota_limited and posthog-js stops sending', !!limitedReply && limitedReply.includes('"events"') && sent.length === before, { replies, before, after: sent.length });
 await api(A, 'PATCH', { limits: { events_monthly: null } });
+await sleep(2500); await fetch(`${SITE}/e/`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ api_key: project.api_token, event: 'meter flush', distinct_id: 'x', properties: {} }) });
+const dropped = await until('dropped past cap', () => api(`${A}/usage`), (v: any) => v.dropped_past_cap.events > 0 && v.dropped_past_cap.requests > 0, 10000);
+check('0.6 usage shows events and requests dropped past the cap', dropped.dropped_past_cap.events > 0 && dropped.dropped_past_cap.requests > 0, dropped.dropped_past_cap);
 
 await browser.close(); site.close();
 await api(A, 'DELETE');

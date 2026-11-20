@@ -1,7 +1,9 @@
 // Project token lookup with a short per-isolate cache (capture and /flags are hot paths).
 import { Env, ProjectRow } from './env';
 const cache = new Map<string, { at: number; row: ProjectRow | null }>();
-const TTL = 30_000;
+/** Per-isolate cache of the project row (token -> row): edge cap state can lag a cap by at most this long. */
+export const PROJECT_CACHE_TTL_MS = 10_000;
+const TTL = PROJECT_CACHE_TTL_MS;
 export async function projectByToken(env: Env, token: string): Promise<ProjectRow | null> {
   const c = cache.get(token);
   if (c && Date.now() - c.at < TTL) return c.row;

@@ -136,3 +136,33 @@ Work in this order. Finish each check before the next task.
     projects keep no limits and exception autocapture off), deploy. For
     email alerts add the `send_email` binding and `ALERT_EMAIL_FROM` on a
     sender domain onboarded to Email Sending.
+
+0.6 (after 1-35):
+
+36. **HTML fallback and public demo (R13, R32).** `worker/routing.ts`;
+    D1 `0005_v06.sql` (`projects.public_demo`); `PUBLIC_DEMO` var,
+    `demoApi()` and `redact()` in `worker/api.ts`; UI banner and write
+    lock. Check: "HTML fallback" and "public demo" in `tests/v06.test.ts`;
+    e2e public-demo checks with `PUBLIC_DEMO=1`.
+37. **Usage counters (R30).** `worker/meter.ts`, `recordEdgeUsage`,
+    `dropped_past_cap`, request types in `estimateCost`, 10 s project
+    cache, Usage screen. Check: "usage counters and cost" tests; e2e
+    dropped-past-cap.
+38. **Error tracking 0.6 (R28, R29).** Releases, per-release maps and
+    retroactive symbolication, merge/split with aliases, assignment,
+    grouping and suppression rules (remote config and ingest), server
+    stacks, index maps, `upload-sourcemaps.mjs --release`, store upgrade.
+    Check: v06 error tests, vectors "source_map_sections",
+    "suppression_rules", "releases"; e2e error checks.
+39. **LLM analytics (R31).** AI endpoints in `worker/capture.ts`,
+    `shared/llm-pricing.ts`, `eventsql.llmRows`, `worker/llm.ts`, API and
+    screens. Check: "LLM analytics" tests, vectors "llm_costs", e2e LLM
+    checks.
+40. **Cold Trends and pruning (R27).** `buildColdTrends`/`runColdTrends`,
+    Trends Source picker, `scripts/cold-prune.py` and its workflow
+    example. Check: "cold Trends" tests; `python3 -m unittest
+    scripts/test_cold_prune.py`.
+41. **Demo data and screenshots.** `scripts/demo-setup.mjs` (every
+    screen, `public_demo`), `scripts/shots-06.mjs`. Check: `shots06/`.
+42. **Upgrade a deployment.** Apply `0005_v06.sql`, deploy; set
+    `PUBLIC_DEMO=1` only on a demo instance.

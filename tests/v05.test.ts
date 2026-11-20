@@ -60,7 +60,7 @@ describe('sampling and limits', () => {
     const evs = [ev('$autocapture', 'u1'), ev('$pageview', 'u1')];
     expect(gateEvents(p, evs).keep.map(e => e.event)).toEqual(['$pageview']);
     p.cap_state = JSON.stringify({ month, events: true, replay: false });
-    expect(gateEvents(p, evs)).toEqual({ keep: [], quotaLimited: ['events', 'exceptionEvent'] });
+    expect(gateEvents(p, evs)).toEqual({ keep: [], quotaLimited: ['events', 'exceptionEvent'], capDropped: 1 });
     p.cap_state = JSON.stringify({ month: '2001-01', events: true, replay: false });
     expect(gateEvents(p, evs).keep.length).toBe(1); // an old month's state lifts itself
     expect(gateEvents({ limits: null } as any, evs).keep.length).toBe(2); // projects without limits: unchanged
@@ -83,7 +83,7 @@ describe('source maps and fingerprints', () => {
   it('decodes VLQ mappings (esbuild map)', () => {
     expect(originalPosition(map, 1, 49)).toMatchObject({ source: 'app-src.js', line: 4, column: 17 });
     expect(originalPosition(map, 1, 159)).toMatchObject({ line: 11, name: 'parsePrice' });
-    expect(validateMap({ version: 3, sections: [] })).toMatch(/indexed/);
+    expect(validateMap({ version: 3, sections: [] })).toMatch(/sections/);
     expect(validateMap({ version: 2, mappings: '', sources: [] })).toMatch(/version 3/);
   });
   it('symbolicates real posthog-js frames, naming functions from their call sites', async () => {

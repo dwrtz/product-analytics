@@ -18,6 +18,7 @@ export interface ShardApi {
   periods(s: PeriodSpec): Promise<unknown[][]>;
   firsts(s: { node: NodeSpec; global?: PropertyFilter[]; before: number }): Promise<unknown[][]>;
   events(s: EventsSpec): Promise<EventRow[]>;
+  llm(s: import('./eventsql').LlmSpec): Promise<unknown[][]>;
 }
 export type PersonRef = { pk: string; uuid: string | null; props: Record<string, unknown>; created_at?: number };
 export interface Engine {

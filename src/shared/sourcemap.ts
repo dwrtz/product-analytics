@@ -1,6 +1,7 @@
 // Source map v3 decoding (design.md "Error tracking"): written from the public Source Map Revision 3 proposal
-// (https://tc39.es/ecma426/). Only regular maps; indexed maps (`sections`) are rejected at upload.
-export type SourceMapV3 = { version: number; file?: string; sourceRoot?: string; sources: (string | null)[]; sourcesContent?: (string | null)[]; names?: string[]; mappings: string; sections?: unknown };
+// (https://tc39.es/ecma426/). Regular maps and indexed maps (`sections`, each with an inline `map`); sections that
+// point at another file by `url` are rejected at upload.
+export type SourceMapV3 = { version: number; file?: string; sourceRoot?: string; sources: (string | null)[]; sourcesContent?: (string | null)[]; names?: string[]; mappings: string; sections?: { offset: { line: number; column: number }; map: SourceMapV3 }[] };
 /** One decoded segment: generated column, source index, original line, original column, name index (-1 when absent); all 0-based. */
 export type Segment = [number, number, number, number, number];
 export type DecodedMap = { sources: string[]; contents: (string | null)[]; names: string[]; lines: Segment[][] };
@@ -12,19 +13,60 @@ const DIGIT = new Int8Array(128).fill(-1); for (let i = 0; i < B64.length; i++) 
 export class SourceMapError extends Error {}
 
 /** Checks the shape of an uploaded map; returns an error message or null. */
-export function validateMap(m: unknown): string | null {
+export function validateMap(m: unknown, depth = 0): string | null {
   if (!m || typeof m !== 'object' || Array.isArray(m)) return 'source map must be a JSON object';
   const o = m as Record<string, unknown>;
-  if (o.sections !== undefined) return 'indexed source maps (sections) are not supported; upload one map per file';
   if (o.version !== 3) return 'only source map version 3 is supported';
+  if (o.sections !== undefined) {
+    if (depth > 0) return 'nested indexed source maps are not supported';
+    if (!Array.isArray(o.sections) || !o.sections.length) return 'sections must be a non-empty list';
+    if (o.sections.length > 10_000) return 'at most 10000 sections';
+    let prev = -1;
+    for (const [i, sec] of (o.sections as any[]).entries()) {
+      if (!sec || typeof sec !== 'object') return `section ${i} must be an object`;
+      if (sec.url !== undefined) return `section ${i} points at a url; upload maps with the map inline in each section`;
+      const off = sec.offset; if (!off || !Number.isInteger(off.line) || !Number.isInteger(off.column) || off.line < 0 || off.column < 0) return `section ${i} needs offset { line, column } (whole numbers >= 0)`;
+      const at = off.line * 1e7 + off.column; if (at <= prev) return 'sections must be sorted and must not overlap'; prev = at;
+      const bad = validateMap(sec.map, depth + 1); if (bad) return `section ${i}: ${bad}`;
+    }
+    return null;
+  }
   if (typeof o.mappings !== 'string') return 'mappings must be a string';
   if (!Array.isArray(o.sources)) return 'sources must be a list';
   return null;
 }
 
+/**
+ * Indexed map: decodes each section's map and shifts it by the section offset (0-based generated line and column; the
+ * column only shifts the section's first line), concatenating sources and names. Segments of a section never reach
+ * past the next section's start.
+ */
+function decodeSections(m: { sections: { offset: { line: number; column: number }; map: SourceMapV3 }[] }): DecodedMap {
+  const out: DecodedMap = { sources: [], contents: [], names: [], lines: [] };
+  const secs = m.sections;
+  for (let k = 0; k < secs.length; k++) {
+    const { offset, map } = secs[k]; const d = decodeMap(map);
+    const next = secs[k + 1]?.offset;
+    const srcBase = out.sources.length, nameBase = out.names.length;
+    out.sources.push(...d.sources); out.contents.push(...d.sources.map((_, i) => d.contents[i] ?? null)); out.names.push(...d.names);
+    d.lines.forEach((segs, li) => {
+      const line = offset.line + li;
+      while (out.lines.length <= line) out.lines.push([]);
+      for (const sg of segs) {
+        const col = sg[0] + (li === 0 ? offset.column : 0);
+        if (next && (line > next.line || (line === next.line && col >= next.column))) continue;
+        out.lines[line].push([col, sg[1] + srcBase, sg[2], sg[3], sg[4] >= 0 ? sg[4] + nameBase : -1]);
+      }
+    });
+  }
+  for (const l of out.lines) l.sort((a, b) => a[0] - b[0]);
+  return out;
+}
+
 /** Decodes the VLQ `mappings` string into per-line segment lists (sorted by generated column). */
 export function decodeMap(m: SourceMapV3): DecodedMap {
   const err = validateMap(m); if (err) throw new SourceMapError(err);
+  if (Array.isArray(m.sections)) return decodeSections(m as any);
   const root = m.sourceRoot ? m.sourceRoot.replace(/\/?$/, '/') : '';
   const sources = m.sources.map(s => (s && root && !/^[a-z]+:\/\//i.test(s) && !s.startsWith('/') ? root + s : (s ?? '')));
   const lines: Segment[][] = []; let line: Segment[] = [];

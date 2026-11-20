@@ -23,6 +23,8 @@
   // Optional alert email (design.md "Alerts"): Cloudflare Email Sending, sender on an onboarded domain.
   // "send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["analytics@yourdomain.com"] }],
   // and add "ALERT_EMAIL_FROM": "analytics@yourdomain.com" to vars. Without both, alerts stay in the app.
+  // Optional public demo (design.md "Public demo"): add "PUBLIC_DEMO": "1" to vars to let signed-out visitors browse
+  // projects marked public_demo (Settings) read-only. Off unless exactly "1". Use synthetic data only.
   "triggers": { "crons": ["17 3 * * *", "41 * * * *"] },
   "observability": { "enabled": true }
 }

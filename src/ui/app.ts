@@ -2,9 +2,13 @@
 import settings from '../../spekkr.inputs.json';
 
 const APP = settings.app_name;
-type Project = { id: number; name: string; api_token: string; timezone: string; retention_days: number; anonymize_ips: boolean; autocapture_opt_out: boolean; session_recording: boolean; replay_config: any; heatmaps: boolean; limits: any; cap_state: { month: string; events: boolean; replay: boolean }; error_tracking: boolean; created_at: string };
-type Me = { id: number; email: string; name: string };
+type Project = { id: number; name: string; api_token: string; timezone: string; retention_days: number; anonymize_ips: boolean; autocapture_opt_out: boolean; session_recording: boolean; replay_config: any; heatmaps: boolean; limits: any; cap_state: { month: string; events: boolean; replay: boolean }; error_tracking: boolean; public_demo?: boolean; created_at: string };
+type Me = { id: number; email: string | null; name: string; demo?: boolean };
 let me: Me | null = null;
+/** Instance config (/api/config): cold tier available, public demo on. */
+let cfg: { app_name: string; signup_open: boolean; cold_tier: boolean; public_demo?: boolean } | null = null;
+/** True for a signed-out visitor of a PUBLIC_DEMO instance (design.md "Public demo"): read-only. */
+const demo = () => !!me?.demo;
 let projects: Project[] = [];
 let defs: { events: { name: string }[]; properties: { kind: string; name: string; type: string }[]; group_types: { idx: number; name: string }[] } | null = null;
 let defsFor = 0;
@@ -33,7 +37,10 @@ function s(tag: string, attrs: Record<string, any> = {}, ...kids: (Node | string
   return el;
 }
 class ApiError extends Error { constructor(public code: string, msg: string, public status = 0) { super(msg); } }
+const DEMO_OK = /^\/api\/projects\/\d+\/(query|sql)$/;
 async function api<T = any>(path: string, opts: { method?: string; body?: unknown } = {}): Promise<T> {
+  const method = opts.method ?? (opts.body !== undefined ? 'POST' : 'GET');
+  if (demo() && method !== 'GET' && !DEMO_OK.test(path) && path !== '/api/login' && path !== '/api/logout') throw new ApiError('demo_read_only', friendly('demo_read_only'), 403);
   const res = await fetch(path, {
     method: opts.method ?? (opts.body !== undefined ? 'POST' : 'GET'), credentials: 'same-origin',
     headers: opts.body !== undefined ? { 'content-type': 'application/json' } : {},
@@ -47,6 +54,7 @@ function friendly(code: string, detail?: string) {
   const m: Record<string, string> = {
     email_not_allowed: 'This instance is private.', signup_closed: 'Sign-up is closed on this instance.', bad_credentials: 'Wrong email or password.',
     taken: 'That email already has an account.', weak_password: 'Use at least 10 characters.',
+    demo_read_only: 'This is a read-only public demo. Sign in to make changes.',
   };
   return m[code] ?? detail ?? code ?? 'Something went wrong.';
 }
@@ -82,17 +90,30 @@ function shell(title: Child | Child[], actions: Child[], ...content: Child[]) {
       h('div', { class: 'proj' }, picker),
       h('div', { class: 'side-links' },
         item('/dashboards', 'Dashboards'), item('/insights', 'Insights'), item('/sql', 'SQL'), item('/events', 'Events'), item('/actions', 'Actions'), item('/persons', 'Persons'), item('/cohorts', 'Cohorts'),
-        item('/replay', 'Session replay'), item('/heatmaps', 'Heatmaps'), item('/errors', 'Error tracking'), item('/feature_flags', 'Feature flags'), item('/experiments', 'Experiments'), item('/surveys', 'Surveys'),
-        usageItem(item('/usage', 'Usage')), item('/settings', 'Settings'),
-        link('/account', 'Account', here === '/account' ? 'active' : ''))),
-    h('main', {}, h('header', { class: 'top' }, h('h1', {}, title), h('div', { class: 'row' }, actions)), ...content)));
+        item('/replay', 'Session replay'), item('/heatmaps', 'Heatmaps'), item('/errors', 'Error tracking'), item('/llm', 'LLM analytics'), item('/feature_flags', 'Feature flags'), item('/experiments', 'Experiments'), item('/surveys', 'Surveys'),
+        demo() ? item('/usage', 'Usage') : usageItem(item('/usage', 'Usage')), item('/settings', 'Settings'),
+        demo() ? link('/login', 'Sign in') : link('/account', 'Account', here === '/account' ? 'active' : ''))),
+    h('main', {}, demo() ? h('div', { class: 'demo-banner', role: 'note' }, h('b', {}, 'Read-only public demo'), ' · synthetic data · browse every screen; changes are turned off. ', link('/login', 'Owner sign in')) : null,
+      h('header', { class: 'top' }, h('h1', {}, title), h('div', { class: 'row' }, actions)), ...content)));
+  if (demo()) lockDemo(root);
+}
+/** Public demo: disables write controls (server answers 403 demo_read_only anyway) so the read-only state is visible. */
+const WRITE_LABEL = /^\s*(\+\s*)?(new|create|save|delete|remove|revoke|reset|resolve|reopen|suppress|merge|split|assign|unassign|send|mark|launch|stop|end |archive|add|upload|recalculate|edit|share|duplicate|sign out|calculate|import|apply|update|restore|enable|disable|move|rotate|generate|pin|unpin)/i;
+let demoObserver: MutationObserver | null = null;
+function lockDemo(el: HTMLElement) {
+  const lock = () => {
+    for (const b of el.querySelectorAll<HTMLButtonElement>('button:not([data-ro]):not([disabled]):not(.tab)')) if (WRITE_LABEL.test(b.textContent ?? '') || b.classList.contains('danger')) { b.disabled = true; b.title = 'Read-only public demo'; b.classList.add('demo-locked'); }
+    for (const a of el.querySelectorAll<HTMLAnchorElement>('a[href$="/new"], a[href*="/edit"], a[href*="#limits"]')) a.classList.add('demo-hidden');
+    if (/\/settings$/.test(location.pathname)) for (const i of el.querySelectorAll<HTMLInputElement>('main input, main select, main textarea')) if (!i.closest('[data-ro]')) i.disabled = true;
+  };
+  lock(); demoObserver?.disconnect(); demoObserver = new MutationObserver(lock); demoObserver.observe(el, { childList: true, subtree: true });
 }
 function blank(...content: Child[]) { root.replaceChildren(h('div', { class: 'center' }, h('div', { class: 'auth' }, ...content))); }
 const loading = () => h('p', { class: 'muted' }, 'Loading…');
 
 // ---------- auth ----------
 async function authPage(mode: 'login' | 'signup') {
-  const cfg = await api<{ signup_open: boolean }>('/api/config');
+  const cfg = await api<{ signup_open: boolean; public_demo?: boolean }>('/api/config');
   const email = h('input', { type: 'email', autocomplete: 'email', required: true }) as HTMLInputElement;
   const pw = h('input', { type: 'password', autocomplete: mode === 'login' ? 'current-password' : 'new-password', required: true, minlength: mode === 'signup' ? 10 : undefined }) as HTMLInputElement;
   const name = h('input', { autocomplete: 'name' }) as HTMLInputElement;
@@ -102,10 +123,11 @@ async function authPage(mode: 'login' | 'signup') {
     h('label', {}, 'Email', email), h('label', {}, 'Password', pw), err, btn);
   form.addEventListener('submit', busy(btn, async () => {
     await api(`/api/${mode}`, { body: { email: email.value, password: pw.value, name: name.value } });
-    me = null; nav('/');
+    me = null; document.body.classList.remove('demo'); demoObserver?.disconnect(); nav('/');
   }, err));
   blank(h('h1', {}, APP), h('p', { class: 'muted' }, mode === 'login' ? 'Sign in to your analytics.' : 'Create the first account on this instance.'), form,
-    mode === 'login' ? (cfg.signup_open ? h('p', { class: 'small' }, 'No account? ', link('/signup', 'Sign up')) : null) : h('p', { class: 'small' }, 'Have an account? ', link('/login', 'Sign in')));
+    mode === 'login' ? (cfg.signup_open ? h('p', { class: 'small' }, 'No account? ', link('/signup', 'Sign up')) : null) : h('p', { class: 'small' }, 'Have an account? ', link('/login', 'Sign in')),
+    cfg.public_demo ? h('p', { class: 'small' }, h('a', { href: '/', onclick: (e: MouseEvent) => { e.preventDefault(); me = null; nav('/'); } }, 'Browse the read-only public demo')) : null);
 }
 
 // ---------- projects ----------
@@ -260,9 +282,14 @@ function renderResult(q: any, res: any) {
   if (q.kind === 'RetentionQuery') return retentionView(res);
   return trendsView(res, q.trendsFilter?.display ?? 'ActionsLineGraph');
 }
-async function runInsight(q: any, into: HTMLElement) {
+async function runInsight(q0: any, into: HTMLElement) {
+  const q = q0.source === 'cold' && !cfg?.cold_tier ? (({ source: _s, ...rest }) => rest)(q0) : q0;
   into.replaceChildren(loading());
-  try { const res = await api(apiP('/query'), { body: { query: q } }); into.replaceChildren(renderResult(q, res)); }
+  try {
+    const cold = q.kind === 'TrendsQuery' && q.source === 'cold';
+    const res = await api(apiP('/query'), { body: cold ? { source: 'cold', query: q } : { query: q } });
+    into.replaceChildren(...(cold ? [h('p', { class: 'muted small' }, 'Cold tier (Basin / Iceberg)', res.scanned?.bytes ? ` · ${bytes(res.scanned.bytes)} scanned` : '')] : []), renderResult(q, res));
+  }
   catch (e) { into.replaceChildren(h('p', { class: 'error' }, e instanceof Error ? e.message : String(e))); }
 }
 const kindName = (k: string) => ({ TrendsQuery: 'Trends', FunnelsQuery: 'Funnel', RetentionQuery: 'Retention' } as Record<string, string>)[k] ?? k;
@@ -353,7 +380,10 @@ async function insightPage(shortId: string | null) {
         h('label', {}, 'Interval', h('select', { onchange: (e: Event) => { q.interval = (e.target as HTMLSelectElement).value; refresh(); } }, [['hour', 'Hour'], ['day', 'Day'], ['week', 'Week'], ['month', 'Month']].map(([v, l]) => opt(v, l, q.interval)))),
         h('label', {}, 'Chart', h('select', { onchange: (e: Event) => { q.trendsFilter.display = (e.target as HTMLSelectElement).value; refresh(); } }, [['ActionsLineGraph', 'Line'], ['ActionsBar', 'Bars'], ['BoldNumber', 'Number'], ['ActionsBarValue', 'Total value bars'], ['ActionsTable', 'Table']].map(([v, l]) => opt(v, l, q.trendsFilter.display ?? 'ActionsLineGraph')))),
         h('label', {}, 'Breakdown', h('input', { value: q.breakdownFilter?.breakdown ?? '', placeholder: 'e.g. $browser', list: 'props-event', onchange: (e: Event) => { const v = (e.target as HTMLInputElement).value.trim(); q.breakdownFilter = v ? { breakdown: v, breakdown_type: (defs?.properties ?? []).some(p => p.kind === 'person' && p.name === v) && !(defs?.properties ?? []).some(p => p.kind === 'event' && p.name === v) ? 'person' : 'event' } : undefined; refresh(); } })),
-        h('label', { class: 'switch' }, h('input', { type: 'checkbox', checked: !!q.compareFilter?.compare, onchange: (e: Event) => { q.compareFilter = { compare: (e.target as HTMLInputElement).checked }; refresh(); } }), 'Compare to previous period')));
+        h('label', { class: 'switch' }, h('input', { type: 'checkbox', checked: !!q.compareFilter?.compare, onchange: (e: Event) => { q.compareFilter = { compare: (e.target as HTMLInputElement).checked }; refresh(); } }), 'Compare to previous period'),
+        // 0.6: Trends can read the cold tier (design.md "Cold Trends"); hidden when the instance has no Basin cold tier.
+        cfg?.cold_tier ? h('label', {}, 'Source', h('select', { 'aria-label': 'Source', 'data-ro': '', onchange: (e: Event) => { const v = (e.target as HTMLSelectElement).value; if (v === 'cold') q.source = 'cold'; else delete q.source; refresh(); } }, opt('hot', 'Hot (recent events)', q.source ?? 'hot'), opt('cold', 'Cold (Iceberg history)', q.source ?? 'hot')))
+          : q.source === 'cold' ? h('span', { class: 'muted small' }, 'Cold tier not configured on this instance; showing hot data.') : null));
     } else if (q.kind === 'FunnelsQuery') {
       parts.push(seriesBox('Steps', q.series, false, 2));
       const ff = q.funnelsFilter ??= {};
@@ -548,7 +578,7 @@ async function settingsPage() {
       h('h3', {}, 'Project API key'), h('div', { class: 'row' }, h('code', { class: 'token' }, p.api_token), copy(p.api_token)),
       h('p', { class: 'muted small' }, 'This key is public: it can only send events and read flags.'),
       stats ? h('p', { class: 'small' }, h('b', {}, fmt(stats.events)), ' events · ', h('b', {}, fmt(stats.persons)), ' persons · last event ', ago(stats.last_event_at), ` · ${(stats.database_bytes / 1048576).toFixed(1)} MB stored`) : null),
-    form, limitsSettings(p), errorTrackingSettings(p), replaySettings(p),
+    form, cfg?.public_demo && !demo() ? publicDemoSettings(p) : null, limitsSettings(p), errorTrackingSettings(p), replaySettings(p),
     h('section', { class: 'card' }, h('h2', {}, 'Other projects'), h('ul', {}, projects.map(x => h('li', {}, link(`/project/${x.id}/settings`, x.name)))), newProjectForm(np => nav(`/project/${np.id}/settings`))),
     h('section', { class: 'card danger-zone' }, h('h2', {}, 'Danger zone'),
       h('div', { class: 'row' }, h('button', { onclick: async () => { if (!confirm('Reset the project API key? Sites using the old key stop sending events.')) return; const r = await api<Project>(apiP('/reset_token'), { body: {} }); projects = projects.map(x => x.id === r.id ? r : x); settingsPage(); } }, 'Reset project API key'),
@@ -1247,9 +1277,15 @@ async function usagePage() {
   const replaySeries = [{ name: 'New recordings', data: labels.map(d => rmap.get(d)?.recordings ?? 0) }];
   const rtotal = u.replay.reduce((a: any, r: any) => ({ recordings: a.recordings + r.recordings, bytes: a.bytes + r.bytes, chunks: a.chunks + r.chunks, dropped: a.dropped + r.dropped }), { recordings: 0, bytes: 0, chunks: 0, dropped: 0 });
   const c = u.cost;
-  const costTable = h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Item'), h('th', { class: 'num' }, 'Projected quantity'), h('th', { class: 'num' }, 'List price'), h('th', { class: 'num' }, 'After included usage'))),
-    h('tbody', {}, c.lines.map((l: any) => h('tr', {}, h('td', {}, l.label), h('td', { class: 'num' }, `${fmt(l.quantity < 100 ? Math.round(l.quantity * 1000) / 1000 : Math.round(l.quantity))} ${l.unit}`), h('td', { class: 'num' }, usd(l.list_usd)), h('td', { class: 'num' }, usd(l.after_included_usd))))),
-    h('tfoot', {}, h('tr', {}, h('th', {}, 'Estimated total for ', u.month), h('th', {}), h('th', { class: 'num' }, usd(c.list_usd)), h('th', { class: 'num' }, usd(c.after_included_usd)))));
+  // 0.6: list price is the headline; the Workers Paid included allowance is a secondary view (it assumes this is the account's only workload).
+  const afterIncl = new URLSearchParams(location.search).get('cost') === 'included';
+  const costCol = (l: any) => afterIncl ? l.after_included_usd : l.list_usd;
+  const costTable = h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Item'), h('th', { class: 'num' }, 'Projected quantity'), h('th', { class: 'num' }, afterIncl ? 'After included allowance' : 'List price'))),
+    h('tbody', {}, c.lines.map((l: any) => h('tr', {}, h('td', {}, l.label), h('td', { class: 'num' }, `${fmt(l.quantity < 100 ? Math.round(l.quantity * 1000) / 1000 : Math.round(l.quantity))} ${l.unit}`), h('td', { class: 'num' }, usd(costCol(l)))))),
+    h('tfoot', {}, h('tr', {}, h('th', {}, 'Estimated total for ', u.month), h('th', {}), h('th', { class: 'num' }, usd(afterIncl ? c.after_included_usd : c.list_usd)))));
+  const costToggle = h('label', { class: 'switch small', 'data-ro': '' }, h('input', { type: 'checkbox', checked: afterIncl, 'data-ro': '', onchange: (e: Event) => nav(P(`/usage?days=${days}${(e.target as HTMLInputElement).checked ? '&cost=included' : ''}`)) }), 'After Workers Paid included allowance');
+  const dp = u.dropped_past_cap ?? { events: 0, requests: 0, replay_uploads: 0 }; const mt = u.month_to_date ?? {};
+  const stat = (label: string, v: number, hint = '') => h('div', { class: 'stat' }, h('div', { class: 'stat-v' }, fmt(v)), h('div', { class: 'stat-l' }, label), hint ? h('div', { class: 'muted small' }, hint) : null);
   const daysSel = h('select', { 'aria-label': 'Days', onchange: (e: Event) => nav(P(`/usage?days=${(e.target as HTMLSelectElement).value}`)) }, [7, 30, 90].map(d => opt(String(d), `Last ${d} days`, String(days))));
   const err = errBox();
   const testBtn = h('button', { onclick: async () => { err.textContent = ''; try { const r = await api<any>(apiP('/alerts/test'), { body: {} }); err.textContent = `Test alert created · email: ${r.email_status}`; } catch (e) { err.textContent = e instanceof Error ? e.message : String(e); } } }, 'Send test alert');
@@ -1259,17 +1295,33 @@ async function usagePage() {
       h('div', { class: 'meters' }, meter('Events', u.caps.events.used, u.caps.events.cap, fmt, st.events, mode),
         meter('Session recordings', u.caps.recordings.used, u.caps.recordings.cap, fmt, st.replay, mode),
         meter('Replay storage', u.caps.replay_bytes.used, u.caps.replay_bytes.cap, bytes, st.replay, mode)),
-      L ? h('p', { class: 'muted small' }, `Past a cap new data is ${L.over_cap === 'drop' ? 'dropped and SDKs are told to pause (quota_limited)' : `sampled: ${Math.round(L.over_cap_sample_rate * 100)}% of people (events) and sessions (replay) are kept`}. Autocapture is sampled at ${Math.round(L.autocapture_sample_rate * 100)}% of sessions. Events dropped at the edge after a cap is hit are not counted.`)
+      L ? h('p', { class: 'muted small' }, `Past a cap new data is ${L.over_cap === 'drop' ? 'dropped and SDKs are told to pause (quota_limited)' : `sampled: ${Math.round(L.over_cap_sample_rate * 100)}% of people (events) and sessions (replay) are kept`}. Autocapture is sampled at ${Math.round(L.autocapture_sample_rate * 100)}% of sessions. Events and requests dropped at the edge after a cap is hit are counted under Dropped past cap.`)
         : h('p', { class: 'muted small' }, 'This project has no usage limits. ', link(P('/settings#limits'), 'Set caps and sampling'), '.')),
+    h('section', { class: 'card', id: 'dropped' }, h('h2', {}, 'Dropped past cap ', h('span', { class: 'muted small' }, `(${u.month}, counted at the edge)`)),
+      h('div', { class: 'stats' }, stat('Events dropped', dp.events, 'refused or sampled out after a cap'), stat('Requests fully dropped', dp.requests, 'nothing in the batch was kept'), stat('Replay uploads refused', dp.replay_uploads),
+        mt.suppressed_exceptions ? stat('Exceptions suppressed', mt.suppressed_exceptions, 'by suppression rules') : null),
+      h('p', { class: 'muted small' }, 'Edge counts are batched per Worker isolate and flushed within a few seconds, so they can trail slightly.')),
+    h('section', { class: 'card' }, h('h2', {}, 'Requests this month'),
+      h('div', { class: 'stats' }, stat('Capture requests', mt.requests ?? 0), stat('Flags / decide / local evaluation', mt.flag_requests ?? 0), stat('Remote config', mt.config_requests ?? 0), stat('Dashboard API', mt.api_requests ?? 0)),
+      h('p', { class: 'muted small' }, 'All of these are Worker requests and count toward the cost estimate below.')),
     h('section', { class: 'card' }, h('h2', {}, 'Events per day by event type'), total ? stackedBars(labels, series) : h('p', { class: 'muted empty' }, 'No events in this range.'), total ? eventsTable : null),
     h('section', { class: 'card' }, h('h2', {}, 'Session replay'), h('p', { class: 'small' }, h('b', {}, fmt(rtotal.recordings)), ' new recordings · ', h('b', {}, bytes(rtotal.bytes)), ' stored (gzip) · ', h('b', {}, fmt(rtotal.chunks)), ' uploads', rtotal.dropped ? ` · ${fmt(rtotal.dropped)} uploads refused over the cap` : '', ` in the last ${days} days`),
       rtotal.recordings || rtotal.chunks ? stackedBars(labels, replaySeries) : h('p', { class: 'muted empty' }, 'No recordings in this range.')),
-    h('section', { class: 'card' }, h('h2', {}, 'Estimated Cloudflare cost ', h('span', { class: 'tag lvl-warn' }, 'estimate')),
-      h('p', { class: 'muted small' }, `Month-to-date usage (${u.days_elapsed} of ${u.days_in_month} days) projected to the full month, priced at Cloudflare's public list prices. Stored data: ${bytes(u.storage.database_bytes)} SQLite, ${bytes(u.storage.r2_bytes)} R2.`),
+    h('section', { class: 'card' }, h('div', { class: 'row spread' }, h('h2', {}, 'Estimated Cloudflare cost ', h('span', { class: 'tag lvl-warn' }, 'estimate')), costToggle),
+      h('div', { class: 'stats' }, stat('Projected list price (USD / month)', Math.round(c.list_usd * 100) / 100), afterIncl ? stat('After Workers Paid included allowance', Math.round(c.after_included_usd * 100) / 100, 'assumes this is the only workload on the account') : null),
+      h('p', { class: 'muted small' }, `Month-to-date usage (${u.days_elapsed} of ${u.days_in_month} days) projected to the full month, priced at Cloudflare's public list prices. Stored data: ${bytes(u.storage.database_bytes)} SQLite, ${bytes(u.storage.r2_bytes)} R2.`, afterIncl ? ' The included-allowance view assumes this is the only workload on the account (other Workers share the allowance).' : ''),
       costTable, h('ul', { class: 'muted small' }, c.notes.map((n: string) => h('li', {}, n)))),
     h('section', { class: 'card' }, h('div', { class: 'row spread' }, h('h2', {}, 'Alerts'), h('div', { class: 'row' }, readBtn, testBtn)),
       h('p', { class: 'muted small' }, u.email.configured ? `Email alerts on: sent from ${u.email.from} to ${Array.isArray(u.email.recipients) ? u.email.recipients.join(', ') : u.email.recipients}.` : 'Email alerts are off on this instance (no Email Sending binding or ALERT_EMAIL_FROM); alerts appear here only.'), err,
       alertsList(al.results)));
+}
+/** PUBLIC_DEMO=1 instances: the owner picks which projects signed-out visitors may browse read-only. */
+function publicDemoSettings(p: Project): HTMLElement {
+  const on = h('input', { type: 'checkbox', checked: !!p.public_demo }) as HTMLInputElement;
+  on.addEventListener('change', async () => { const r = await api<Project>(apiP(''), { method: 'PATCH', body: { public_demo: on.checked } }); projects = projects.map(x => x.id === r.id ? r : x); });
+  return h('section', { class: 'card', id: 'public-demo' }, h('h2', {}, 'Public demo'),
+    h('label', { class: 'switch' }, on, 'Show this project read-only to signed-out visitors'),
+    h('p', { class: 'muted small' }, 'This instance runs with PUBLIC_DEMO=1. Visitors can browse and query demo projects but cannot change anything; emails, personal API keys and the project API key are hidden. Use synthetic data only.'));
 }
 function limitsSettings(p: Project): HTMLElement {
   const L = p.limits ?? { events_monthly: null, replay_recordings_monthly: null, replay_bytes_monthly: null, over_cap: 'drop', over_cap_sample_rate: 0.1, autocapture_sample_rate: 1, alert_emails: [], spike_alerts: true, spike_factor: 3 };
@@ -1304,19 +1356,60 @@ function errorTrackingSettings(p: Project): HTMLElement {
   const list = h('div', {}, loading());
   const load = async () => {
     const sets = await api<any[]>(apiP('/symbol_sets'));
-    list.replaceChildren(sets.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Minified file'), h('th', { class: 'num' }, 'Size'), h('th', {}, 'Uploaded'), h('th', {}, 'Last used'), h('th', {}))),
-      h('tbody', {}, sets.map(x => h('tr', {}, h('td', { class: 'url' }, h('code', {}, x.ref)), h('td', { class: 'num' }, bytes(x.size)), h('td', { class: 'muted nowrap' }, ago(x.created_at)), h('td', { class: 'muted nowrap' }, ago(x.last_used_at)),
+    list.replaceChildren(sets.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Minified file'), h('th', {}, 'Release'), h('th', { class: 'num' }, 'Size'), h('th', {}, 'Uploaded'), h('th', {}, 'Last used'), h('th', {}))),
+      h('tbody', {}, sets.map(x => h('tr', {}, h('td', { class: 'url' }, h('code', {}, x.ref)), h('td', {}, x.release ? h('code', {}, x.release) : h('span', { class: 'muted small' }, 'any')), h('td', { class: 'num' }, bytes(x.size)), h('td', { class: 'muted nowrap' }, ago(x.created_at)), h('td', { class: 'muted nowrap' }, ago(x.last_used_at)),
         h('td', {}, h('button', { type: 'button', class: 'link danger', onclick: async () => { if (!confirm('Delete this source map?')) return; await api(apiP(`/symbol_sets/${x.id}`), { method: 'DELETE' }); load(); } }, 'Delete')))))) : h('p', { class: 'muted small' }, 'No source maps uploaded.'));
   };
   load().catch(e => list.replaceChildren(h('p', { class: 'error' }, String(e))));
   on.addEventListener('change', async () => { const r = await api<Project>(apiP(''), { method: 'PATCH', body: { error_tracking: on.checked } }); projects = projects.map(x => x.id === r.id ? r : x); });
-  const cli = `node upload-sourcemaps.mjs --host ${location.origin} --project ${p.id} \\\n  --dir dist/assets --url-prefix https://your-site.com/assets/\n# reads the personal API key from PA_PERSONAL_API_KEY`;
+  const cli = `node upload-sourcemaps.mjs --host ${location.origin} --project ${p.id} \\\n  --dir dist/assets --url-prefix https://your-site.com/assets/ --release 1.4.2\n# reads the personal API key from PA_PERSONAL_API_KEY; --release is optional`;
   return h('section', { class: 'card', id: 'error-tracking' }, h('h2', {}, 'Error tracking'),
     h('label', { class: 'switch' }, on, 'Capture unhandled errors and promise rejections (posthog-js exception autocapture, via remote config)'),
     h('p', { class: 'muted small' }, 'posthog.captureException(error) and posthog-node captureException always work. Exceptions are grouped into issues by type and top stack frames, or by a $exception_fingerprint you send. ', link(P('/errors'), 'Open error tracking'), '.'),
     h('h3', {}, 'Source maps'),
-    h('p', { class: 'muted small' }, 'Upload the map for each minified file so stack traces show original files, lines and function names. New exceptions are symbolicated at ingest. Use a personal API key (Account page) with the upload script from the repo (scripts/upload-sourcemaps.mjs):'),
-    h('pre', { class: 'code' }, cli), list);
+    h('p', { class: 'muted small' }, 'Upload the map for each minified file so stack traces show original files, lines and function names. New exceptions are symbolicated at ingest, and issues from the last 30 days that arrived before the map are re-symbolicated on upload. Maps uploaded with --release only apply to exceptions from that release ($release or $app_version); maps without one apply to any release. Use a personal API key (Account page) with the upload script from the repo (scripts/upload-sourcemaps.mjs):'),
+    h('pre', { class: 'code' }, cli), list, groupingRulesEditor(), suppressionRulesEditor());
+}
+/** Custom grouping rules (design.md "Grouping rules"): first match wins, after $exception_fingerprint, before default grouping. */
+function groupingRulesEditor(): HTMLElement {
+  const box = h('div', {}, loading()); const err = errBox();
+  const field = h('select', { 'aria-label': 'Field' }, opt('type', 'Exception type', 'type'), opt('value', 'Exception message', 'type'), opt('filename', 'Any frame file', 'type'), opt('function', 'Any frame function', 'type')) as HTMLSelectElement;
+  const match = h('select', { 'aria-label': 'Match' }, opt('contains', 'contains', 'contains'), opt('exact', 'equals', 'contains'), opt('regex', 'matches regex', 'contains')) as HTMLSelectElement;
+  const pat = h('input', { placeholder: 'pattern', 'aria-label': 'Pattern' }) as HTMLInputElement; const key = h('input', { placeholder: 'group key, e.g. network-errors', 'aria-label': 'Group key' }) as HTMLInputElement;
+  const load = async () => {
+    const rules = await api<any[]>(apiP('/error_grouping_rules'));
+    box.replaceChildren(rules.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, 'When'), h('th', {}, 'Group as'), h('th', {}, 'On'), h('th', {}))),
+      h('tbody', {}, rules.map((r, i) => h('tr', {}, h('td', { class: 'num' }, String(i + 1)), h('td', {}, `${r.field} ${r.match} `, h('code', {}, r.pattern)), h('td', {}, h('code', {}, r.key)),
+        h('td', {}, h('input', { type: 'checkbox', checked: r.enabled, 'aria-label': 'Enabled', onchange: async (e: Event) => { await api(apiP(`/error_grouping_rules/${r.id}`), { method: 'PATCH', body: { enabled: (e.target as HTMLInputElement).checked } }); } })),
+        h('td', {}, h('button', { type: 'button', class: 'link danger', onclick: async () => { await api(apiP(`/error_grouping_rules/${r.id}`), { method: 'DELETE' }); load(); } }, 'Delete')))))) : h('p', { class: 'muted small' }, 'No grouping rules: issues group by $exception_fingerprint, else by type and top in-app frames.'));
+  };
+  load().catch(e => box.replaceChildren(h('p', { class: 'error' }, String(e))));
+  const add = h('button', { type: 'button' }, 'Add rule') as HTMLButtonElement;
+  add.addEventListener('click', busy(add, async () => { await api(apiP('/error_grouping_rules'), { body: { field: field.value, match: match.value, pattern: pat.value, key: key.value } }); pat.value = ''; key.value = ''; await load(); }, err));
+  return h('div', { id: 'grouping-rules' }, h('h3', {}, 'Grouping rules'), h('p', { class: 'muted small' }, 'Exceptions matching a rule are grouped into one issue per group key. Rules apply to new exceptions; the first enabled match wins.'), box,
+    h('div', { class: 'row opts' }, field, match, pat, key, add), err);
+}
+/** SDK suppression rules: sent to posthog-js in remote config (errorTracking.suppressionRules) and also enforced at ingest. */
+function suppressionRulesEditor(): HTMLElement {
+  const box = h('div', {}, loading()); const err = errBox();
+  const key = h('select', { 'aria-label': 'Property' }, opt('$exception_types', 'Exception type', '$exception_types'), opt('$exception_values', 'Exception message', '$exception_types')) as HTMLSelectElement;
+  const op = h('select', { 'aria-label': 'Operator' }, [['exact', 'equals'], ['is_not', 'does not equal'], ['icontains', 'contains'], ['not_icontains', 'does not contain'], ['regex', 'matches regex'], ['not_regex', 'does not match regex']].map(([v, l]) => opt(v, l, 'icontains'))) as HTMLSelectElement;
+  const val = h('input', { placeholder: 'value (comma-separated for several)', 'aria-label': 'Value' }) as HTMLInputElement;
+  const load = async () => {
+    const rules = await api<any[]>(apiP('/error_suppression_rules'));
+    box.replaceChildren(rules.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Drop exceptions where'), h('th', {}, 'On'), h('th', {}))),
+      h('tbody', {}, rules.map(r => h('tr', {}, h('td', {}, r.values.map((v: any, i: number) => h('span', {}, i ? ` ${r.type} ` : '', h('code', {}, v.key), ` ${v.operator} `, h('code', {}, Array.isArray(v.value) ? v.value.join(' | ') : v.value)))),
+        h('td', {}, h('input', { type: 'checkbox', checked: r.enabled, 'aria-label': 'Enabled', onchange: async (e: Event) => { await api(apiP(`/error_suppression_rules/${r.id}`), { method: 'PATCH', body: { enabled: (e.target as HTMLInputElement).checked } }); } })),
+        h('td', {}, h('button', { type: 'button', class: 'link danger', onclick: async () => { await api(apiP(`/error_suppression_rules/${r.id}`), { method: 'DELETE' }); load(); } }, 'Delete')))))) : h('p', { class: 'muted small' }, 'No suppression rules.'));
+  };
+  load().catch(e => box.replaceChildren(h('p', { class: 'error' }, String(e))));
+  const add = h('button', { type: 'button' }, 'Add suppression rule') as HTMLButtonElement;
+  add.addEventListener('click', busy(add, async () => {
+    const vs = val.value.split(',').map(x => x.trim()).filter(Boolean);
+    await api(apiP('/error_suppression_rules'), { body: { type: 'OR', values: [{ key: key.value, operator: op.value, value: vs.length > 1 ? vs : vs[0] ?? '' }] } }); val.value = ''; await load();
+  }, err));
+  return h('div', { id: 'suppression-rules' }, h('h3', {}, 'Suppression rules'), h('p', { class: 'muted small' }, 'posthog-js drops matching exceptions before sending (via remote config); anything that still arrives is dropped at ingest and counted on the Usage page.'), box,
+    h('div', { class: 'row opts' }, key, op, val, add), err);
 }
 const STATUS_TAG: Record<string, string> = { active: 'status-running', resolved: 'status-complete', suppressed: 'status-draft' };
 function spark(data: number[]) {
@@ -1328,26 +1421,39 @@ function spark(data: number[]) {
 async function errorsPage() {
   const q = new URLSearchParams(location.search); const status = q.get('status') ?? 'active'; const order = q.get('order') ?? 'last_seen';
   shell('Error tracking', [], loading());
-  const r = await api<any>(apiP(`/error_issues?status=${status === 'all' ? '' : status}&order=${order}&search=${encodeURIComponent(q.get('search') ?? '')}`));
+  const rel = q.get('release') ?? ''; const asg = q.get('assignee') ?? '';
+  const [r, rels, users] = await Promise.all([api<any>(apiP(`/error_issues?status=${status === 'all' ? '' : status}&order=${order}&search=${encodeURIComponent(q.get('search') ?? '')}&release=${encodeURIComponent(rel)}&assignee=${encodeURIComponent(asg)}`)),
+    api<any[]>(apiP('/error_issues/releases')), demo() ? Promise.resolve([]) : api<any[]>('/api/users').catch(() => [])]);
+  const picked = new Set<string>();
   const go = (k: string, v: string) => { const n = new URLSearchParams(location.search); n.set(k, v); nav(P('/errors?' + n.toString())); };
   const tab = (v: string, label: string) => h('button', { class: status === v ? 'tab active' : 'tab', onclick: () => go('status', v) }, label, v !== 'all' ? h('span', { class: 'muted small' }, ` ${fmt(r.counts[v] ?? 0)}`) : null);
   const search = h('input', { placeholder: 'Search type, message or frame', value: q.get('search') ?? '', 'aria-label': 'Search issues', onkeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') go('search', (e.target as HTMLInputElement).value); } });
   const sort = h('select', { 'aria-label': 'Sort', onchange: (e: Event) => go('order', (e.target as HTMLSelectElement).value) }, opt('last_seen', 'Last seen', order), opt('first_seen', 'First seen', order), opt('occurrences', 'Occurrences', order), opt('users', 'Users', order));
+  const relSel = h('select', { 'aria-label': 'Release', onchange: (e: Event) => go('release', (e.target as HTMLSelectElement).value) }, opt('', 'All releases', rel), rels.map(x => opt(x.release, x.release, rel)));
+  const asgSel = h('select', { 'aria-label': 'Assignee', onchange: (e: Event) => go('assignee', (e.target as HTMLSelectElement).value) }, opt('', 'Anyone', asg), opt('me', 'Assigned to me', asg), opt('none', 'Unassigned', asg), users.map((u: any) => opt(String(u.id), u.email ?? `User ${u.id}`, asg)));
+  const err = errBox();
+  const mergeBtn = h('button', { disabled: true, title: 'Select two or more issues; the first selected keeps its id' }, 'Merge selected') as HTMLButtonElement;
+  mergeBtn.addEventListener('click', busy(mergeBtn, async () => { const [first, ...rest] = [...picked]; await api(apiP(`/error_issues/${first}/merge`), { body: { ids: rest } }); nav(P(`/errors/${first}`)); }, err));
   const p = project();
   shell('Error tracking', [],
     !p.error_tracking ? h('p', { class: 'muted small' }, 'Exception autocapture is off for this project; only manual captureException calls arrive. ', link(P('/settings#error-tracking'), 'Turn it on in Settings'), '.') : null,
-    h('section', { class: 'card' }, h('div', { class: 'row spread' }, h('div', { class: 'row tabs' }, tab('active', 'Active'), tab('resolved', 'Resolved'), tab('suppressed', 'Suppressed'), tab('all', 'All')), h('div', { class: 'row' }, search, sort)),
-      r.results.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Issue'), h('th', {}, '14 days'), h('th', { class: 'num' }, 'Occurrences'), h('th', { class: 'num' }, 'Users'), h('th', {}, 'Last seen'), h('th', {}, 'First seen'))),
+    h('section', { class: 'card' }, h('div', { class: 'row spread' }, h('div', { class: 'row tabs' }, tab('active', 'Active'), tab('resolved', 'Resolved'), tab('suppressed', 'Suppressed'), tab('all', 'All')), h('div', { class: 'row' }, search, relSel, asgSel, sort, mergeBtn)), err,
+      r.results.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}), h('th', {}, 'Issue'), h('th', {}, '14 days'), h('th', { class: 'num' }, 'Occurrences'), h('th', { class: 'num' }, 'Users'), h('th', {}, 'Releases'), h('th', {}, 'Assignee'), h('th', {}, 'Last seen'), h('th', {}, 'First seen'))),
         h('tbody', {}, r.results.map((i: any) => h('tr', { class: 'clickable', onclick: () => nav(P(`/errors/${i.id}`)) },
+          h('td', { onclick: (e: Event) => e.stopPropagation() }, h('input', { type: 'checkbox', 'aria-label': 'Select issue', disabled: demo(), onchange: (e: Event) => { if ((e.target as HTMLInputElement).checked) picked.add(i.id); else picked.delete(i.id); mergeBtn.disabled = picked.size < 2 || demo(); } })),
           h('td', {}, link(P(`/errors/${i.id}`), [h('b', {}, i.type), i.message ? `: ${i.message.length > 140 ? i.message.slice(0, 140) + '…' : i.message}` : '']), status === 'all' ? h('span', { class: `tag ${STATUS_TAG[i.status]}` }, i.status) : null, i.regressions ? h('span', { class: 'tag lvl-warn' }, 'regressed') : null,
             h('div', { class: 'muted small mono' }, i.top_frame ?? 'no stack trace')),
-          h('td', {}, spark(i.last_14_days)), h('td', { class: 'num' }, fmt(i.occurrences)), h('td', { class: 'num' }, fmt(i.users)), h('td', { class: 'muted nowrap' }, ago(i.last_seen)), h('td', { class: 'muted nowrap' }, ago(i.first_seen))))))
+          h('td', {}, spark(i.last_14_days)), h('td', { class: 'num' }, fmt(i.occurrences)), h('td', { class: 'num' }, fmt(i.users)),
+          h('td', { class: 'small mono nowrap' }, i.first_seen_release ? (i.first_seen_release === i.last_seen_release ? i.first_seen_release : `${i.first_seen_release} → ${i.last_seen_release}`) : h('span', { class: 'muted' }, '–')),
+          h('td', { class: 'small' }, i.assignee ? (i.assignee.email ?? `User ${i.assignee.id}`) : h('span', { class: 'muted' }, '–')),
+          h('td', { class: 'muted nowrap' }, ago(i.last_seen)), h('td', { class: 'muted nowrap' }, ago(i.first_seen))))))
         : h('p', { class: 'muted empty' }, status === 'active' ? 'No active issues. Exceptions from posthog-js and posthog-node appear here grouped into issues.' : 'Nothing here.')));
 }
 function frameView(f: any, open: boolean) {
-  const loc = `${f.filename ?? f.abs_path ?? '?'}${f.lineno ? ':' + f.lineno : ''}${f.colno ? ':' + f.colno : ''}`;
+  const loc = `${f.filename ?? f.abs_path ?? f.module ?? '?'}${f.lineno ? ':' + f.lineno : ''}${f.colno ? ':' + f.colno : ''}`;
   const hasCtx = typeof f.context_line === 'string';
   const head = h('div', { class: 'fhead' }, h('span', { class: 'mono' }, h('b', {}, f.function ?? '?'), h('span', { class: 'muted' }, ' in '), loc), f.in_app === false ? h('span', { class: 'tag' }, 'library') : null,
+    f.platform && !/^(web:)?javascript$|^node:javascript$/.test(f.platform) ? h('span', { class: 'tag' }, String(f.platform).replace(/^custom$/, f.lang ?? 'native')) : null,
     f.minified ? h('span', { class: 'muted small mono', title: 'Minified location' }, ` ← ${f.minified.function ?? '?'} ${(f.minified.filename ?? '').replace(/^https?:\/\/[^/]+/, '')}:${f.minified.lineno}:${f.minified.colno}`) : null);
   if (!hasCtx) return h('div', { class: `frame${f.in_app === false ? ' lib' : ''}` }, head);
   const first = (f.lineno ?? 1) - (f.pre_context?.length ?? 0);
@@ -1360,6 +1466,13 @@ async function errorPage(id: string) {
   shell('Issue', [], loading());
   const i = await api<any>(apiP(`/error_issues/${id}`));
   const setStatus = async (st: string) => { await api(apiP(`/error_issues/${id}`), { method: 'PATCH', body: { status: st } }); errorPage(id); };
+  if (i.status === 'merged' && i.merged_into) return nav(P(`/errors/${i.merged_into}`));
+  const users = demo() ? [] : await api<any[]>('/api/users').catch(() => []);
+  const assign = h('select', { 'aria-label': 'Assignee', disabled: demo(), onchange: async (e: Event) => { const v = (e.target as HTMLSelectElement).value; await api(apiP(`/error_issues/${id}`), { method: 'PATCH', body: { assignee: v || null } }); errorPage(id); } },
+    opt('', 'Unassigned', i.assignee ? String(i.assignee.id) : ''), users.map((u: any) => opt(String(u.id), u.email, i.assignee ? String(i.assignee.id) : '')),
+    i.assignee && !users.some((u: any) => u.id === i.assignee.id) ? opt(String(i.assignee.id), i.assignee.email ?? `User ${i.assignee.id}`, String(i.assignee.id)) : null);
+  const ferr = errBox();
+  const split = (fp: string) => async () => { if (!confirm('Move occurrences with this fingerprint to their own issue?')) return; try { const r = await api<any>(apiP(`/error_issues/${id}/split`), { body: { fingerprint: fp } }); nav(P(`/errors/${r.split.id}`)); } catch (e) { ferr.textContent = e instanceof Error ? e.message : String(e); } };
   const actions = i.status === 'active' ? [h('button', { class: 'primary', onclick: () => setStatus('resolved') }, 'Resolve'), h('button', { onclick: () => setStatus('suppressed') }, 'Suppress')]
     : [h('button', { onclick: () => setStatus('active') }, 'Reopen')];
   const ex: any[] = Array.isArray(i.exception_list) ? i.exception_list : [];
@@ -1377,12 +1490,96 @@ async function errorPage(id: string) {
           h('dt', {}, 'Status'), h('dd', {}, h('span', { class: `tag ${STATUS_TAG[i.status]}` }, i.status), i.resolved_at ? h('span', { class: 'muted small' }, ` since ${when(i.resolved_at)}`) : null),
           h('dt', {}, 'First seen'), h('dd', {}, when(i.first_seen)), h('dt', {}, 'Last seen'), h('dd', {}, when(i.last_seen)),
           h('dt', {}, 'Occurrences'), h('dd', {}, fmt(i.occurrences)), h('dt', {}, 'Affected users'), h('dd', {}, fmt(i.users)),
-          h('dt', {}, 'Regressions'), h('dd', {}, fmt(i.regressions)), h('dt', {}, 'Fingerprint'), h('dd', {}, h('code', { class: 'small' }, i.fingerprint)))),
+          h('dt', {}, 'Regressions'), h('dd', {}, fmt(i.regressions)),
+          h('dt', {}, 'Releases'), h('dd', {}, i.first_seen_release ? h('span', { class: 'mono small' }, i.first_seen_release, i.last_seen_release !== i.first_seen_release ? ` → ${i.last_seen_release}` : '') : h('span', { class: 'muted' }, 'none sent')),
+          h('dt', {}, 'Assignee'), h('dd', {}, assign),
+          h('dt', {}, 'Fingerprint'), h('dd', {}, h('code', { class: 'small' }, i.fingerprint)))),
+        i.releases?.length ? h('div', { class: 'card' }, h('h2', {}, 'Releases'), h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Release'), h('th', { class: 'num' }, 'Occurrences'), h('th', {}, 'Last seen'))),
+          h('tbody', {}, i.releases.map((x: any) => h('tr', {}, h('td', { class: 'mono' }, link(P(`/errors?status=all&release=${encodeURIComponent(x.release)}`), x.release)), h('td', { class: 'num' }, fmt(x.occurrences)), h('td', { class: 'muted nowrap' }, ago(x.last_seen))))))) : null,
+        h('div', { class: 'card', id: 'fingerprints' }, h('h2', {}, 'Fingerprints'), h('p', { class: 'muted small' }, 'Every grouping fingerprint in this issue. Split one out to give it its own issue.'), ferr,
+          h('table', {}, h('tbody', {}, (i.fingerprints ?? []).map((f: any) => h('tr', {}, h('td', {}, h('code', { class: 'small' }, f.fingerprint.length > 48 ? f.fingerprint.slice(0, 48) + '…' : f.fingerprint), f.primary ? h('span', { class: 'tag' }, 'primary') : null),
+            h('td', { class: 'num' }, fmt(f.occurrences)), h('td', {}, (i.fingerprints.length > 1 || !f.primary) ? h('button', { class: 'link', onclick: split(f.fingerprint) }, 'Split out') : null))))),
+          i.merged_issues?.length ? h('p', { class: 'small' }, `Merged in: ${i.merged_issues.length} issue${i.merged_issues.length > 1 ? 's' : ''} (`, i.merged_issues.map((x: any) => `${x.type}${x.message ? ': ' + x.message.slice(0, 40) : ''}`).join('; '), ')') : null),
         daily ? h('div', { class: 'card' }, h('h2', {}, 'Last 30 days'), daily) : null,
-        h('div', { class: 'card' }, h('h2', {}, 'Recent occurrences'), h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'When'), h('th', {}, 'Person'), h('th', {}, 'Replay'))),
-          h('tbody', {}, i.occurrences_list.map((o: any) => h('tr', {}, h('td', { class: 'nowrap' }, when(o.timestamp), h('div', { class: 'muted small url' }, o.url ?? '')),
+        h('div', { class: 'card' }, h('h2', {}, 'Recent occurrences'), h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'When'), h('th', {}, 'Release'), h('th', {}, 'Person'), h('th', {}, 'Replay'))),
+          h('tbody', {}, i.occurrences_list.map((o: any) => h('tr', {}, h('td', { class: 'nowrap' }, when(o.timestamp), h('div', { class: 'muted small url' }, o.url ?? '')), h('td', { class: 'mono small' }, o.release ?? '–'),
             h('td', {}, o.person ? link(P(`/persons/${encodeURIComponent(o.person.id)}`), o.person.name) : h('span', { class: 'muted' }, o.distinct_id)),
             h('td', {}, o.has_recording ? link(P(`/replay/${encodeURIComponent(o.session_id)}`), 'Watch') : h('span', { class: 'muted small' }, o.session_id ? 'not recorded' : '–'))))))))));
+}
+
+// ---------- LLM analytics (design.md "LLM analytics") ----------
+const ms = (v: number | null | undefined) => v === null || v === undefined ? '–' : v < 1000 ? `${Math.round(v)} ms` : `${(v / 1000).toFixed(2)} s`;
+const rate = (v: number) => `${(100 * v).toFixed(v && v < 0.01 ? 2 : 1)}%`;
+async function llmPage() {
+  const q = new URLSearchParams(location.search); const tab = q.get('tab') === 'traces' ? 'traces' : 'overview';
+  const from = q.get('date_from') ?? '-7d'; const model = q.get('model') ?? ''; const provider = q.get('provider') ?? ''; const status = q.get('status') ?? ''; const search = q.get('search') ?? '';
+  shell('LLM analytics', [], loading());
+  const go = (k: string, v: string) => { const n = new URLSearchParams(location.search); if (v) n.set(k, v); else n.delete(k); nav(P('/llm?' + n.toString())); };
+  const qs = new URLSearchParams({ date_from: from, ...(model ? { model } : {}), ...(provider ? { provider } : {}), ...(status ? { status } : {}), ...(search ? { search } : {}) }).toString();
+  const [ov, tr] = await Promise.all([api<any>(apiP(`/llm/overview?${qs}`)), api<any>(apiP(`/llm/traces?${qs}`))]);
+  const tabs = h('div', { class: 'row tabs' }, h('button', { class: tab === 'overview' ? 'tab active' : 'tab', 'data-ro': '', onclick: () => go('tab', '') }, 'Overview'), h('button', { class: tab === 'traces' ? 'tab active' : 'tab', 'data-ro': '', onclick: () => go('tab', 'traces') }, 'Traces', h('span', { class: 'muted small' }, ` ${fmt(tr.total)}`)));
+  const filters = h('div', { class: 'row' },
+    rangeSelect(from, v => go('date_from', v)),
+    h('select', { 'aria-label': 'Model', onchange: (e: Event) => go('model', (e.target as HTMLSelectElement).value) }, opt('', 'All models', model), tr.facets.models.map((m: string) => opt(m, m, model))),
+    h('select', { 'aria-label': 'Provider', onchange: (e: Event) => go('provider', (e.target as HTMLSelectElement).value) }, opt('', 'All providers', provider), tr.facets.providers.map((m: string) => opt(m, m, provider))),
+    tab === 'traces' ? h('select', { 'aria-label': 'Status', onchange: (e: Event) => go('status', (e.target as HTMLSelectElement).value) }, opt('', 'Any status', status), opt('ok', 'OK', status), opt('error', 'Error', status)) : null,
+    tab === 'traces' ? h('input', { placeholder: 'Search trace, user or model', value: search, 'aria-label': 'Search traces', onkeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') go('search', (e.target as HTMLInputElement).value); } }) : null);
+  const t = ov.totals;
+  const stat = (label: string, v: string, hint = '') => h('div', { class: 'stat' }, h('div', { class: 'stat-v' }, v), h('div', { class: 'stat-l' }, label), hint ? h('div', { class: 'muted small' }, hint) : null);
+  const empty = !t.generations && !t.embeddings && !tr.total;
+  const intro = h('p', { class: 'muted small' }, 'Generations, embeddings, spans and traces sent by the PostHog AI SDKs (@posthog/ai, posthog-python ai) or any $ai_* event. Costs use the SDK\'s $ai_total_cost_usd when sent, else list prices per model.');
+  if (empty) return shell('LLM analytics', [filters], h('section', { class: 'card' }, tabs, h('p', { class: 'muted empty' }, 'No LLM events in this range. Wrap your OpenAI, Anthropic or other client with the PostHog AI SDK, or send $ai_generation events to /i/v0/ai/batch or the normal capture endpoints.'), intro));
+  const series = (label: string, data: number[]): Series => ({ label, data, labels: ov.labels, count: data.reduce((a, b) => a + b, 0), days: ov.days } as any);
+  const overview = [
+    h('section', { class: 'card' }, h('div', { class: 'stats' }, stat('Generations', fmt(t.generations), t.embeddings ? `${fmt(t.embeddings)} embeddings` : ''), stat('Traces', fmt(t.traces)), stat('Users', fmt(t.users)),
+      stat('Tokens', `${fmt(t.input_tokens)} in · ${fmt(t.output_tokens)} out`), stat('Cost', usd(t.cost_usd), t.unpriced_calls ? `${fmt(t.unpriced_calls)} calls with unknown pricing` : ''),
+      stat('Latency p50 / p95', `${ms(t.latency_p50_ms)} / ${ms(t.latency_p95_ms)}`), stat('Error rate', rate(t.error_rate), `${fmt(t.errors)} errors`))),
+    h('div', { class: 'cols' },
+      h('section', { class: 'card' }, h('h2', {}, 'Generations'), lineChart([series('Generations', ov.series.generations), series('Errors', ov.series.errors)])),
+      h('section', { class: 'card' }, h('h2', {}, 'Cost (USD)'), lineChart([series('Cost', ov.series.cost_usd)], true))),
+    h('section', { class: 'card' }, h('h2', {}, 'Models'), h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Model'), h('th', {}, 'Provider'), h('th', { class: 'num' }, 'Calls'), h('th', { class: 'num' }, 'Input tokens'), h('th', { class: 'num' }, 'Output tokens'), h('th', { class: 'num' }, 'Cost'), h('th', { class: 'num' }, 'p50 latency'), h('th', { class: 'num' }, 'Errors'))),
+      h('tbody', {}, ov.models.map((m: any) => h('tr', { class: 'clickable', onclick: () => go('model', m.model ?? '') }, h('td', { class: 'mono' }, m.model ?? '–'), h('td', {}, m.provider ?? '–'), h('td', { class: 'num' }, fmt(m.generations + m.embeddings)),
+        h('td', { class: 'num' }, fmt(m.input_tokens)), h('td', { class: 'num' }, fmt(m.output_tokens)), h('td', { class: 'num' }, usd(m.cost_usd)), h('td', { class: 'num' }, ms(m.latency_p50_ms)), h('td', { class: 'num' }, m.errors ? rate(m.error_rate) : '–')))))),
+  ];
+  const traces = h('section', { class: 'card' }, tr.results.length ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Trace'), h('th', {}, 'Person'), h('th', {}, 'Models'), h('th', { class: 'num' }, 'Spans'), h('th', { class: 'num' }, 'Tokens'), h('th', { class: 'num' }, 'Cost'), h('th', { class: 'num' }, 'Latency'), h('th', {}, 'Status'), h('th', {}, 'When'))),
+    h('tbody', {}, tr.results.map((x: any) => { const to = P(`/llm/traces/${encodeURIComponent(x.id)}?ts=${x.timestamp}`); return h('tr', { class: 'clickable', onclick: () => nav(to) },
+      h('td', {}, link(to, h('b', {}, x.name ?? x.id)), h('div', { class: 'muted small mono' }, x.id.length > 40 ? x.id.slice(0, 40) + '…' : x.id)), h('td', { class: 'small' }, x.distinct_id),
+      h('td', { class: 'small mono' }, x.models.join(', ') || '–'), h('td', { class: 'num' }, fmt(x.spans)), h('td', { class: 'num' }, fmt(x.input_tokens + x.output_tokens)), h('td', { class: 'num' }, usd(x.cost_usd)), h('td', { class: 'num' }, ms(x.latency_ms)),
+      h('td', {}, x.status === 'error' ? h('span', { class: 'tag lvl-crit', title: x.error ?? '' }, 'error') : h('span', { class: 'tag status-complete' }, 'ok')), h('td', { class: 'muted nowrap' }, ago(x.timestamp))); })))
+    : h('p', { class: 'muted empty' }, 'No traces match.'));
+  shell('LLM analytics', [filters], h('section', { class: 'card' }, tabs, intro), ...(tab === 'overview' ? overview : [traces]));
+}
+function jsonBlock(v: unknown) {
+  if (v === null || v === undefined) return h('p', { class: 'muted small' }, 'none');
+  if (Array.isArray(v) && v.every(m => m && typeof m === 'object' && 'role' in m)) return h('div', { class: 'msgs' }, v.map((m: any) => h('div', { class: `msg role-${m.role}` }, h('div', { class: 'muted small' }, m.role), h('pre', { class: 'code wrap' }, typeof m.content === 'string' ? m.content : JSON.stringify(m.content, null, 2)))));
+  return h('pre', { class: 'code wrap' }, typeof v === 'string' ? v : JSON.stringify(v, null, 2));
+}
+async function llmTracePage(id: string) {
+  shell('Trace', [], loading());
+  const ts = new URLSearchParams(location.search).get('ts');
+  const t = await api<any>(apiP(`/llm/traces/${encodeURIComponent(id)}${ts ? `?ts=${ts}` : ''}`));
+  const total = Math.max(1, t.latency_ms ?? 1, ...flat(t.tree).map((x: any) => (x.offset_ms ?? 0) + (x.latency_ms ?? 0)));
+  function flat(ns: any[], d = 0): any[] { return ns.flatMap(n => [{ ...n, depth: d }, ...flat(n.children ?? [], d + 1)]); }
+  const detail = h('div', {});
+  const show = (n: any) => detail.replaceChildren(h('div', { class: 'card' }, h('h2', {}, n.name ?? n.event, ' ', h('span', { class: 'tag' }, n.event.replace('$ai_', ''))),
+    h('dl', { class: 'facts' }, n.model ? [h('dt', {}, 'Model'), h('dd', { class: 'mono' }, n.model, n.provider ? ` · ${n.provider}` : '')] : null,
+      h('dt', {}, 'Latency'), h('dd', {}, ms(n.latency_ms)), n.input_tokens || n.output_tokens ? [h('dt', {}, 'Tokens'), h('dd', {}, `${fmt(n.input_tokens)} in · ${fmt(n.output_tokens)} out`, n.cache_read_tokens ? ` · ${fmt(n.cache_read_tokens)} cached` : '')] : null,
+      n.cost_usd !== null && n.cost_usd !== undefined ? [h('dt', {}, 'Cost'), h('dd', {}, usd(n.cost_usd), h('span', { class: 'muted small' }, n.cost_source === 'sdk' ? ' (from SDK)' : ' (list price)'))] : null,
+      n.is_error ? [h('dt', {}, 'Error'), h('dd', { class: 'error' }, n.error ?? `HTTP ${n.http_status ?? ''}`)] : null),
+    h('details', { open: true }, h('summary', {}, h('b', {}, 'Input')), jsonBlock(n.input)), h('details', { open: true }, h('summary', {}, h('b', {}, 'Output')), jsonBlock(n.output)),
+    n.tools ? h('details', {}, h('summary', {}, 'Tools'), jsonBlock(n.tools)) : null));
+  const rows = flat(t.tree);
+  const wf = h('div', { class: 'waterfall' }, rows.map((n: any) => { const row = h('div', { class: `wf-row${n.is_error ? ' wf-err' : ''}`, tabindex: '0', onclick: () => { wf.querySelectorAll('.wf-row').forEach(x => x.classList.remove('active')); row.classList.add('active'); show(n); } },
+    h('div', { class: 'wf-name', style: `padding-left:${n.depth * 16}px` }, h('span', { class: `tag wf-${n.event.replace('$ai_', '')}` }, n.event.replace('$ai_', '')), ' ', n.name ?? '', n.model && n.name !== n.model ? h('span', { class: 'muted small mono' }, ` ${n.model}`) : null),
+    h('div', { class: 'wf-track' }, h('div', { class: 'wf-bar', style: `left:${(100 * (n.offset_ms ?? 0) / total).toFixed(2)}%;width:${Math.max(0.5, 100 * (n.latency_ms ?? 0) / total).toFixed(2)}%` }), h('span', { class: 'wf-ms small muted' }, ms(n.latency_ms)))); return row; }));
+  shell(h('span', {}, link(P('/llm?tab=traces'), 'Traces'), ' / ', t.name ?? id), [],
+    h('section', { class: 'card' }, h('div', { class: 'stats' }, h('div', { class: 'stat' }, h('div', { class: 'stat-v' }, ms(t.latency_ms)), h('div', { class: 'stat-l' }, 'Latency')),
+      h('div', { class: 'stat' }, h('div', { class: 'stat-v' }, fmt(t.input_tokens + t.output_tokens)), h('div', { class: 'stat-l' }, 'Tokens')), h('div', { class: 'stat' }, h('div', { class: 'stat-v' }, usd(t.cost_usd)), h('div', { class: 'stat-l' }, 'Cost')),
+      h('div', { class: 'stat' }, h('div', { class: 'stat-v' }, t.status === 'error' ? h('span', { class: 'error' }, 'error') : 'ok'), h('div', { class: 'stat-l' }, 'Status'))),
+      h('p', { class: 'small muted' }, when(t.timestamp), ' · ', t.person ? link(P(`/persons/${encodeURIComponent(t.person.id)}`), t.person.name) : t.distinct_id, t.session_id ? [' · ', link(P(`/replay/${encodeURIComponent(t.session_id)}`), 'session')] : null, ' · ', h('code', {}, id))),
+    h('div', { class: 'cols' }, h('section', { class: 'card' }, h('h2', {}, 'Spans'), rows.length ? wf : h('p', { class: 'muted' }, 'No spans.'),
+      t.input || t.output ? h('div', {}, h('h3', {}, 'Trace input / output'), h('details', {}, h('summary', {}, 'Input'), jsonBlock(t.input)), h('details', {}, h('summary', {}, 'Output'), jsonBlock(t.output))) : null), detail));
+  const first = rows.find((n: any) => n.event === '$ai_generation') ?? rows[0]; if (first) { show(first); (wf.children[rows.indexOf(first)] as HTMLElement)?.classList.add('active'); }
 }
 
 // ---------- router ----------
@@ -1391,11 +1588,14 @@ async function render() {
   try {
     if (path === '/login') return await authPage('login');
     if (path === '/signup') return await authPage('signup');
+    if (!cfg) cfg = await api('/api/config');
     if (!me) {
       try { me = await api('/api/me'); } catch (e) { if (e instanceof ApiError && e.status === 401) return nav('/login'); throw e; }
       projects = await api('/api/projects');
+      document.body.classList.toggle('demo', demo());
     }
-    if (path === '/account') return await accountPage();
+    if (path === '/account') return demo() ? nav('/login') : await accountPage();
+    if (!projects.length && demo()) return blank(h('h1', {}, APP), h('p', { class: 'muted' }, 'This public demo has no demo project yet.'), h('p', { class: 'small' }, link('/login', 'Owner sign in')));
     if (!projects.length) return onboarding();
     const m = /^\/project\/(\d+)(\/.*)?$/.exec(path);
     if (!m || !projects.some(p => p.id === +m[1])) return nav(`/project/${projects[0].id}/dashboards`);
@@ -1417,6 +1617,8 @@ async function render() {
     if (sub === '/usage') return await usagePage();
     if (sub === '/errors') return await errorsPage();
     if ((r = /^\/errors\/([0-9a-f-]{36})$/.exec(sub))) return await errorPage(r[1]);
+    if (sub === '/llm') return await llmPage();
+    if ((r = /^\/llm\/traces\/([^/]+)$/.exec(sub))) return await llmTracePage(decodeURIComponent(r[1]));
     if (sub === '/replay') return await replayListPage();
     if ((r = /^\/replay\/([^/]+)$/.exec(sub))) return await replayPage(decodeURIComponent(r[1]));
     if (sub === '/experiments') return await experimentsPage();

@@ -104,3 +104,27 @@ describe('exception fingerprints (0.5)', () => {
   it('filenames', () => { for (const c of (V as any).fingerprints.filenames) expect(normalizeFilename(c.filename)).toBe(c.expect); });
   it('messages', () => { for (const c of (V as any).fingerprints.messages) expect(normalizeMessage(c.message)).toBe(c.expect); });
 });
+
+// 0.6 vectors
+import { validateMap as validateMap06 } from '../src/shared/sourcemap';
+import { costOf } from '../src/shared/llm-pricing';
+import { cleanSuppressionRule, suppressed, releaseOf } from '../src/worker/errors';
+const inline = (m: any): any => JSON.parse(JSON.stringify(m).replaceAll('"$source_maps.map"', JSON.stringify((V as any).source_maps.map)));
+describe('sectioned source maps (0.6)', () => {
+  const sm = (V as any).source_map_sections;
+  const d = decodeMap(inline(sm.map));
+  for (const c of sm.positions) it(`${c.line}:${c.column}`, () => expect(originalPosition(d, c.line, c.column)).toEqual(c.expect));
+  it('rejects invalid index maps', () => { for (const c of sm.invalid) expect(validateMap06(inline(c.map)), c.reason).toBeTruthy(); });
+});
+describe('LLM costs (0.6)', () => {
+  for (const c of (V as any).llm_costs.cases) it(c.name, () => {
+    const r = costOf(c.properties); expect(r.source).toBe(c.expect.source);
+    if (c.expect.usd === null) expect(r.usd).toBeNull(); else expect(r.usd).toBeCloseTo(c.expect.usd, 9);
+  });
+});
+describe('suppression rules (0.6)', () => {
+  for (const c of (V as any).suppression_rules.cases) it(c.name, () => {
+    const w = cleanSuppressionRule(c.rule); expect(w).toEqual(c.wire); expect(suppressed([w], c.exception_list)).toBe(c.expect);
+  });
+});
+describe('releases (0.6)', () => { it('reads the release property', () => { for (const c of (V as any).releases.cases) expect(releaseOf(c.properties)).toBe(c.expect); }); });

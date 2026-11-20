@@ -1,1241 +1,1751 @@
 {
- "about": "Worked examples for protocol.md. Sources are PostHog MIT code paths (rust/capture, rust/common/types, rust/feature-flags, nodejs persons) at posthog commit 0f73d659, or runtime captures of posthog-js 1.450.1 and posthog-node 6.0.3. Times are ms since the Unix epoch unless an ISO string is shown.",
- "timestamps": {
-  "source": "rust/common/types/src/timestamp.rs tests",
-  "now": "2023-01-01T12:00:00Z",
-  "cases": [
-   {
-    "name": "client clock ahead by 10s",
-    "timestamp": "2023-01-01T11:00:00Z",
-    "sent_at": "2023-01-01T12:00:10Z",
-    "expect": "2023-01-01T10:59:50Z"
-   },
-   {
-    "name": "client clock behind by 10s",
-    "timestamp": "2023-01-01T11:00:00Z",
-    "sent_at": "2023-01-01T11:59:50Z",
-    "expect": "2023-01-01T11:00:10Z"
-   },
-   {
-    "name": "clocks aligned",
-    "timestamp": "2023-01-01T11:00:00Z",
-    "sent_at": "2023-01-01T12:00:00Z",
-    "expect": "2023-01-01T11:00:00Z"
-   },
-   {
-    "name": "no sent_at: timestamp as sent",
-    "timestamp": "2023-01-01T11:00:00Z",
-    "expect": "2023-01-01T11:00:00Z"
-   },
-   {
-    "name": "ignore_sent_at",
-    "timestamp": "2023-01-01T11:00:00Z",
-    "sent_at": "2023-01-01T12:00:10Z",
-    "ignore_sent_at": true,
-    "expect": "2023-01-01T11:00:00Z"
-   },
-   {
-    "name": "nothing: now",
-    "expect": "2023-01-01T12:00:00Z"
-   },
-   {
-    "name": "sent_at alone: now",
-    "sent_at": "2023-01-01T12:00:10Z",
-    "expect": "2023-01-01T12:00:00Z"
-   },
-   {
-    "name": "offset wins",
-    "timestamp": "2023-01-01T11:00:00Z",
-    "sent_at": "2023-01-01T12:00:10Z",
-    "offset": 5000,
-    "expect": "2023-01-01T11:59:55Z"
-   },
-   {
-    "name": "unparseable timestamp: now",
-    "timestamp": "not a date",
-    "expect": "2023-01-01T12:00:00Z"
-   },
-   {
-    "name": "offset out of range is ignored (no timestamp)",
-    "offset": -8300000000000000,
-    "expect": "2023-01-01T12:00:00Z"
-   },
-   {
-    "name": "offset out of range is ignored (timestamp kept)",
-    "timestamp": "2023-01-01T11:00:00Z",
-    "offset": 9007199254740991,
-    "expect": "2023-01-01T11:00:00Z"
-   },
-   {
-    "name": "more than 23h in the future: now",
-    "timestamp": "2023-01-03T12:00:00Z",
-    "expect": "2023-01-01T12:00:00Z"
-   },
-   {
-    "name": "22h in the future is kept",
-    "timestamp": "2023-01-02T10:00:00Z",
-    "expect": "2023-01-02T10:00:00Z"
-   },
-   {
-    "name": "+HH zone gets :00",
-    "timestamp": "2023-01-01T14:00:00.000+03",
-    "expect": "2023-01-01T11:00:00Z"
-   },
-   {
-    "name": "zone-less time is UTC",
-    "timestamp": "2023-01-01T11:00:00",
-    "expect": "2023-01-01T11:00:00Z"
-   }
-  ]
- },
- "tokens": {
-  "source": "rust/capture/src/token.rs",
-  "valid": [
-   "phc_abc123",
-   "a",
-   "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-   "with space"
-  ],
-  "invalid": [
-   {
-    "token": "",
-    "reason": "empty"
-   },
-   {
-    "token": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-    "reason": "too_long"
-   },
-   {
-    "token": "phc_é",
-    "reason": "not_ascii"
-   },
-   {
-    "token": "phx_personalkey",
-    "reason": "personal_api_key"
-   },
-   {
-    "token": "a\u0000b",
-    "reason": "null_byte"
-   }
-  ]
- },
- "flag_hash": {
-  "source": "rust/feature-flags/src/flags/flag_matching_utils.rs (calculate_hash) and test_flag_matching.rs",
-  "rule": "SHA-1 of prefix + identifier + salt; first 15 hex digits as an integer / 0xfffffffffffffff",
-  "cases": [
-   {
-    "prefix": "holdout-",
-    "id": "some_distinct_id",
-    "salt": "",
-    "hash": 0.7270002403585725
-   },
-   {
-    "prefix": "holdout-",
-    "id": "test-identifier",
-    "salt": "",
-    "hash": 0.4493881716040236
-   },
-   {
-    "prefix": "holdout-",
-    "id": "example_id",
-    "salt": "",
-    "hash": 0.9402003475831224
-   },
-   {
-    "prefix": "holdout-",
-    "id": "example_id2",
-    "salt": "",
-    "hash": 0.6292740389966519
-   }
-  ],
-  "variants": {
-   "flag": {
-    "id": 1,
-    "key": "beta-feature",
-    "version": 1,
-    "active": true,
-    "filters": {
-     "groups": [
+  "about": "Worked examples for protocol.md. Sources are PostHog MIT code paths (rust/capture, rust/common/types, rust/feature-flags, nodejs persons) at posthog commit 0f73d659, or runtime captures of posthog-js 1.450.1 and posthog-node 6.0.3. Times are ms since the Unix epoch unless an ISO string is shown. 0.6 adds sectioned source maps (ECMA-426 index maps), LLM cost, posthog-js suppression rules and release properties.",
+  "timestamps": {
+    "source": "rust/common/types/src/timestamp.rs tests",
+    "now": "2023-01-01T12:00:00Z",
+    "cases": [
       {
-       "properties": [],
-       "rollout_percentage": null
+        "name": "client clock ahead by 10s",
+        "timestamp": "2023-01-01T11:00:00Z",
+        "sent_at": "2023-01-01T12:00:10Z",
+        "expect": "2023-01-01T10:59:50Z"
+      },
+      {
+        "name": "client clock behind by 10s",
+        "timestamp": "2023-01-01T11:00:00Z",
+        "sent_at": "2023-01-01T11:59:50Z",
+        "expect": "2023-01-01T11:00:10Z"
+      },
+      {
+        "name": "clocks aligned",
+        "timestamp": "2023-01-01T11:00:00Z",
+        "sent_at": "2023-01-01T12:00:00Z",
+        "expect": "2023-01-01T11:00:00Z"
+      },
+      {
+        "name": "no sent_at: timestamp as sent",
+        "timestamp": "2023-01-01T11:00:00Z",
+        "expect": "2023-01-01T11:00:00Z"
+      },
+      {
+        "name": "ignore_sent_at",
+        "timestamp": "2023-01-01T11:00:00Z",
+        "sent_at": "2023-01-01T12:00:10Z",
+        "ignore_sent_at": true,
+        "expect": "2023-01-01T11:00:00Z"
+      },
+      {
+        "name": "nothing: now",
+        "expect": "2023-01-01T12:00:00Z"
+      },
+      {
+        "name": "sent_at alone: now",
+        "sent_at": "2023-01-01T12:00:10Z",
+        "expect": "2023-01-01T12:00:00Z"
+      },
+      {
+        "name": "offset wins",
+        "timestamp": "2023-01-01T11:00:00Z",
+        "sent_at": "2023-01-01T12:00:10Z",
+        "offset": 5000,
+        "expect": "2023-01-01T11:59:55Z"
+      },
+      {
+        "name": "unparseable timestamp: now",
+        "timestamp": "not a date",
+        "expect": "2023-01-01T12:00:00Z"
+      },
+      {
+        "name": "offset out of range is ignored (no timestamp)",
+        "offset": -8300000000000000,
+        "expect": "2023-01-01T12:00:00Z"
+      },
+      {
+        "name": "offset out of range is ignored (timestamp kept)",
+        "timestamp": "2023-01-01T11:00:00Z",
+        "offset": 9007199254740991,
+        "expect": "2023-01-01T11:00:00Z"
+      },
+      {
+        "name": "more than 23h in the future: now",
+        "timestamp": "2023-01-03T12:00:00Z",
+        "expect": "2023-01-01T12:00:00Z"
+      },
+      {
+        "name": "22h in the future is kept",
+        "timestamp": "2023-01-02T10:00:00Z",
+        "expect": "2023-01-02T10:00:00Z"
+      },
+      {
+        "name": "+HH zone gets :00",
+        "timestamp": "2023-01-01T14:00:00.000+03",
+        "expect": "2023-01-01T11:00:00Z"
+      },
+      {
+        "name": "zone-less time is UTC",
+        "timestamp": "2023-01-01T11:00:00",
+        "expect": "2023-01-01T11:00:00Z"
       }
-     ],
-     "multivariate": {
-      "variants": [
-       {
-        "key": "first-variant",
-        "rollout_percentage": 50
-       },
-       {
-        "key": "second-variant",
-        "rollout_percentage": 25
-       },
-       {
-        "key": "third-variant",
-        "rollout_percentage": 25
-       }
+    ]
+  },
+  "tokens": {
+    "source": "rust/capture/src/token.rs",
+    "valid": [
+      "phc_abc123",
+      "a",
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "with space"
+    ],
+    "invalid": [
+      {
+        "token": "",
+        "reason": "empty"
+      },
+      {
+        "token": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "reason": "too_long"
+      },
+      {
+        "token": "phc_é",
+        "reason": "not_ascii"
+      },
+      {
+        "token": "phx_personalkey",
+        "reason": "personal_api_key"
+      },
+      {
+        "token": "a\u0000b",
+        "reason": "null_byte"
+      }
+    ]
+  },
+  "flag_hash": {
+    "source": "rust/feature-flags/src/flags/flag_matching_utils.rs (calculate_hash) and test_flag_matching.rs",
+    "rule": "SHA-1 of prefix + identifier + salt; first 15 hex digits as an integer / 0xfffffffffffffff",
+    "cases": [
+      {
+        "prefix": "holdout-",
+        "id": "some_distinct_id",
+        "salt": "",
+        "hash": 0.7270002403585725
+      },
+      {
+        "prefix": "holdout-",
+        "id": "test-identifier",
+        "salt": "",
+        "hash": 0.4493881716040236
+      },
+      {
+        "prefix": "holdout-",
+        "id": "example_id",
+        "salt": "",
+        "hash": 0.9402003475831224
+      },
+      {
+        "prefix": "holdout-",
+        "id": "example_id2",
+        "salt": "",
+        "hash": 0.6292740389966519
+      }
+    ],
+    "variants": {
+      "flag": {
+        "id": 1,
+        "key": "beta-feature",
+        "version": 1,
+        "active": true,
+        "filters": {
+          "groups": [
+            {
+              "properties": [],
+              "rollout_percentage": null
+            }
+          ],
+          "multivariate": {
+            "variants": [
+              {
+                "key": "first-variant",
+                "rollout_percentage": 50
+              },
+              {
+                "key": "second-variant",
+                "rollout_percentage": 25
+              },
+              {
+                "key": "third-variant",
+                "rollout_percentage": 25
+              }
+            ]
+          }
+        }
+      },
+      "expect": {
+        "3": "third-variant",
+        "11": "first-variant",
+        "example_id": "second-variant"
+      }
+    },
+    "rollout": [
+      {
+        "rollout_percentage": 0,
+        "distinct_id": "test_user",
+        "enabled": false,
+        "reason": "out_of_rollout_bound"
+      },
+      {
+        "rollout_percentage": 100,
+        "distinct_id": "test_user",
+        "enabled": true,
+        "reason": "condition_match"
+      }
+    ]
+  },
+  "property_match": {
+    "source": "rust/feature-flags/src/properties/property_matching.rs",
+    "cases": [
+      {
+        "filter": {
+          "key": "email",
+          "value": "A@Example.com",
+          "operator": "exact"
+        },
+        "props": {
+          "email": "a@example.com"
+        },
+        "match": true
+      },
+      {
+        "filter": {
+          "key": "plan",
+          "value": [
+            "pro",
+            "team"
+          ],
+          "operator": "exact"
+        },
+        "props": {
+          "plan": "team"
+        },
+        "match": true
+      },
+      {
+        "filter": {
+          "key": "plan",
+          "value": [
+            "pro"
+          ],
+          "operator": "exact"
+        },
+        "props": {},
+        "match": false
+      },
+      {
+        "filter": {
+          "key": "plan",
+          "value": [
+            "pro"
+          ],
+          "operator": "is_not"
+        },
+        "props": {},
+        "match": true
+      },
+      {
+        "filter": {
+          "key": "plan",
+          "value": [
+            "pro"
+          ],
+          "operator": "is_not"
+        },
+        "props": {
+          "plan": "pro"
+        },
+        "match": false
+      },
+      {
+        "filter": {
+          "key": "n",
+          "value": 5,
+          "operator": "exact"
+        },
+        "props": {
+          "n": "5"
+        },
+        "match": true
+      },
+      {
+        "filter": {
+          "key": "flag",
+          "value": "true",
+          "operator": "exact"
+        },
+        "props": {
+          "flag": true
+        },
+        "match": true
+      },
+      {
+        "filter": {
+          "key": "email",
+          "value": "EXAMPLE",
+          "operator": "icontains"
+        },
+        "props": {
+          "email": "a@example.com"
+        },
+        "match": true
+      },
+      {
+        "filter": {
+          "key": "email",
+          "value": "example",
+          "operator": "not_icontains"
+        },
+        "props": {
+          "email": "a@example.com"
+        },
+        "match": false
+      },
+      {
+        "filter": {
+          "key": "email",
+          "value": "@example\\.com$",
+          "operator": "regex"
+        },
+        "props": {
+          "email": "a@example.com"
+        },
+        "match": true
+      },
+      {
+        "filter": {
+          "key": "age",
+          "value": 18,
+          "operator": "gt"
+        },
+        "props": {
+          "age": 21
+        },
+        "match": true
+      },
+      {
+        "filter": {
+          "key": "age",
+          "value": "18",
+          "operator": "lte"
+        },
+        "props": {
+          "age": "18"
+        },
+        "match": true
+      },
+      {
+        "filter": {
+          "key": "age",
+          "value": 18,
+          "operator": "gt"
+        },
+        "props": {
+          "age": "old"
+        },
+        "match": false
+      },
+      {
+        "filter": {
+          "key": "email",
+          "operator": "is_set"
+        },
+        "props": {
+          "email": "x"
+        },
+        "match": true
+      },
+      {
+        "filter": {
+          "key": "email",
+          "operator": "is_not_set"
+        },
+        "props": {},
+        "match": true
+      }
+    ]
+  },
+  "illegal_distinct_ids": {
+    "source": "nodejs/src/common/persons/person-utils.ts",
+    "never_merge": [
+      "anonymous",
+      "Guest",
+      "DISTINCT_ID",
+      "distinctid",
+      "id",
+      "not_authenticated",
+      "email",
+      "undefined",
+      "true",
+      "False",
+      "[object Object]",
+      "NaN",
+      "None",
+      "none",
+      "null",
+      "0",
+      "\"null\"",
+      "'undefined'",
+      "",
+      "   "
+    ],
+    "allowed": [
+      "NULL",
+      "nan",
+      "user-1",
+      "u@example.com",
+      "00"
+    ]
+  },
+  "bodies": {
+    "source": "rust/capture/src/payload (decompression.rs, types.rs) and posthog-js 1.450.1 runtime capture",
+    "json": "{\"api_key\":\"phc_vectortoken\",\"sent_at\":\"2026-11-18T12:00:00.000Z\",\"batch\":[{\"event\":\"$pageview\",\"properties\":{\"distinct_id\":\"d1\",\"$current_url\":\"https://example.com/\"},\"timestamp\":\"2026-11-18T11:59:59.000Z\"}]}",
+    "cases": [
+      {
+        "name": "plain JSON",
+        "content_type": "application/json",
+        "body_base64": "eyJhcGlfa2V5IjoicGhjX3ZlY3RvcnRva2VuIiwic2VudF9hdCI6IjIwMjYtMTEtMThUMTI6MDA6MDAuMDAwWiIsImJhdGNoIjpbeyJldmVudCI6IiRwYWdldmlldyIsInByb3BlcnRpZXMiOnsiZGlzdGluY3RfaWQiOiJkMSIsIiRjdXJyZW50X3VybCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vIn0sInRpbWVzdGFtcCI6IjIwMjYtMTEtMThUMTE6NTk6NTkuMDAwWiJ9XX0="
+      },
+      {
+        "name": "gzip with no hint (posthog-js 1.450 default: text/plain, no compression param)",
+        "content_type": "text/plain",
+        "body_base64": "H4sIAAAAAAAAA13O0QqCMBSH8Xf54+XUTTDyPEdXRciahxylju1ohfjuId11/8H3W2GDbx/8ASH0rl3YyRRlevAIhcSjtFZAqHR1yI3JzfFkKtKatC601mco3Ky4HnRZwQuPe5wFe+fF8wsKIU6Bo3hOoBWdT+JHJ63vQOgMFDI3x7h/5vgEoRcJicqS33YITy7cNJTYFMQPnMQO4Q9jqG6obn6Y7bp9AYkmygjRAAAA"
+      },
+      {
+        "name": "gzip-js hint",
+        "query": "compression=gzip-js",
+        "content_type": "text/plain",
+        "body_base64": "H4sIAAAAAAAAA13O0QqCMBSH8Xf54+XUTTDyPEdXRciahxylju1ohfjuId11/8H3W2GDbx/8ASH0rl3YyRRlevAIhcSjtFZAqHR1yI3JzfFkKtKatC601mco3Ky4HnRZwQuPe5wFe+fF8wsKIU6Bo3hOoBWdT+JHJ63vQOgMFDI3x7h/5vgEoRcJicqS33YITy7cNJTYFMQPnMQO4Q9jqG6obn6Y7bp9AYkmygjRAAAA"
+      },
+      {
+        "name": "Content-Encoding gzip (posthog-node v1)",
+        "content_encoding": "gzip",
+        "content_type": "application/json",
+        "body_base64": "H4sIAAAAAAAAA13O0QqCMBSH8Xf54+XUTTDyPEdXRciahxylju1ohfjuId11/8H3W2GDbx/8ASH0rl3YyRRlevAIhcSjtFZAqHR1yI3JzfFkKtKatC601mco3Ky4HnRZwQuPe5wFe+fF8wsKIU6Bo3hOoBWdT+JHJ63vQOgMFDI3x7h/5vgEoRcJicqS33YITy7cNJTYFMQPnMQO4Q9jqG6obn6Y7bp9AYkmygjRAAAA"
+      },
+      {
+        "name": "lz64 hint",
+        "query": "compression=lz64",
+        "content_type": "application/x-www-form-urlencoded",
+        "body_base64": "ZGF0YT1ONElnaGdEZ2xnJTJCZzFnVXdKNGdGd2dnQ3dNWXdHNExZQXVBOWdFNm1JQjJJQU5DQU00SlZFeGhGb2dCTUFERndHd0JhQUl6Q1JBRGdBcXdycWg0ODVQQUhUeWVBTFRvZ0FSdTJ5WTBBYlZBSUNMVGdCSUlZQU9ZbW9DQU82YUlaRWhBUVY3RE5LQUFtVUJpSW9LbUlZS0Y5T1gyRk5jMndBVnpJeVpsWUVnQnRPVENJaUNBWlVBSG84aEFBUE1BQmJDRlNFSld3U1VyeVFBRjk2SU5LRVFMS0lUbDRCRVRGaEtWRlVBRllBVG1HUmxYa05Cb0JkQnFB"
+      },
+      {
+        "name": "form data= base64",
+        "content_type": "application/x-www-form-urlencoded",
+        "body_base64": "ZGF0YT1leUpoY0dsZmEyVjVJam9pY0doalgzWmxZM1J2Y25SdmEyVnVJaXdpYzJWdWRGOWhkQ0k2SWpJd01qWXRNVEV0TVRoVU1USTZNREE2TURBdU1EQXdXaUlzSW1KaGRHTm9JanBiZXlKbGRtVnVkQ0k2SWlSd1lXZGxkbWxsZHlJc0luQnliM0JsY25ScFpYTWlPbnNpWkdsemRHbHVZM1JmYVdRaU9pSmtNU0lzSWlSamRYSnlaVzUwWDNWeWJDSTZJbWgwZEhCek9pOHZaWGhoYlhCc1pTNWpiMjB2SW4wc0luUnBiV1Z6ZEdGdGNDSTZJakl3TWpZdE1URXRNVGhVTVRFNk5UazZOVGt1TURBd1dpSjlYWDAlM0Q="
+      },
+      {
+        "name": "raw base64 body",
+        "content_type": "text/plain",
+        "body_base64": "ZXlKaGNHbGZhMlY1SWpvaWNHaGpYM1psWTNSdmNuUnZhMlZ1SWl3aWMyVnVkRjloZENJNklqSXdNall0TVRFdE1UaFVNVEk2TURBNk1EQXVNREF3V2lJc0ltSmhkR05vSWpwYmV5SmxkbVZ1ZENJNklpUndZV2RsZG1sbGR5SXNJbkJ5YjNCbGNuUnBaWE1pT25zaVpHbHpkR2x1WTNSZmFXUWlPaUprTVNJc0lpUmpkWEp5Wlc1MFgzVnliQ0k2SW1oMGRIQnpPaTh2WlhoaGJYQnNaUzVqYjIwdkluMHNJblJwYldWemRHRnRjQ0k2SWpJd01qWXRNVEV0TVRoVU1URTZOVGs2TlRrdU1EQXdXaUo5WFgwPQ=="
+      }
+    ]
+  },
+  "capture_responses": {
+    "legacy": {
+      "status": 200,
+      "body": {
+        "status": 1
+      },
+      "beacon": {
+        "query": "beacon=1",
+        "status": 204
+      }
+    },
+    "v1": {
+      "status": 200,
+      "body": {
+        "results": {
+          "01890000-0000-7000-8000-000000000001": {
+            "result": "ok"
+          }
+        }
+      }
+    },
+    "errors": [
+      {
+        "path": "/e/",
+        "body": "{\"batch\":[]}",
+        "status": 400,
+        "code": "empty_batch",
+        "note": "empty batch"
+      },
+      {
+        "path": "/e/",
+        "body": "{\"batch\":[{\"event\":\"x\",\"distinct_id\":\"d\"}]}",
+        "status": 401,
+        "type": "authentication_error",
+        "code": "no_token",
+        "note": "no token"
+      },
+      {
+        "path": "/e/",
+        "body": "{\"api_key\":\"phx_abc\",\"batch\":[{\"event\":\"x\",\"distinct_id\":\"d\"}]}",
+        "status": 401,
+        "type": "authentication_error",
+        "code": "invalid_token",
+        "note": "personal key as project token"
+      },
+      {
+        "path": "/i/v1/analytics/events",
+        "headers": {},
+        "status": 401,
+        "note": "missing Authorization"
+      },
+      {
+        "path": "/i/v1/analytics/events",
+        "headers": {
+          "authorization": "Basic abc"
+        },
+        "status": 400,
+        "note": "not Bearer"
+      },
+      {
+        "path": "/i/v1/analytics/events",
+        "headers": {
+          "authorization": "Bearer phx_x"
+        },
+        "status": 401,
+        "note": "personal key"
+      },
+      {
+        "path": "/i/v1/analytics/events",
+        "headers": {
+          "authorization": "Bearer phc_x",
+          "content-encoding": "br"
+        },
+        "status": 415,
+        "note": "unsupported encoding"
+      }
+    ]
+  },
+  "persons": {
+    "source": "nodejs/src/ingestion/common/persons (identify / alias / merge)",
+    "scenarios": [
+      {
+        "name": "identify links the anonymous id",
+        "events": [
+          {
+            "event": "$pageview",
+            "distinct_id": "anon-1",
+            "properties": {
+              "$process_person_profile": false
+            }
+          },
+          {
+            "event": "$identify",
+            "distinct_id": "user-1",
+            "properties": {
+              "$anon_distinct_id": "anon-1"
+            },
+            "$set": {
+              "email": "u@example.com"
+            }
+          }
+        ],
+        "expect": {
+          "persons": [
+            {
+              "distinct_ids": [
+                "anon-1",
+                "user-1"
+              ],
+              "properties": {
+                "email": "u@example.com"
+              },
+              "is_identified": true
+            }
+          ],
+          "events_by_person": {
+            "user-1": 2
+          }
+        }
+      },
+      {
+        "name": "alias joins two ids",
+        "events": [
+          {
+            "event": "$set",
+            "distinct_id": "a",
+            "properties": {
+              "$set": {
+                "x": 1
+              }
+            }
+          },
+          {
+            "event": "$create_alias",
+            "distinct_id": "a",
+            "properties": {
+              "alias": "b"
+            }
+          }
+        ],
+        "expect": {
+          "persons": [
+            {
+              "distinct_ids": [
+                "a",
+                "b"
+              ],
+              "properties": {
+                "x": 1
+              },
+              "is_identified": true
+            }
+          ]
+        }
+      },
+      {
+        "name": "identify never merges two identified persons",
+        "events": [
+          {
+            "event": "$identify",
+            "distinct_id": "u1",
+            "properties": {}
+          },
+          {
+            "event": "$identify",
+            "distinct_id": "u2",
+            "properties": {}
+          },
+          {
+            "event": "$identify",
+            "distinct_id": "u2",
+            "properties": {
+              "$anon_distinct_id": "u1"
+            }
+          }
+        ],
+        "expect": {
+          "persons": [
+            {
+              "distinct_ids": [
+                "u1"
+              ]
+            },
+            {
+              "distinct_ids": [
+                "u2"
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "name": "$merge_dangerously merges identified persons",
+        "events": [
+          {
+            "event": "$identify",
+            "distinct_id": "u1",
+            "properties": {},
+            "$set": {
+              "a": 1,
+              "b": 1
+            }
+          },
+          {
+            "event": "$identify",
+            "distinct_id": "u2",
+            "properties": {},
+            "$set": {
+              "b": 2
+            }
+          },
+          {
+            "event": "$merge_dangerously",
+            "distinct_id": "u2",
+            "properties": {
+              "alias": "u1"
+            }
+          }
+        ],
+        "expect": {
+          "persons": [
+            {
+              "distinct_ids": [
+                "u1",
+                "u2"
+              ],
+              "properties": {
+                "a": 1,
+                "b": 2
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "illegal id does not merge",
+        "events": [
+          {
+            "event": "$identify",
+            "distinct_id": "user-9",
+            "properties": {
+              "$anon_distinct_id": "null"
+            }
+          }
+        ],
+        "expect": {
+          "persons": [
+            {
+              "distinct_ids": [
+                "user-9"
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "name": "$set_once keeps the first value, $unset removes",
+        "events": [
+          {
+            "event": "$set",
+            "distinct_id": "p",
+            "properties": {
+              "$set_once": {
+                "first": "a"
+              },
+              "$set": {
+                "k": 1
+              }
+            }
+          },
+          {
+            "event": "$set",
+            "distinct_id": "p",
+            "properties": {
+              "$set_once": {
+                "first": "b"
+              },
+              "$unset": [
+                "k"
+              ]
+            }
+          }
+        ],
+        "expect": {
+          "persons": [
+            {
+              "distinct_ids": [
+                "p"
+              ],
+              "properties": {
+                "first": "a"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "sampling": {
+    "source": "design.md \"Usage limits\": FNV-1a 32-bit over the UTF-16 code units of the key, divided by 2^32; kept when below the rate. Keys: cap:<distinct_id> (events past a cap), cap:<session_id> (replay past a cap), ac:<$session_id or distinct_id> (autocapture).",
+    "cases": [
+      {
+        "key": "cap:user-1",
+        "unit": 0.34798795776441693,
+        "kept_at_0_5": true,
+        "kept_at_0_25": false
+      },
+      {
+        "key": "cap:user-2",
+        "unit": 0.34408161393366754,
+        "kept_at_0_5": true,
+        "kept_at_0_25": false
+      },
+      {
+        "key": "ac:01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
+        "unit": 0.5421303973998874,
+        "kept_at_0_5": false,
+        "kept_at_0_25": false
+      },
+      {
+        "key": "cap:sess-a",
+        "unit": 0.11303425836376846,
+        "kept_at_0_5": true,
+        "kept_at_0_25": true
+      },
+      {
+        "key": "",
+        "unit": 0.5043428998906165,
+        "kept_at_0_5": false,
+        "kept_at_0_25": false
+      }
+    ]
+  },
+  "quota_limited": {
+    "source": "posthog-js 1.450.1 src/rate-limiter.ts (MIT): a capture response whose JSON has quota_limited: [batch keys] pauses those keys for 60 s. Batch keys: events (default), exceptionEvent, recordings.",
+    "capture_capped_drop": {
+      "status": 1,
+      "quota_limited": [
+        "events",
+        "exceptionEvent"
       ]
-     }
+    },
+    "snapshots_capped_drop": {
+      "status": 1,
+      "quota_limited": [
+        "recordings"
+      ]
+    },
+    "v1_capped_drop_has": {
+      "quota_limited": [
+        "events",
+        "exceptionEvent"
+      ]
+    },
+    "sample_mode": {
+      "status": 1
     }
-   },
-   "expect": {
-    "3": "third-variant",
-    "11": "first-variant",
-    "example_id": "second-variant"
-   }
   },
-  "rollout": [
-   {
-    "rollout_percentage": 0,
-    "distinct_id": "test_user",
-    "enabled": false,
-    "reason": "out_of_rollout_bound"
-   },
-   {
-    "rollout_percentage": 100,
-    "distinct_id": "test_user",
-    "enabled": true,
-    "reason": "condition_match"
-   }
-  ]
- },
- "property_match": {
-  "source": "rust/feature-flags/src/properties/property_matching.rs",
-  "cases": [
-   {
-    "filter": {
-     "key": "email",
-     "value": "A@Example.com",
-     "operator": "exact"
+  "source_maps": {
+    "source": "Source Map Revision 3 (tc39.es/ecma426); map and frames from tests/fixtures/v05-errors.json (esbuild bundle, posthog-js frames). Lines and columns are 1-based like stack traces.",
+    "map": {
+      "version": 3,
+      "sources": [
+        "app-src.js"
+      ],
+      "sourcesContent": [
+        "// Small \"site\" bundle used to produce real minified stack traces and a source map (fixtures for 0.5 error tracking).\nfunction parsePrice(raw) {\n  if (typeof raw !== 'number') {\n    const err = new TypeError('Price must be a number, got ' + typeof raw);\n    throw err;\n  }\n  return raw;\n}\nfunction computeTotal(cart) {\n  let sum = 0;\n  for (const item of cart.items) sum += parsePrice(item.price) * item.qty;\n  return sum;\n}\nexport function checkout(cart) {\n  return computeTotal(cart);\n}\nexport async function loadProfile(id) {\n  await new Promise(r => setTimeout(r, 5));\n  throw new Error('Profile ' + id + ' not found');\n}\nwindow.shop = {\n  throwUnhandled() { setTimeout(() => { checkout({ items: [{ price: '12', qty: 1 }] }); }, 0); },\n  rejectUnhandled() { loadProfile(42); },\n  manual() { try { checkout({ items: [{ price: null, qty: 2 }] }); } catch (e) { window.posthog.captureException(e, { cart_size: 1 }); } },\n  custom() { window.posthog.captureException(new RangeError('Quantity out of range'), { $exception_fingerprint: 'qty-range' }); },\n};\n"
+      ],
+      "mappings": "MACA,SAASA,EAAWC,EAAK,CACvB,GAAI,OAAOA,GAAQ,SAEjB,MADY,IAAI,UAAU,+BAAiC,OAAOA,CAAG,EAGvE,OAAOA,CACT,CACA,SAASC,EAAaC,EAAM,CAC1B,IAAIC,EAAM,EACV,QAAWC,KAAQF,EAAK,MAAOC,GAAOJ,EAAWK,EAAK,KAAK,EAAIA,EAAK,IACpE,OAAOD,CACT,CACO,SAASE,EAASH,EAAM,CAC7B,OAAOD,EAAaC,CAAI,CAC1B,CACA,eAAsBI,EAAYC,EAAI,CACpC,YAAM,IAAI,QAAQC,GAAK,WAAWA,EAAG,CAAC,CAAC,EACjC,IAAI,MAAM,WAAaD,EAAK,YAAY,CAChD,CACA,OAAO,KAAO,CACZ,gBAAiB,CAAE,WAAW,IAAM,CAAEF,EAAS,CAAE,MAAO,CAAC,CAAE,MAAO,KAAM,IAAK,CAAE,CAAC,CAAE,CAAC,CAAG,EAAG,CAAC,CAAG,EAC7F,iBAAkB,CAAEC,EAAY,EAAE,CAAG,EACrC,QAAS,CAAE,GAAI,CAAED,EAAS,CAAE,MAAO,CAAC,CAAE,MAAO,KAAM,IAAK,CAAE,CAAC,CAAE,CAAC,CAAG,OAAS,EAAG,CAAE,OAAO,QAAQ,iBAAiB,EAAG,CAAE,UAAW,CAAE,CAAC,CAAG,CAAE,EACvI,QAAS,CAAE,OAAO,QAAQ,iBAAiB,IAAI,WAAW,uBAAuB,EAAG,CAAE,uBAAwB,WAAY,CAAC,CAAG,CAChI",
+      "names": [
+        "parsePrice",
+        "raw",
+        "computeTotal",
+        "cart",
+        "sum",
+        "item",
+        "checkout",
+        "loadProfile",
+        "id",
+        "r"
+      ]
     },
-    "props": {
-     "email": "a@example.com"
-    },
-    "match": true
-   },
-   {
-    "filter": {
-     "key": "plan",
-     "value": [
-      "pro",
-      "team"
-     ],
-     "operator": "exact"
-    },
-    "props": {
-     "plan": "team"
-    },
-    "match": true
-   },
-   {
-    "filter": {
-     "key": "plan",
-     "value": [
-      "pro"
-     ],
-     "operator": "exact"
-    },
-    "props": {},
-    "match": false
-   },
-   {
-    "filter": {
-     "key": "plan",
-     "value": [
-      "pro"
-     ],
-     "operator": "is_not"
-    },
-    "props": {},
-    "match": true
-   },
-   {
-    "filter": {
-     "key": "plan",
-     "value": [
-      "pro"
-     ],
-     "operator": "is_not"
-    },
-    "props": {
-     "plan": "pro"
-    },
-    "match": false
-   },
-   {
-    "filter": {
-     "key": "n",
-     "value": 5,
-     "operator": "exact"
-    },
-    "props": {
-     "n": "5"
-    },
-    "match": true
-   },
-   {
-    "filter": {
-     "key": "flag",
-     "value": "true",
-     "operator": "exact"
-    },
-    "props": {
-     "flag": true
-    },
-    "match": true
-   },
-   {
-    "filter": {
-     "key": "email",
-     "value": "EXAMPLE",
-     "operator": "icontains"
-    },
-    "props": {
-     "email": "a@example.com"
-    },
-    "match": true
-   },
-   {
-    "filter": {
-     "key": "email",
-     "value": "example",
-     "operator": "not_icontains"
-    },
-    "props": {
-     "email": "a@example.com"
-    },
-    "match": false
-   },
-   {
-    "filter": {
-     "key": "email",
-     "value": "@example\\.com$",
-     "operator": "regex"
-    },
-    "props": {
-     "email": "a@example.com"
-    },
-    "match": true
-   },
-   {
-    "filter": {
-     "key": "age",
-     "value": 18,
-     "operator": "gt"
-    },
-    "props": {
-     "age": 21
-    },
-    "match": true
-   },
-   {
-    "filter": {
-     "key": "age",
-     "value": "18",
-     "operator": "lte"
-    },
-    "props": {
-     "age": "18"
-    },
-    "match": true
-   },
-   {
-    "filter": {
-     "key": "age",
-     "value": 18,
-     "operator": "gt"
-    },
-    "props": {
-     "age": "old"
-    },
-    "match": false
-   },
-   {
-    "filter": {
-     "key": "email",
-     "operator": "is_set"
-    },
-    "props": {
-     "email": "x"
-    },
-    "match": true
-   },
-   {
-    "filter": {
-     "key": "email",
-     "operator": "is_not_set"
-    },
-    "props": {},
-    "match": true
-   }
-  ]
- },
- "illegal_distinct_ids": {
-  "source": "nodejs/src/common/persons/person-utils.ts",
-  "never_merge": [
-   "anonymous",
-   "Guest",
-   "DISTINCT_ID",
-   "distinctid",
-   "id",
-   "not_authenticated",
-   "email",
-   "undefined",
-   "true",
-   "False",
-   "[object Object]",
-   "NaN",
-   "None",
-   "none",
-   "null",
-   "0",
-   "\"null\"",
-   "'undefined'",
-   "",
-   "   "
-  ],
-  "allowed": [
-   "NULL",
-   "nan",
-   "user-1",
-   "u@example.com",
-   "00"
-  ]
- },
- "bodies": {
-  "source": "rust/capture/src/payload (decompression.rs, types.rs) and posthog-js 1.450.1 runtime capture",
-  "json": "{\"api_key\":\"phc_vectortoken\",\"sent_at\":\"2026-11-18T12:00:00.000Z\",\"batch\":[{\"event\":\"$pageview\",\"properties\":{\"distinct_id\":\"d1\",\"$current_url\":\"https://example.com/\"},\"timestamp\":\"2026-11-18T11:59:59.000Z\"}]}",
-  "cases": [
-   {
-    "name": "plain JSON",
-    "content_type": "application/json",
-    "body_base64": "eyJhcGlfa2V5IjoicGhjX3ZlY3RvcnRva2VuIiwic2VudF9hdCI6IjIwMjYtMTEtMThUMTI6MDA6MDAuMDAwWiIsImJhdGNoIjpbeyJldmVudCI6IiRwYWdldmlldyIsInByb3BlcnRpZXMiOnsiZGlzdGluY3RfaWQiOiJkMSIsIiRjdXJyZW50X3VybCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vIn0sInRpbWVzdGFtcCI6IjIwMjYtMTEtMThUMTE6NTk6NTkuMDAwWiJ9XX0="
-   },
-   {
-    "name": "gzip with no hint (posthog-js 1.450 default: text/plain, no compression param)",
-    "content_type": "text/plain",
-    "body_base64": "H4sIAAAAAAAAA13O0QqCMBSH8Xf54+XUTTDyPEdXRciahxylju1ohfjuId11/8H3W2GDbx/8ASH0rl3YyRRlevAIhcSjtFZAqHR1yI3JzfFkKtKatC601mco3Ky4HnRZwQuPe5wFe+fF8wsKIU6Bo3hOoBWdT+JHJ63vQOgMFDI3x7h/5vgEoRcJicqS33YITy7cNJTYFMQPnMQO4Q9jqG6obn6Y7bp9AYkmygjRAAAA"
-   },
-   {
-    "name": "gzip-js hint",
-    "query": "compression=gzip-js",
-    "content_type": "text/plain",
-    "body_base64": "H4sIAAAAAAAAA13O0QqCMBSH8Xf54+XUTTDyPEdXRciahxylju1ohfjuId11/8H3W2GDbx/8ASH0rl3YyRRlevAIhcSjtFZAqHR1yI3JzfFkKtKatC601mco3Ky4HnRZwQuPe5wFe+fF8wsKIU6Bo3hOoBWdT+JHJ63vQOgMFDI3x7h/5vgEoRcJicqS33YITy7cNJTYFMQPnMQO4Q9jqG6obn6Y7bp9AYkmygjRAAAA"
-   },
-   {
-    "name": "Content-Encoding gzip (posthog-node v1)",
-    "content_encoding": "gzip",
-    "content_type": "application/json",
-    "body_base64": "H4sIAAAAAAAAA13O0QqCMBSH8Xf54+XUTTDyPEdXRciahxylju1ohfjuId11/8H3W2GDbx/8ASH0rl3YyRRlevAIhcSjtFZAqHR1yI3JzfFkKtKatC601mco3Ky4HnRZwQuPe5wFe+fF8wsKIU6Bo3hOoBWdT+JHJ63vQOgMFDI3x7h/5vgEoRcJicqS33YITy7cNJTYFMQPnMQO4Q9jqG6obn6Y7bp9AYkmygjRAAAA"
-   },
-   {
-    "name": "lz64 hint",
-    "query": "compression=lz64",
-    "content_type": "application/x-www-form-urlencoded",
-    "body_base64": "ZGF0YT1ONElnaGdEZ2xnJTJCZzFnVXdKNGdGd2dnQ3dNWXdHNExZQXVBOWdFNm1JQjJJQU5DQU00SlZFeGhGb2dCTUFERndHd0JhQUl6Q1JBRGdBcXdycWg0ODVQQUhUeWVBTFRvZ0FSdTJ5WTBBYlZBSUNMVGdCSUlZQU9ZbW9DQU82YUlaRWhBUVY3RE5LQUFtVUJpSW9LbUlZS0Y5T1gyRk5jMndBVnpJeVpsWUVnQnRPVENJaUNBWlVBSG84aEFBUE1BQmJDRlNFSld3U1VyeVFBRjk2SU5LRVFMS0lUbDRCRVRGaEtWRlVBRllBVG1HUmxYa05Cb0JkQnFB"
-   },
-   {
-    "name": "form data= base64",
-    "content_type": "application/x-www-form-urlencoded",
-    "body_base64": "ZGF0YT1leUpoY0dsZmEyVjVJam9pY0doalgzWmxZM1J2Y25SdmEyVnVJaXdpYzJWdWRGOWhkQ0k2SWpJd01qWXRNVEV0TVRoVU1USTZNREE2TURBdU1EQXdXaUlzSW1KaGRHTm9JanBiZXlKbGRtVnVkQ0k2SWlSd1lXZGxkbWxsZHlJc0luQnliM0JsY25ScFpYTWlPbnNpWkdsemRHbHVZM1JmYVdRaU9pSmtNU0lzSWlSamRYSnlaVzUwWDNWeWJDSTZJbWgwZEhCek9pOHZaWGhoYlhCc1pTNWpiMjB2SW4wc0luUnBiV1Z6ZEdGdGNDSTZJakl3TWpZdE1URXRNVGhVTVRFNk5UazZOVGt1TURBd1dpSjlYWDAlM0Q="
-   },
-   {
-    "name": "raw base64 body",
-    "content_type": "text/plain",
-    "body_base64": "ZXlKaGNHbGZhMlY1SWpvaWNHaGpYM1psWTNSdmNuUnZhMlZ1SWl3aWMyVnVkRjloZENJNklqSXdNall0TVRFdE1UaFVNVEk2TURBNk1EQXVNREF3V2lJc0ltSmhkR05vSWpwYmV5SmxkbVZ1ZENJNklpUndZV2RsZG1sbGR5SXNJbkJ5YjNCbGNuUnBaWE1pT25zaVpHbHpkR2x1WTNSZmFXUWlPaUprTVNJc0lpUmpkWEp5Wlc1MFgzVnliQ0k2SW1oMGRIQnpPaTh2WlhoaGJYQnNaUzVqYjIwdkluMHNJblJwYldWemRHRnRjQ0k2SWpJd01qWXRNVEV0TVRoVU1URTZOVGs2TlRrdU1EQXdXaUo5WFgwPQ=="
-   }
-  ]
- },
- "capture_responses": {
-  "legacy": {
-   "status": 200,
-   "body": {
-    "status": 1
-   },
-   "beacon": {
-    "query": "beacon=1",
-    "status": 204
-   }
-  },
-  "v1": {
-   "status": 200,
-   "body": {
-    "results": {
-     "01890000-0000-7000-8000-000000000001": {
-      "result": "ok"
-     }
-    }
-   }
-  },
-  "errors": [
-   {
-    "path": "/e/",
-    "body": "{\"batch\":[]}",
-    "status": 400,
-    "code": "empty_batch",
-    "note": "empty batch"
-   },
-   {
-    "path": "/e/",
-    "body": "{\"batch\":[{\"event\":\"x\",\"distinct_id\":\"d\"}]}",
-    "status": 401,
-    "type": "authentication_error",
-    "code": "no_token",
-    "note": "no token"
-   },
-   {
-    "path": "/e/",
-    "body": "{\"api_key\":\"phx_abc\",\"batch\":[{\"event\":\"x\",\"distinct_id\":\"d\"}]}",
-    "status": 401,
-    "type": "authentication_error",
-    "code": "invalid_token",
-    "note": "personal key as project token"
-   },
-   {
-    "path": "/i/v1/analytics/events",
-    "headers": {},
-    "status": 401,
-    "note": "missing Authorization"
-   },
-   {
-    "path": "/i/v1/analytics/events",
-    "headers": {
-     "authorization": "Basic abc"
-    },
-    "status": 400,
-    "note": "not Bearer"
-   },
-   {
-    "path": "/i/v1/analytics/events",
-    "headers": {
-     "authorization": "Bearer phx_x"
-    },
-    "status": 401,
-    "note": "personal key"
-   },
-   {
-    "path": "/i/v1/analytics/events",
-    "headers": {
-     "authorization": "Bearer phc_x",
-     "content-encoding": "br"
-    },
-    "status": 415,
-    "note": "unsupported encoding"
-   }
-  ]
- },
- "persons": {
-  "source": "nodejs/src/ingestion/common/persons (identify / alias / merge)",
-  "scenarios": [
-   {
-    "name": "identify links the anonymous id",
-    "events": [
-     {
-      "event": "$pageview",
-      "distinct_id": "anon-1",
-      "properties": {
-       "$process_person_profile": false
-      }
-     },
-     {
-      "event": "$identify",
-      "distinct_id": "user-1",
-      "properties": {
-       "$anon_distinct_id": "anon-1"
-      },
-      "$set": {
-       "email": "u@example.com"
-      }
-     }
-    ],
-    "expect": {
-     "persons": [
+    "positions": [
       {
-       "distinct_ids": [
-        "anon-1",
-        "user-1"
-       ],
-       "properties": {
-        "email": "u@example.com"
-       },
-       "is_identified": true
-      }
-     ],
-     "events_by_person": {
-      "user-1": 2
-     }
-    }
-   },
-   {
-    "name": "alias joins two ids",
-    "events": [
-     {
-      "event": "$set",
-      "distinct_id": "a",
-      "properties": {
-       "$set": {
-        "x": 1
-       }
-      }
-     },
-     {
-      "event": "$create_alias",
-      "distinct_id": "a",
-      "properties": {
-       "alias": "b"
-      }
-     }
-    ],
-    "expect": {
-     "persons": [
-      {
-       "distinct_ids": [
-        "a",
-        "b"
-       ],
-       "properties": {
-        "x": 1
-       },
-       "is_identified": true
-      }
-     ]
-    }
-   },
-   {
-    "name": "identify never merges two identified persons",
-    "events": [
-     {
-      "event": "$identify",
-      "distinct_id": "u1",
-      "properties": {}
-     },
-     {
-      "event": "$identify",
-      "distinct_id": "u2",
-      "properties": {}
-     },
-     {
-      "event": "$identify",
-      "distinct_id": "u2",
-      "properties": {
-       "$anon_distinct_id": "u1"
-      }
-     }
-    ],
-    "expect": {
-     "persons": [
-      {
-       "distinct_ids": [
-        "u1"
-       ]
+        "line": 1,
+        "column": 49,
+        "expect": {
+          "source": "app-src.js",
+          "line": 4,
+          "column": 17,
+          "name": null,
+          "sourceIndex": 0
+        }
       },
       {
-       "distinct_ids": [
-        "u2"
-       ]
-      }
-     ]
-    }
-   },
-   {
-    "name": "$merge_dangerously merges identified persons",
-    "events": [
-     {
-      "event": "$identify",
-      "distinct_id": "u1",
-      "properties": {},
-      "$set": {
-       "a": 1,
-       "b": 1
-      }
-     },
-     {
-      "event": "$identify",
-      "distinct_id": "u2",
-      "properties": {},
-      "$set": {
-       "b": 2
-      }
-     },
-     {
-      "event": "$merge_dangerously",
-      "distinct_id": "u2",
-      "properties": {
-       "alias": "u1"
-      }
-     }
-    ],
-    "expect": {
-     "persons": [
+        "line": 1,
+        "column": 159,
+        "expect": {
+          "source": "app-src.js",
+          "line": 11,
+          "column": 41,
+          "name": "parsePrice",
+          "sourceIndex": 0
+        }
+      },
       {
-       "distinct_ids": [
-        "u1",
-        "u2"
-       ],
-       "properties": {
-        "a": 1,
-        "b": 2
-       }
-      }
-     ]
-    }
-   },
-   {
-    "name": "illegal id does not merge",
-    "events": [
-     {
-      "event": "$identify",
-      "distinct_id": "user-9",
-      "properties": {
-       "$anon_distinct_id": "null"
-      }
-     }
-    ],
-    "expect": {
-     "persons": [
+        "line": 1,
+        "column": 206,
+        "expect": {
+          "source": "app-src.js",
+          "line": 15,
+          "column": 10,
+          "name": "computeTotal",
+          "sourceIndex": 0
+        }
+      },
       {
-       "distinct_ids": [
-        "user-9"
-       ]
-      }
-     ]
-    }
-   },
-   {
-    "name": "$set_once keeps the first value, $unset removes",
-    "events": [
-     {
-      "event": "$set",
-      "distinct_id": "p",
-      "properties": {
-       "$set_once": {
-        "first": "a"
-       },
-       "$set": {
-        "k": 1
-       }
-      }
-     },
-     {
-      "event": "$set",
-      "distinct_id": "p",
-      "properties": {
-       "$set_once": {
-        "first": "b"
-       },
-       "$unset": [
-        "k"
-       ]
-      }
-     }
-    ],
-    "expect": {
-     "persons": [
+        "line": 1,
+        "column": 358,
+        "expect": {
+          "source": "app-src.js",
+          "line": 22,
+          "column": 41,
+          "name": "checkout",
+          "sourceIndex": 0
+        }
+      },
       {
-       "distinct_ids": [
-        "p"
-       ],
-       "properties": {
-        "first": "a"
-       }
+        "line": 1,
+        "column": 275,
+        "expect": {
+          "source": "app-src.js",
+          "line": 19,
+          "column": 9,
+          "name": null,
+          "sourceIndex": 0
+        }
       }
-     ]
-    }
-   }
-  ]
- },
- "sampling": {
-  "source": "design.md \"Usage limits\": FNV-1a 32-bit over the UTF-16 code units of the key, divided by 2^32; kept when below the rate. Keys: cap:<distinct_id> (events past a cap), cap:<session_id> (replay past a cap), ac:<$session_id or distinct_id> (autocapture).",
-  "cases": [
-   {
-    "key": "cap:user-1",
-    "unit": 0.34798795776441693,
-    "kept_at_0_5": true,
-    "kept_at_0_25": false
-   },
-   {
-    "key": "cap:user-2",
-    "unit": 0.34408161393366754,
-    "kept_at_0_5": true,
-    "kept_at_0_25": false
-   },
-   {
-    "key": "ac:01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
-    "unit": 0.5421303973998874,
-    "kept_at_0_5": false,
-    "kept_at_0_25": false
-   },
-   {
-    "key": "cap:sess-a",
-    "unit": 0.11303425836376846,
-    "kept_at_0_5": true,
-    "kept_at_0_25": true
-   },
-   {
-    "key": "",
-    "unit": 0.5043428998906165,
-    "kept_at_0_5": false,
-    "kept_at_0_25": false
-   }
-  ]
- },
- "quota_limited": {
-  "source": "posthog-js 1.450.1 src/rate-limiter.ts (MIT): a capture response whose JSON has quota_limited: [batch keys] pauses those keys for 60 s. Batch keys: events (default), exceptionEvent, recordings.",
-  "capture_capped_drop": {
-   "status": 1,
-   "quota_limited": [
-    "events",
-    "exceptionEvent"
-   ]
+    ]
   },
-  "snapshots_capped_drop": {
-   "status": 1,
-   "quota_limited": [
-    "recordings"
-   ]
+  "fingerprints": {
+    "source": "design.md \"Error tracking\": $exception_fingerprint wins (custom:<value>); else SHA-256 (first 16 bytes, hex) of \"<type>\\n\" + top five in-app frames innermost first as \"<function>@<normalized filename>\" joined by \\n; with no frames \"<type>\\n<normalized message>\".",
+    "cases": [
+      {
+        "name": "posthog-js unhandled TypeError (raw frames)",
+        "properties": {
+          "$os": "Linux",
+          "$browser": "Chrome",
+          "$device_type": "Desktop",
+          "$timezone": "UTC",
+          "$timezone_offset": 0,
+          "$current_url": "http://172.17.0.1:8797/",
+          "$host": "172.17.0.1:8797",
+          "$pathname": "/",
+          "$raw_user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
+          "$browser_version": 156,
+          "$browser_language": "en-US",
+          "$browser_language_prefix": "en",
+          "$screen_height": 720,
+          "$screen_width": 1280,
+          "$viewport_height": 720,
+          "$viewport_width": 1280,
+          "$lib": "web",
+          "$lib_version": "1.450.1",
+          "$insert_id": "3myab7pfize6fgmr",
+          "$time": 1795091180.396,
+          "$sdk_dist_channel": "cdn",
+          "$initialization_time": "2026-11-19T12:26:15.244Z",
+          "$configured_session_timeout_ms": 1800000,
+          "distinct_id": "user-7",
+          "$device_id": "01a1f3c5-974f-74fb-ab45-c80a124f3ac2",
+          "$autocapture_disabled_server_side": false,
+          "$error_tracking_capture_extension_exceptions": false,
+          "$web_vitals_enabled_server_side": false,
+          "$exception_capture_enabled_server_side": true,
+          "$dead_clicks_enabled_server_side": false,
+          "$user_id": "user-7",
+          "$sdk_debug_extensions_init_method": "synchronous",
+          "$sdk_debug_extensions_init_time_ms": 1,
+          "$referrer": "$direct",
+          "$referring_domain": "$direct",
+          "$feature_flag_request_id": "00000000-0000-4000-8000-000000000000",
+          "$active_feature_flags": [],
+          "$feature_flag_payloads": {},
+          "$exception_list": [
+            {
+              "type": "TypeError",
+              "value": "Price must be a number, got string",
+              "mechanism": {
+                "type": "generic",
+                "handled": false,
+                "synthetic": false,
+                "exception_id": 0
+              },
+              "stacktrace": {
+                "type": "raw",
+                "frames": [
+                  {
+                    "platform": "web:javascript",
+                    "filename": "http://172.17.0.1:8797/app.min.js",
+                    "function": "?",
+                    "in_app": true,
+                    "lineno": 1,
+                    "colno": 358
+                  },
+                  {
+                    "platform": "web:javascript",
+                    "filename": "http://172.17.0.1:8797/app.min.js",
+                    "function": "r",
+                    "in_app": true,
+                    "lineno": 1,
+                    "colno": 206
+                  },
+                  {
+                    "platform": "web:javascript",
+                    "filename": "http://172.17.0.1:8797/app.min.js",
+                    "function": "i",
+                    "in_app": true,
+                    "lineno": 1,
+                    "colno": 159
+                  },
+                  {
+                    "platform": "web:javascript",
+                    "filename": "http://172.17.0.1:8797/app.min.js",
+                    "function": "n",
+                    "in_app": true,
+                    "lineno": 1,
+                    "colno": 49
+                  }
+                ]
+              }
+            }
+          ],
+          "$exception_level": "error",
+          "token": "phc_testtoken123",
+          "$config_defaults": "unset",
+          "$session_id": "01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
+          "$window_id": "01a1f3c5-9768-7ecc-ae2f-758a0ec51c92",
+          "$session_entry_referrer": "$direct",
+          "$session_entry_referring_domain": "$direct",
+          "$session_entry_url": "http://172.17.0.1:8797/",
+          "$session_entry_host": "172.17.0.1:8797",
+          "$session_entry_pathname": "/",
+          "$recording_status": "disabled",
+          "$sdk_debug_retry_queue_size": 0,
+          "$lib_custom_api_host": "http://172.17.0.1:8797",
+          "$pageview_id": "01a1f3c5-975f-7c94-b404-e672c88a02be",
+          "$browser_type": "bot",
+          "$is_identified": true,
+          "$process_person_profile": true,
+          "$lib_rate_limit_remaining_tokens": 98.14
+        },
+        "expect": "a6fcf13979853cb7ab140c960b08ecbe"
+      },
+      {
+        "name": "posthog-js unhandled rejection",
+        "properties": {
+          "$os": "Linux",
+          "$browser": "Chrome",
+          "$device_type": "Desktop",
+          "$timezone": "UTC",
+          "$timezone_offset": 0,
+          "$current_url": "http://172.17.0.1:8797/",
+          "$host": "172.17.0.1:8797",
+          "$pathname": "/",
+          "$raw_user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
+          "$browser_version": 156,
+          "$browser_language": "en-US",
+          "$browser_language_prefix": "en",
+          "$screen_height": 720,
+          "$screen_width": 1280,
+          "$viewport_height": 720,
+          "$viewport_width": 1280,
+          "$lib": "web",
+          "$lib_version": "1.450.1",
+          "$insert_id": "y3zy9jsicsmvunsq",
+          "$time": 1795091182.427,
+          "$sdk_dist_channel": "cdn",
+          "$initialization_time": "2026-11-19T12:26:15.244Z",
+          "$configured_session_timeout_ms": 1800000,
+          "distinct_id": "user-7",
+          "$device_id": "01a1f3c5-974f-74fb-ab45-c80a124f3ac2",
+          "$autocapture_disabled_server_side": false,
+          "$error_tracking_capture_extension_exceptions": false,
+          "$web_vitals_enabled_server_side": false,
+          "$exception_capture_enabled_server_side": true,
+          "$dead_clicks_enabled_server_side": false,
+          "$user_id": "user-7",
+          "$sdk_debug_extensions_init_method": "synchronous",
+          "$sdk_debug_extensions_init_time_ms": 1,
+          "$referrer": "$direct",
+          "$referring_domain": "$direct",
+          "$feature_flag_request_id": "00000000-0000-4000-8000-000000000000",
+          "$active_feature_flags": [],
+          "$feature_flag_payloads": {},
+          "$exception_list": [
+            {
+              "type": "Error",
+              "value": "Profile 42 not found",
+              "mechanism": {
+                "type": "generic",
+                "handled": false,
+                "synthetic": false,
+                "exception_id": 0
+              },
+              "stacktrace": {
+                "type": "raw",
+                "frames": [
+                  {
+                    "platform": "web:javascript",
+                    "filename": "http://172.17.0.1:8797/app.min.js",
+                    "function": "c",
+                    "in_app": true,
+                    "lineno": 1,
+                    "colno": 275
+                  }
+                ]
+              }
+            }
+          ],
+          "$exception_level": "error",
+          "token": "phc_testtoken123",
+          "$config_defaults": "unset",
+          "$session_id": "01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
+          "$window_id": "01a1f3c5-9768-7ecc-ae2f-758a0ec51c92",
+          "$session_entry_referrer": "$direct",
+          "$session_entry_referring_domain": "$direct",
+          "$session_entry_url": "http://172.17.0.1:8797/",
+          "$session_entry_host": "172.17.0.1:8797",
+          "$session_entry_pathname": "/",
+          "$recording_status": "disabled",
+          "$sdk_debug_retry_queue_size": 0,
+          "$lib_custom_api_host": "http://172.17.0.1:8797",
+          "$pageview_id": "01a1f3c5-975f-7c94-b404-e672c88a02be",
+          "$browser_type": "bot",
+          "$is_identified": true,
+          "$process_person_profile": true,
+          "$lib_rate_limit_remaining_tokens": 98.1
+        },
+        "expect": "641056856ac9e738663b8e56f0b1c8ad"
+      },
+      {
+        "name": "custom fingerprint",
+        "properties": {
+          "$os": "Linux",
+          "$browser": "Chrome",
+          "$device_type": "Desktop",
+          "$timezone": "UTC",
+          "$timezone_offset": 0,
+          "$current_url": "http://172.17.0.1:8797/",
+          "$host": "172.17.0.1:8797",
+          "$pathname": "/",
+          "$raw_user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
+          "$browser_version": 156,
+          "$browser_language": "en-US",
+          "$browser_language_prefix": "en",
+          "$screen_height": 720,
+          "$screen_width": 1280,
+          "$viewport_height": 720,
+          "$viewport_width": 1280,
+          "$lib": "web",
+          "$lib_version": "1.450.1",
+          "$insert_id": "eci8fjsftro9hubi",
+          "$time": 1795091186.485,
+          "$sdk_dist_channel": "cdn",
+          "$initialization_time": "2026-11-19T12:26:15.244Z",
+          "$configured_session_timeout_ms": 1800000,
+          "distinct_id": "user-7",
+          "$device_id": "01a1f3c5-974f-74fb-ab45-c80a124f3ac2",
+          "$autocapture_disabled_server_side": false,
+          "$error_tracking_capture_extension_exceptions": false,
+          "$web_vitals_enabled_server_side": false,
+          "$exception_capture_enabled_server_side": true,
+          "$dead_clicks_enabled_server_side": false,
+          "$user_id": "user-7",
+          "$sdk_debug_extensions_init_method": "synchronous",
+          "$sdk_debug_extensions_init_time_ms": 1,
+          "$referrer": "$direct",
+          "$referring_domain": "$direct",
+          "$feature_flag_request_id": "00000000-0000-4000-8000-000000000000",
+          "$active_feature_flags": [],
+          "$feature_flag_payloads": {},
+          "$exception_list": [
+            {
+              "type": "RangeError",
+              "value": "Quantity out of range",
+              "mechanism": {
+                "type": "generic",
+                "handled": true,
+                "synthetic": false,
+                "exception_id": 0
+              },
+              "stacktrace": {
+                "type": "raw",
+                "frames": [
+                  {
+                    "platform": "web:javascript",
+                    "filename": "http://172.17.0.1:8797/",
+                    "function": "HTMLButtonElement.onclick",
+                    "in_app": true,
+                    "lineno": 9,
+                    "colno": 50
+                  },
+                  {
+                    "platform": "web:javascript",
+                    "filename": "http://172.17.0.1:8797/app.min.js",
+                    "function": "Object.custom",
+                    "in_app": true,
+                    "lineno": 1,
+                    "colno": 566
+                  }
+                ]
+              }
+            }
+          ],
+          "$exception_level": "error",
+          "$exception_fingerprint": "qty-range",
+          "token": "phc_testtoken123",
+          "$config_defaults": "unset",
+          "$session_id": "01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
+          "$window_id": "01a1f3c5-9768-7ecc-ae2f-758a0ec51c92",
+          "$session_entry_referrer": "$direct",
+          "$session_entry_referring_domain": "$direct",
+          "$session_entry_url": "http://172.17.0.1:8797/",
+          "$session_entry_host": "172.17.0.1:8797",
+          "$session_entry_pathname": "/",
+          "$recording_status": "disabled",
+          "$sdk_debug_retry_queue_size": 0,
+          "$lib_custom_api_host": "http://172.17.0.1:8797",
+          "$pageview_id": "01a1f3c5-975f-7c94-b404-e672c88a02be",
+          "$browser_type": "bot",
+          "$is_identified": true,
+          "$process_person_profile": true,
+          "$lib_rate_limit_remaining_tokens": 98.03
+        },
+        "expect": "custom:qty-range"
+      },
+      {
+        "name": "no frames: type and normalized message",
+        "properties": {
+          "$exception_list": [
+            {
+              "type": "Error",
+              "value": "Order 1234 failed for \"bob\""
+            }
+          ]
+        },
+        "expect": "bce20b4535f75101bafcf77c680a994e"
+      },
+      {
+        "name": "same as above with other numbers and strings",
+        "properties": {
+          "$exception_list": [
+            {
+              "type": "Error",
+              "value": "Order 99 failed for \"ann\""
+            }
+          ]
+        },
+        "expect": "bce20b4535f75101bafcf77c680a994e"
+      }
+    ],
+    "filenames": [
+      {
+        "filename": "https://cdn.test/assets/app.3f9a2c1b.js?v=2",
+        "expect": "/assets/app.js"
+      },
+      {
+        "filename": "/assets/index-B7xQ2kLp.js",
+        "expect": "/assets/index.js"
+      },
+      {
+        "filename": "/js/app-facade.js",
+        "expect": "/js/app-facade.js"
+      },
+      {
+        "filename": "node:internal/modules/run_main",
+        "expect": "node:internal/modules/run_main"
+      }
+    ],
+    "messages": [
+      {
+        "message": "Profile 42 not found for \"bob\"",
+        "expect": "Profile <n> not found for <str>"
+      },
+      {
+        "message": "Bad id 0x1F at 3.5s for 0190f3c2-1111-7000-8000-000000000000",
+        "expect": "Bad id <hex> at <n>s for <id>"
+      }
+    ]
   },
-  "v1_capped_drop_has": {
-   "quota_limited": [
-    "events",
-    "exceptionEvent"
-   ]
+  "source_map_sections": {
+    "source": "ECMA-426 \"Index map\": sections sorted by offset, each with an inline map; a section's first line is shifted by offset.column, later lines by offset.line only. url sections are refused. The inner map is source_maps.map placed at (0,0) and at line 3 column 20; positions are 1-based like stack traces; sourceIndex counts sources across sections.",
+    "map": {
+      "version": 3,
+      "file": "bundle.min.js",
+      "sections": [
+        {
+          "offset": {
+            "line": 0,
+            "column": 0
+          },
+          "map": "$source_maps.map"
+        },
+        {
+          "offset": {
+            "line": 3,
+            "column": 20
+          },
+          "map": "$source_maps.map"
+        }
+      ]
+    },
+    "positions": [
+      {
+        "line": 1,
+        "column": 49,
+        "expect": {
+          "source": "app-src.js",
+          "line": 4,
+          "column": 17,
+          "name": null,
+          "sourceIndex": 0
+        }
+      },
+      {
+        "line": 4,
+        "column": 69,
+        "expect": {
+          "source": "app-src.js",
+          "line": 4,
+          "column": 17,
+          "name": null,
+          "sourceIndex": 1
+        }
+      },
+      {
+        "line": 1,
+        "column": 159,
+        "expect": {
+          "source": "app-src.js",
+          "line": 11,
+          "column": 41,
+          "name": "parsePrice",
+          "sourceIndex": 0
+        }
+      },
+      {
+        "line": 4,
+        "column": 179,
+        "expect": {
+          "source": "app-src.js",
+          "line": 11,
+          "column": 41,
+          "name": "parsePrice",
+          "sourceIndex": 1
+        }
+      },
+      {
+        "line": 1,
+        "column": 206,
+        "expect": {
+          "source": "app-src.js",
+          "line": 15,
+          "column": 10,
+          "name": "computeTotal",
+          "sourceIndex": 0
+        }
+      },
+      {
+        "line": 4,
+        "column": 226,
+        "expect": {
+          "source": "app-src.js",
+          "line": 15,
+          "column": 10,
+          "name": "computeTotal",
+          "sourceIndex": 1
+        }
+      },
+      {
+        "line": 1,
+        "column": 358,
+        "expect": {
+          "source": "app-src.js",
+          "line": 22,
+          "column": 41,
+          "name": "checkout",
+          "sourceIndex": 0
+        }
+      },
+      {
+        "line": 4,
+        "column": 378,
+        "expect": {
+          "source": "app-src.js",
+          "line": 22,
+          "column": 41,
+          "name": "checkout",
+          "sourceIndex": 1
+        }
+      },
+      {
+        "line": 1,
+        "column": 275,
+        "expect": {
+          "source": "app-src.js",
+          "line": 19,
+          "column": 9,
+          "name": null,
+          "sourceIndex": 0
+        }
+      },
+      {
+        "line": 4,
+        "column": 295,
+        "expect": {
+          "source": "app-src.js",
+          "line": 19,
+          "column": 9,
+          "name": null,
+          "sourceIndex": 1
+        }
+      }
+    ],
+    "invalid": [
+      {
+        "map": {
+          "version": 3,
+          "sections": [
+            {
+              "offset": {
+                "line": 0,
+                "column": 0
+              },
+              "url": "part.js.map"
+            }
+          ]
+        },
+        "reason": "url sections are not supported"
+      },
+      {
+        "map": {
+          "version": 3,
+          "sections": []
+        },
+        "reason": "sections must be a non-empty list"
+      },
+      {
+        "map": {
+          "version": 3,
+          "sections": [
+            {
+              "offset": {
+                "line": 5,
+                "column": 0
+              },
+              "map": "$source_maps.map"
+            },
+            {
+              "offset": {
+                "line": 1,
+                "column": 0
+              },
+              "map": "$source_maps.map"
+            }
+          ]
+        },
+        "reason": "sections must be sorted and must not overlap"
+      }
+    ]
   },
-  "sample_mode": {
-   "status": 1
+  "llm_costs": {
+    "source": "design.md \"LLM analytics\": $ai_total_cost_usd, else $ai_input_cost_usd + $ai_output_cost_usd, from the SDK wins; else src/shared/llm-pricing.ts list prices (USD per 1M tokens: gpt-4o 2.50/10.00 cached 1.25; gpt-4o-mini 0.15/0.60 cached 0.075; claude-3-5-haiku 0.80/4.00 cached 0.08). OpenAI-style providers include cached tokens in $ai_input_tokens; Anthropic reports cache reads and writes apart (writes priced as input). Compare usd to 9 decimal places.",
+    "cases": [
+      {
+        "name": "SDK total cost wins",
+        "properties": {
+          "$ai_model": "gpt-4o",
+          "$ai_input_tokens": 1000,
+          "$ai_output_tokens": 100,
+          "$ai_total_cost_usd": 0.0042
+        },
+        "expect": {
+          "usd": 0.0042,
+          "source": "sdk"
+        }
+      },
+      {
+        "name": "SDK input + output cost",
+        "properties": {
+          "$ai_model": "gpt-4o",
+          "$ai_input_cost_usd": 0.001,
+          "$ai_output_cost_usd": 0.002
+        },
+        "expect": {
+          "usd": 0.003,
+          "source": "sdk"
+        }
+      },
+      {
+        "name": "OpenAI list price, dated model id",
+        "properties": {
+          "$ai_model": "gpt-4o-mini-2024-07-18",
+          "$ai_provider": "openai",
+          "$ai_input_tokens": 12000,
+          "$ai_output_tokens": 800
+        },
+        "expect": {
+          "usd": 0.00228,
+          "source": "pricing"
+        }
+      },
+      {
+        "name": "OpenAI cached tokens are part of input",
+        "properties": {
+          "$ai_model": "gpt-4o",
+          "$ai_provider": "openai",
+          "$ai_input_tokens": 10000,
+          "$ai_cache_read_input_tokens": 8000,
+          "$ai_output_tokens": 500
+        },
+        "expect": {
+          "usd": 0.02,
+          "source": "pricing"
+        }
+      },
+      {
+        "name": "Anthropic cache reads and writes are reported apart from input",
+        "properties": {
+          "$ai_model": "claude-3-5-haiku-20241022",
+          "$ai_provider": "anthropic",
+          "$ai_input_tokens": 2000,
+          "$ai_cache_read_input_tokens": 30000,
+          "$ai_cache_creation_input_tokens": 1000,
+          "$ai_output_tokens": 400
+        },
+        "expect": {
+          "usd": 0.0064,
+          "source": "pricing"
+        }
+      },
+      {
+        "name": "Unknown model has no cost",
+        "properties": {
+          "$ai_model": "my-local-model",
+          "$ai_input_tokens": 100
+        },
+        "expect": {
+          "usd": null,
+          "source": null
+        }
+      }
+    ]
+  },
+  "suppression_rules": {
+    "source": "posthog-js remote config errorTracking.suppressionRules (@posthog/browser-common remote-config types): rule { type: AND|OR, values: [{ key: $exception_types|$exception_values, operator, value: string|string[], type }] }. A value matches when any exception in $exception_list matches; string lists match any item. Operators: exact, is_not, icontains, not_icontains, regex, not_regex.",
+    "cases": [
+      {
+        "name": "exact type list (OR)",
+        "rule": {
+          "type": "OR",
+          "values": [
+            {
+              "key": "$exception_types",
+              "operator": "exact",
+              "value": [
+                "AbortError",
+                "ResizeObserver loop limit exceeded"
+              ]
+            }
+          ]
+        },
+        "wire": {
+          "type": "OR",
+          "values": [
+            {
+              "key": "$exception_types",
+              "operator": "exact",
+              "value": [
+                "AbortError",
+                "ResizeObserver loop limit exceeded"
+              ],
+              "type": "error_tracking_issue_property"
+            }
+          ]
+        },
+        "exception_list": [
+          {
+            "type": "AbortError",
+            "value": "The user aborted a request."
+          }
+        ],
+        "expect": true
+      },
+      {
+        "name": "is_not",
+        "rule": {
+          "type": "OR",
+          "values": [
+            {
+              "key": "$exception_types",
+              "operator": "is_not",
+              "value": "TypeError"
+            }
+          ]
+        },
+        "wire": {
+          "type": "OR",
+          "values": [
+            {
+              "key": "$exception_types",
+              "operator": "is_not",
+              "value": "TypeError",
+              "type": "error_tracking_issue_property"
+            }
+          ]
+        },
+        "exception_list": [
+          {
+            "type": "TypeError",
+            "value": "x"
+          }
+        ],
+        "expect": false
+      },
+      {
+        "name": "icontains on message",
+        "rule": {
+          "type": "OR",
+          "values": [
+            {
+              "key": "$exception_values",
+              "operator": "icontains",
+              "value": "CHROME-EXTENSION://"
+            }
+          ]
+        },
+        "wire": {
+          "type": "OR",
+          "values": [
+            {
+              "key": "$exception_values",
+              "operator": "icontains",
+              "value": "CHROME-EXTENSION://",
+              "type": "error_tracking_issue_property"
+            }
+          ]
+        },
+        "exception_list": [
+          {
+            "type": "Error",
+            "value": "at chrome-extension://abc/x.js"
+          }
+        ],
+        "expect": true
+      },
+      {
+        "name": "regex on message",
+        "rule": {
+          "type": "OR",
+          "values": [
+            {
+              "key": "$exception_values",
+              "operator": "regex",
+              "value": "^Script error\\.?$"
+            }
+          ]
+        },
+        "wire": {
+          "type": "OR",
+          "values": [
+            {
+              "key": "$exception_values",
+              "operator": "regex",
+              "value": "^Script error\\.?$",
+              "type": "error_tracking_issue_property"
+            }
+          ]
+        },
+        "exception_list": [
+          {
+            "type": "Error",
+            "value": "Script error."
+          }
+        ],
+        "expect": true
+      },
+      {
+        "name": "AND needs every value",
+        "rule": {
+          "type": "AND",
+          "values": [
+            {
+              "key": "$exception_types",
+              "operator": "exact",
+              "value": "TypeError"
+            },
+            {
+              "key": "$exception_values",
+              "operator": "not_icontains",
+              "value": "price"
+            }
+          ]
+        },
+        "wire": {
+          "type": "AND",
+          "values": [
+            {
+              "key": "$exception_types",
+              "operator": "exact",
+              "value": "TypeError",
+              "type": "error_tracking_issue_property"
+            },
+            {
+              "key": "$exception_values",
+              "operator": "not_icontains",
+              "value": "price",
+              "type": "error_tracking_issue_property"
+            }
+          ]
+        },
+        "exception_list": [
+          {
+            "type": "TypeError",
+            "value": "Price must be a number"
+          }
+        ],
+        "expect": false
+      },
+      {
+        "name": "chained exceptions: any type matches",
+        "rule": {
+          "type": "OR",
+          "values": [
+            {
+              "key": "$exception_types",
+              "operator": "exact",
+              "value": "ConnectionError"
+            }
+          ]
+        },
+        "wire": {
+          "type": "OR",
+          "values": [
+            {
+              "key": "$exception_types",
+              "operator": "exact",
+              "value": "ConnectionError",
+              "type": "error_tracking_issue_property"
+            }
+          ]
+        },
+        "exception_list": [
+          {
+            "type": "RuntimeError",
+            "value": "wrapped"
+          },
+          {
+            "type": "ConnectionError",
+            "value": "refused"
+          }
+        ],
+        "expect": true
+      }
+    ]
+  },
+  "releases": {
+    "source": "design.md \"Releases\": the first non-empty of $release, release, $app_version, app_version (numbers become strings, trimmed, at most 200 chars).",
+    "cases": [
+      {
+        "properties": {
+          "$release": "2.1.0",
+          "$app_version": "9"
+        },
+        "expect": "2.1.0"
+      },
+      {
+        "properties": {
+          "release": "abc123"
+        },
+        "expect": "abc123"
+      },
+      {
+        "properties": {
+          "$app_version": 7
+        },
+        "expect": "7"
+      },
+      {
+        "properties": {
+          "app_version": " 1.0 "
+        },
+        "expect": "1.0"
+      },
+      {
+        "properties": {},
+        "expect": null
+      }
+    ]
   }
- },
- "source_maps": {
-  "source": "Source Map Revision 3 (tc39.es/ecma426); map and frames from tests/fixtures/v05-errors.json (esbuild bundle, posthog-js frames). Lines and columns are 1-based like stack traces.",
-  "map": {
-   "version": 3,
-   "sources": [
-    "app-src.js"
-   ],
-   "sourcesContent": [
-    "// Small \"site\" bundle used to produce real minified stack traces and a source map (fixtures for 0.5 error tracking).\nfunction parsePrice(raw) {\n  if (typeof raw !== 'number') {\n    const err = new TypeError('Price must be a number, got ' + typeof raw);\n    throw err;\n  }\n  return raw;\n}\nfunction computeTotal(cart) {\n  let sum = 0;\n  for (const item of cart.items) sum += parsePrice(item.price) * item.qty;\n  return sum;\n}\nexport function checkout(cart) {\n  return computeTotal(cart);\n}\nexport async function loadProfile(id) {\n  await new Promise(r => setTimeout(r, 5));\n  throw new Error('Profile ' + id + ' not found');\n}\nwindow.shop = {\n  throwUnhandled() { setTimeout(() => { checkout({ items: [{ price: '12', qty: 1 }] }); }, 0); },\n  rejectUnhandled() { loadProfile(42); },\n  manual() { try { checkout({ items: [{ price: null, qty: 2 }] }); } catch (e) { window.posthog.captureException(e, { cart_size: 1 }); } },\n  custom() { window.posthog.captureException(new RangeError('Quantity out of range'), { $exception_fingerprint: 'qty-range' }); },\n};\n"
-   ],
-   "mappings": "MACA,SAASA,EAAWC,EAAK,CACvB,GAAI,OAAOA,GAAQ,SAEjB,MADY,IAAI,UAAU,+BAAiC,OAAOA,CAAG,EAGvE,OAAOA,CACT,CACA,SAASC,EAAaC,EAAM,CAC1B,IAAIC,EAAM,EACV,QAAWC,KAAQF,EAAK,MAAOC,GAAOJ,EAAWK,EAAK,KAAK,EAAIA,EAAK,IACpE,OAAOD,CACT,CACO,SAASE,EAASH,EAAM,CAC7B,OAAOD,EAAaC,CAAI,CAC1B,CACA,eAAsBI,EAAYC,EAAI,CACpC,YAAM,IAAI,QAAQC,GAAK,WAAWA,EAAG,CAAC,CAAC,EACjC,IAAI,MAAM,WAAaD,EAAK,YAAY,CAChD,CACA,OAAO,KAAO,CACZ,gBAAiB,CAAE,WAAW,IAAM,CAAEF,EAAS,CAAE,MAAO,CAAC,CAAE,MAAO,KAAM,IAAK,CAAE,CAAC,CAAE,CAAC,CAAG,EAAG,CAAC,CAAG,EAC7F,iBAAkB,CAAEC,EAAY,EAAE,CAAG,EACrC,QAAS,CAAE,GAAI,CAAED,EAAS,CAAE,MAAO,CAAC,CAAE,MAAO,KAAM,IAAK,CAAE,CAAC,CAAE,CAAC,CAAG,OAAS,EAAG,CAAE,OAAO,QAAQ,iBAAiB,EAAG,CAAE,UAAW,CAAE,CAAC,CAAG,CAAE,EACvI,QAAS,CAAE,OAAO,QAAQ,iBAAiB,IAAI,WAAW,uBAAuB,EAAG,CAAE,uBAAwB,WAAY,CAAC,CAAG,CAChI",
-   "names": [
-    "parsePrice",
-    "raw",
-    "computeTotal",
-    "cart",
-    "sum",
-    "item",
-    "checkout",
-    "loadProfile",
-    "id",
-    "r"
-   ]
-  },
-  "positions": [
-   {
-    "line": 1,
-    "column": 49,
-    "expect": {
-     "source": "app-src.js",
-     "line": 4,
-     "column": 17,
-     "name": null,
-     "sourceIndex": 0
-    }
-   },
-   {
-    "line": 1,
-    "column": 159,
-    "expect": {
-     "source": "app-src.js",
-     "line": 11,
-     "column": 41,
-     "name": "parsePrice",
-     "sourceIndex": 0
-    }
-   },
-   {
-    "line": 1,
-    "column": 206,
-    "expect": {
-     "source": "app-src.js",
-     "line": 15,
-     "column": 10,
-     "name": "computeTotal",
-     "sourceIndex": 0
-    }
-   },
-   {
-    "line": 1,
-    "column": 358,
-    "expect": {
-     "source": "app-src.js",
-     "line": 22,
-     "column": 41,
-     "name": "checkout",
-     "sourceIndex": 0
-    }
-   },
-   {
-    "line": 1,
-    "column": 275,
-    "expect": {
-     "source": "app-src.js",
-     "line": 19,
-     "column": 9,
-     "name": null,
-     "sourceIndex": 0
-    }
-   }
-  ]
- },
- "fingerprints": {
-  "source": "design.md \"Error tracking\": $exception_fingerprint wins (custom:<value>); else SHA-256 (first 16 bytes, hex) of \"<type>\\n\" + top five in-app frames innermost first as \"<function>@<normalized filename>\" joined by \\n; with no frames \"<type>\\n<normalized message>\".",
-  "cases": [
-   {
-    "name": "posthog-js unhandled TypeError (raw frames)",
-    "properties": {
-     "$os": "Linux",
-     "$browser": "Chrome",
-     "$device_type": "Desktop",
-     "$timezone": "UTC",
-     "$timezone_offset": 0,
-     "$current_url": "http://172.17.0.1:8797/",
-     "$host": "172.17.0.1:8797",
-     "$pathname": "/",
-     "$raw_user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
-     "$browser_version": 156,
-     "$browser_language": "en-US",
-     "$browser_language_prefix": "en",
-     "$screen_height": 720,
-     "$screen_width": 1280,
-     "$viewport_height": 720,
-     "$viewport_width": 1280,
-     "$lib": "web",
-     "$lib_version": "1.450.1",
-     "$insert_id": "3myab7pfize6fgmr",
-     "$time": 1795091180.396,
-     "$sdk_dist_channel": "cdn",
-     "$initialization_time": "2026-11-19T12:26:15.244Z",
-     "$configured_session_timeout_ms": 1800000,
-     "distinct_id": "user-7",
-     "$device_id": "01a1f3c5-974f-74fb-ab45-c80a124f3ac2",
-     "$autocapture_disabled_server_side": false,
-     "$error_tracking_capture_extension_exceptions": false,
-     "$web_vitals_enabled_server_side": false,
-     "$exception_capture_enabled_server_side": true,
-     "$dead_clicks_enabled_server_side": false,
-     "$user_id": "user-7",
-     "$sdk_debug_extensions_init_method": "synchronous",
-     "$sdk_debug_extensions_init_time_ms": 1,
-     "$referrer": "$direct",
-     "$referring_domain": "$direct",
-     "$feature_flag_request_id": "00000000-0000-4000-8000-000000000000",
-     "$active_feature_flags": [],
-     "$feature_flag_payloads": {},
-     "$exception_list": [
-      {
-       "type": "TypeError",
-       "value": "Price must be a number, got string",
-       "mechanism": {
-        "type": "generic",
-        "handled": false,
-        "synthetic": false,
-        "exception_id": 0
-       },
-       "stacktrace": {
-        "type": "raw",
-        "frames": [
-         {
-          "platform": "web:javascript",
-          "filename": "http://172.17.0.1:8797/app.min.js",
-          "function": "?",
-          "in_app": true,
-          "lineno": 1,
-          "colno": 358
-         },
-         {
-          "platform": "web:javascript",
-          "filename": "http://172.17.0.1:8797/app.min.js",
-          "function": "r",
-          "in_app": true,
-          "lineno": 1,
-          "colno": 206
-         },
-         {
-          "platform": "web:javascript",
-          "filename": "http://172.17.0.1:8797/app.min.js",
-          "function": "i",
-          "in_app": true,
-          "lineno": 1,
-          "colno": 159
-         },
-         {
-          "platform": "web:javascript",
-          "filename": "http://172.17.0.1:8797/app.min.js",
-          "function": "n",
-          "in_app": true,
-          "lineno": 1,
-          "colno": 49
-         }
-        ]
-       }
-      }
-     ],
-     "$exception_level": "error",
-     "token": "phc_testtoken123",
-     "$config_defaults": "unset",
-     "$session_id": "01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
-     "$window_id": "01a1f3c5-9768-7ecc-ae2f-758a0ec51c92",
-     "$session_entry_referrer": "$direct",
-     "$session_entry_referring_domain": "$direct",
-     "$session_entry_url": "http://172.17.0.1:8797/",
-     "$session_entry_host": "172.17.0.1:8797",
-     "$session_entry_pathname": "/",
-     "$recording_status": "disabled",
-     "$sdk_debug_retry_queue_size": 0,
-     "$lib_custom_api_host": "http://172.17.0.1:8797",
-     "$pageview_id": "01a1f3c5-975f-7c94-b404-e672c88a02be",
-     "$browser_type": "bot",
-     "$is_identified": true,
-     "$process_person_profile": true,
-     "$lib_rate_limit_remaining_tokens": 98.14
-    },
-    "expect": "a6fcf13979853cb7ab140c960b08ecbe"
-   },
-   {
-    "name": "posthog-js unhandled rejection",
-    "properties": {
-     "$os": "Linux",
-     "$browser": "Chrome",
-     "$device_type": "Desktop",
-     "$timezone": "UTC",
-     "$timezone_offset": 0,
-     "$current_url": "http://172.17.0.1:8797/",
-     "$host": "172.17.0.1:8797",
-     "$pathname": "/",
-     "$raw_user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
-     "$browser_version": 156,
-     "$browser_language": "en-US",
-     "$browser_language_prefix": "en",
-     "$screen_height": 720,
-     "$screen_width": 1280,
-     "$viewport_height": 720,
-     "$viewport_width": 1280,
-     "$lib": "web",
-     "$lib_version": "1.450.1",
-     "$insert_id": "y3zy9jsicsmvunsq",
-     "$time": 1795091182.427,
-     "$sdk_dist_channel": "cdn",
-     "$initialization_time": "2026-11-19T12:26:15.244Z",
-     "$configured_session_timeout_ms": 1800000,
-     "distinct_id": "user-7",
-     "$device_id": "01a1f3c5-974f-74fb-ab45-c80a124f3ac2",
-     "$autocapture_disabled_server_side": false,
-     "$error_tracking_capture_extension_exceptions": false,
-     "$web_vitals_enabled_server_side": false,
-     "$exception_capture_enabled_server_side": true,
-     "$dead_clicks_enabled_server_side": false,
-     "$user_id": "user-7",
-     "$sdk_debug_extensions_init_method": "synchronous",
-     "$sdk_debug_extensions_init_time_ms": 1,
-     "$referrer": "$direct",
-     "$referring_domain": "$direct",
-     "$feature_flag_request_id": "00000000-0000-4000-8000-000000000000",
-     "$active_feature_flags": [],
-     "$feature_flag_payloads": {},
-     "$exception_list": [
-      {
-       "type": "Error",
-       "value": "Profile 42 not found",
-       "mechanism": {
-        "type": "generic",
-        "handled": false,
-        "synthetic": false,
-        "exception_id": 0
-       },
-       "stacktrace": {
-        "type": "raw",
-        "frames": [
-         {
-          "platform": "web:javascript",
-          "filename": "http://172.17.0.1:8797/app.min.js",
-          "function": "c",
-          "in_app": true,
-          "lineno": 1,
-          "colno": 275
-         }
-        ]
-       }
-      }
-     ],
-     "$exception_level": "error",
-     "token": "phc_testtoken123",
-     "$config_defaults": "unset",
-     "$session_id": "01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
-     "$window_id": "01a1f3c5-9768-7ecc-ae2f-758a0ec51c92",
-     "$session_entry_referrer": "$direct",
-     "$session_entry_referring_domain": "$direct",
-     "$session_entry_url": "http://172.17.0.1:8797/",
-     "$session_entry_host": "172.17.0.1:8797",
-     "$session_entry_pathname": "/",
-     "$recording_status": "disabled",
-     "$sdk_debug_retry_queue_size": 0,
-     "$lib_custom_api_host": "http://172.17.0.1:8797",
-     "$pageview_id": "01a1f3c5-975f-7c94-b404-e672c88a02be",
-     "$browser_type": "bot",
-     "$is_identified": true,
-     "$process_person_profile": true,
-     "$lib_rate_limit_remaining_tokens": 98.1
-    },
-    "expect": "641056856ac9e738663b8e56f0b1c8ad"
-   },
-   {
-    "name": "custom fingerprint",
-    "properties": {
-     "$os": "Linux",
-     "$browser": "Chrome",
-     "$device_type": "Desktop",
-     "$timezone": "UTC",
-     "$timezone_offset": 0,
-     "$current_url": "http://172.17.0.1:8797/",
-     "$host": "172.17.0.1:8797",
-     "$pathname": "/",
-     "$raw_user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
-     "$browser_version": 156,
-     "$browser_language": "en-US",
-     "$browser_language_prefix": "en",
-     "$screen_height": 720,
-     "$screen_width": 1280,
-     "$viewport_height": 720,
-     "$viewport_width": 1280,
-     "$lib": "web",
-     "$lib_version": "1.450.1",
-     "$insert_id": "eci8fjsftro9hubi",
-     "$time": 1795091186.485,
-     "$sdk_dist_channel": "cdn",
-     "$initialization_time": "2026-11-19T12:26:15.244Z",
-     "$configured_session_timeout_ms": 1800000,
-     "distinct_id": "user-7",
-     "$device_id": "01a1f3c5-974f-74fb-ab45-c80a124f3ac2",
-     "$autocapture_disabled_server_side": false,
-     "$error_tracking_capture_extension_exceptions": false,
-     "$web_vitals_enabled_server_side": false,
-     "$exception_capture_enabled_server_side": true,
-     "$dead_clicks_enabled_server_side": false,
-     "$user_id": "user-7",
-     "$sdk_debug_extensions_init_method": "synchronous",
-     "$sdk_debug_extensions_init_time_ms": 1,
-     "$referrer": "$direct",
-     "$referring_domain": "$direct",
-     "$feature_flag_request_id": "00000000-0000-4000-8000-000000000000",
-     "$active_feature_flags": [],
-     "$feature_flag_payloads": {},
-     "$exception_list": [
-      {
-       "type": "RangeError",
-       "value": "Quantity out of range",
-       "mechanism": {
-        "type": "generic",
-        "handled": true,
-        "synthetic": false,
-        "exception_id": 0
-       },
-       "stacktrace": {
-        "type": "raw",
-        "frames": [
-         {
-          "platform": "web:javascript",
-          "filename": "http://172.17.0.1:8797/",
-          "function": "HTMLButtonElement.onclick",
-          "in_app": true,
-          "lineno": 9,
-          "colno": 50
-         },
-         {
-          "platform": "web:javascript",
-          "filename": "http://172.17.0.1:8797/app.min.js",
-          "function": "Object.custom",
-          "in_app": true,
-          "lineno": 1,
-          "colno": 566
-         }
-        ]
-       }
-      }
-     ],
-     "$exception_level": "error",
-     "$exception_fingerprint": "qty-range",
-     "token": "phc_testtoken123",
-     "$config_defaults": "unset",
-     "$session_id": "01a1f3c5-9768-7ecc-ae2f-7589c52b2fcf",
-     "$window_id": "01a1f3c5-9768-7ecc-ae2f-758a0ec51c92",
-     "$session_entry_referrer": "$direct",
-     "$session_entry_referring_domain": "$direct",
-     "$session_entry_url": "http://172.17.0.1:8797/",
-     "$session_entry_host": "172.17.0.1:8797",
-     "$session_entry_pathname": "/",
-     "$recording_status": "disabled",
-     "$sdk_debug_retry_queue_size": 0,
-     "$lib_custom_api_host": "http://172.17.0.1:8797",
-     "$pageview_id": "01a1f3c5-975f-7c94-b404-e672c88a02be",
-     "$browser_type": "bot",
-     "$is_identified": true,
-     "$process_person_profile": true,
-     "$lib_rate_limit_remaining_tokens": 98.03
-    },
-    "expect": "custom:qty-range"
-   },
-   {
-    "name": "no frames: type and normalized message",
-    "properties": {
-     "$exception_list": [
-      {
-       "type": "Error",
-       "value": "Order 1234 failed for \"bob\""
-      }
-     ]
-    },
-    "expect": "bce20b4535f75101bafcf77c680a994e"
-   },
-   {
-    "name": "same as above with other numbers and strings",
-    "properties": {
-     "$exception_list": [
-      {
-       "type": "Error",
-       "value": "Order 99 failed for \"ann\""
-      }
-     ]
-    },
-    "expect": "bce20b4535f75101bafcf77c680a994e"
-   }
-  ],
-  "filenames": [
-   {
-    "filename": "https://cdn.test/assets/app.3f9a2c1b.js?v=2",
-    "expect": "/assets/app.js"
-   },
-   {
-    "filename": "/assets/index-B7xQ2kLp.js",
-    "expect": "/assets/index.js"
-   },
-   {
-    "filename": "/js/app-facade.js",
-    "expect": "/js/app-facade.js"
-   },
-   {
-    "filename": "node:internal/modules/run_main",
-    "expect": "node:internal/modules/run_main"
-   }
-  ],
-  "messages": [
-   {
-    "message": "Profile 42 not found for \"bob\"",
-    "expect": "Profile <n> not found for <str>"
-   },
-   {
-    "message": "Bad id 0x1F at 3.5s for 0190f3c2-1111-7000-8000-000000000000",
-    "expect": "Bad id <hex> at <n>s for <id>"
-   }
-  ]
- }
 }

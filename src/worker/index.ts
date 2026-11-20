@@ -1,7 +1,9 @@
 // Worker entry: routing, the ingest queue consumer and the daily retention cron (spec R1).
 import { coldRecord } from './cold';
 import { Env, HttpError, IngestMsg, ingestHost, json, origin, storeFor, ProjectRow } from './env';
-import { handleLegacyCapture, handleV1Capture, LEGACY_PATHS, V1_PATH, cors } from './capture';
+import { meter } from './meter';
+import { wantsApp } from './routing';
+import { handleLegacyCapture, handleV1Capture, handleAiMultipart, LEGACY_PATHS, V1_PATH, AI_MULTIPART_PATH, AI_V1_PATH, cors } from './capture';
 import { handleConfig, handleFlags, handleStub, handleSurveys, handleLocalEvaluation } from './sdk';
 import { handleApi } from './api';
 import { handleSnapshots, chunkPrefix, deletePrefix } from './replay';
@@ -12,18 +14,22 @@ export { EventShard } from './shard';
 const HOURLY = '41 * * * *';
 const SECURITY = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'same-origin' };
 
-async function route(req: Request, env: Env): Promise<Response> {
+const HTML_HEADERS = { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache', 'x-frame-options': 'DENY', ...SECURITY };
+
+async function route(req: Request, env: Env, ectx?: ExecutionContext): Promise<Response> {
   const url = new URL(req.url);
   const path = url.pathname;
   const bare = path.length > 1 ? path.replace(/\/+$/, '') : path;
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors(req) });
-  if (LEGACY_PATHS.has(bare) && (req.method === 'POST' || req.method === 'GET')) return handleLegacyCapture(req, env, url);
-  if (bare === V1_PATH && req.method === 'POST') return handleV1Capture(req, env);
-  if (bare === '/s' || bare === '/i/v0/s') return handleSnapshots(req, env, url);
-  if (bare === '/flags/definitions' || bare === '/api/feature_flag/local_evaluation') return handleLocalEvaluation(req, env, url);
-  if (bare === '/flags' || bare === '/decide') return handleFlags(req, env, url, bare === '/decide');
+  if (LEGACY_PATHS.has(bare) && (req.method === 'POST' || req.method === 'GET')) return handleLegacyCapture(req, env, url, ectx);
+  if (bare === V1_PATH && req.method === 'POST') return handleV1Capture(req, env, ectx);
+  if (bare === AI_V1_PATH && req.method === 'POST') return handleV1Capture(req, env, ectx, true);
+  if (bare === AI_MULTIPART_PATH && req.method === 'POST') return handleAiMultipart(req, env, ectx);
+  if (bare === '/s' || bare === '/i/v0/s') return handleSnapshots(req, env, url, ectx);
+  if (bare === '/flags/definitions' || bare === '/api/feature_flag/local_evaluation') return handleLocalEvaluation(req, env, url, undefined, ectx);
+  if (bare === '/flags' || bare === '/decide') return handleFlags(req, env, url, bare === '/decide', ectx);
   const cfg = /^\/array\/([^/]+)\/config(\.js)?$/.exec(path);
-  if (cfg && req.method === 'GET') return handleConfig(req, env, decodeURIComponent(cfg[1]), !!cfg[2]);
+  if (cfg && req.method === 'GET') return handleConfig(req, env, decodeURIComponent(cfg[1]), !!cfg[2], ectx);
   if (path.startsWith('/static/')) {
     // posthog-js first asks for /static/<sdk version>/<file>; serve the bundled copy for any version.
     const u = new URL(req.url); u.pathname = path.replace(/^\/static\/\d+\.\d+\.\d+[^/]*\//, '/static/');
@@ -41,19 +47,23 @@ async function route(req: Request, env: Env): Promise<Response> {
     if (req.method === 'GET' || req.method === 'HEAD') return new Response(null, { status: 302, headers: { location: origin(env) + path + url.search, ...SECURITY } });
     return json({ error: 'wrong_host', detail: 'This hostname only receives SDK traffic; the dashboard and owner API are served at SITE_URL.' }, 421);
   }
-  if (path.startsWith('/api/')) return handleApi(req, env, url, ui.appName);
+  if (path.startsWith('/api/')) {
+    // Owner API requests per project count towards the cost estimate (design.md "Cost estimate").
+    const ap = /^\/api\/projects\/(\d+)(\/|$)/.exec(path); if (ap) meter(env, ectx, Number(ap[1]), 'api');
+    return handleApi(req, env, url, ui.appName);
+  }
   if (path === '/app.js') return new Response(ui.js, { headers: { 'content-type': 'application/javascript', 'cache-control': 'no-cache', ...SECURITY } });
   if (path === '/player.js') return new Response(ui.playerJs, { headers: { 'content-type': 'application/javascript', 'cache-control': 'public, max-age=86400', ...SECURITY } });
   if (path === '/player.css') return new Response(ui.playerCss, { headers: { 'content-type': 'text/css', 'cache-control': 'public, max-age=86400', ...SECURITY } });
   if (path === '/app.css') return new Response(ui.css, { headers: { 'content-type': 'text/css', 'cache-control': 'no-cache', ...SECURITY } });
   if (path === '/_health') return json({ ok: true });
-  if (req.method === 'GET' && (req.headers.get('accept') ?? '').includes('text/html')) return new Response(ui.html, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache', 'x-frame-options': 'DENY', ...SECURITY } });
+  if (wantsApp(req.method, path, req.headers.get('accept'))) return new Response(req.method === 'HEAD' ? null : ui.html, { headers: HTML_HEADERS });
   return json({ error: 'not_found' }, 404);
 }
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
-    try { return await route(req, env); }
+  async fetch(req: Request, env: Env, ectx: ExecutionContext): Promise<Response> {
+    try { return await route(req, env, ectx); }
     catch (e) {
       if (e instanceof HttpError) return json({ error: e.code, detail: e.message }, e.status);
       console.error('unhandled', e instanceof Error ? e.message : String(e));

@@ -2,15 +2,15 @@
   "spekkr": 1,
   "id": "dwrtz/product-analytics",
   "name": "Product Analytics",
-  "summary": "Self-hosted posthog-js analytics on Cloudflare: insights, flags, replay, heatmaps, SQL, experiments, surveys, error tracking, usage caps.",
+  "summary": "Self-hosted posthog-js analytics on Cloudflare: insights, flags, replay, surveys, SQL, error tracking, LLM analytics, usage caps.",
   "kind": "web app",
   "keywords": [
     "product analytics",
     "posthog-js compatible",
     "session replay",
-    "heatmaps",
     "usage limits",
     "error tracking",
+    "llm analytics",
     "experiments",
     "surveys",
     "feature flags",
@@ -18,7 +18,7 @@
     "self-hosted",
     "cloudflare workers"
   ],
-  "version": "0.5.0",
+  "version": "0.6.0",
   "author": {
     "id": "dwrtz",
     "name": "David Wurtz"
@@ -44,7 +44,8 @@
       "Vitest",
       "Playwright",
       "posthog-node",
-      "Cloudflare Email Sending (optional)"
+      "Cloudflare Email Sending (optional)",
+      "PyIceberg (optional cold-tier pruning)"
     ]
   },
   "customize": {
@@ -66,19 +67,19 @@
   "files": [
     {
       "path": "spec.md",
-      "about": "Requirements R1-R30 (0.2: event shards, replay, experiments, surveys; 0.3: actions, cohorts, heatmaps, SQL, local evaluation, continuity, survey targeting, replay settings, no row limits; 0.4: optional Basin / Iceberg cold tier queried from SQL; 0.5: error tracking with source maps, usage caps, sampling, usage page, cost estimate and alerts) with acceptance checks, scope and definition of done."
+      "about": "Requirements R1-R32 (0.2: event shards, replay, experiments, surveys; 0.3: actions, cohorts, heatmaps, SQL, local evaluation, continuity, survey targeting, replay settings, no row limits; 0.4: optional Basin / Iceberg cold tier queried from SQL; 0.5: error tracking with source maps, usage caps, sampling, usage page, cost estimate and alerts; 0.6: LLM analytics (R31), public demo (R32), releases, merge/split, assignment, grouping and suppression rules, retroactive symbolication, server stacks, cold Trends, request and dropped-past-cap counters) with acceptance checks, scope and definition of done."
     },
     {
       "path": "protocol.md",
-      "about": "The normative SDK wire format: capture routes, body decoding, tokens, timestamps, v1 capture, persons and merges, feature flags, remote config, replay snapshots and settings, surveys and targeting, exposure, heatmaps, local evaluation, experience continuity, exceptions, quota limiting, error codes."
+      "about": "The normative SDK wire format: capture routes, body decoding, tokens, timestamps, v1 capture, persons and merges, feature flags, remote config, replay snapshots and settings, surveys and targeting, exposure, heatmaps, local evaluation, experience continuity, exceptions, quota limiting, error codes, LLM analytics capture (AI endpoints), 0.6 exception releases, server SDK stacks and suppression rules."
     },
     {
       "path": "test-vectors.json",
-      "about": "Worked examples for decoding, tokens, timestamps, distinct ids, flag hashing and matching, capture responses person scenarios, sampling, quota_limited answers, source-map decoding and exception fingerprints."
+      "about": "Worked examples for decoding, tokens, timestamps, distinct ids, flag hashing and matching, capture responses person scenarios, sampling, quota_limited answers, source-map decoding and exception fingerprints, and (0.6) index source maps, LLM costs, suppression rules and releases."
     },
     {
       "path": "design.md",
-      "about": "Stack, storage and event-shard decisions, Cloudflare config, deploy and upgrade, data model, ingestion, query semantics, actions, cohorts, SQL, heatmaps, streaming funnels, replay, experiment statistics, surveys, owner API, screens, tests, limits and the Basin cold tier (stream, Iceberg sink, Basin SQL compiler, retention), usage limits, cost estimate, alerts, error tracking and symbolication."
+      "about": "Stack, storage and event-shard decisions, Cloudflare config, deploy and upgrade, data model, ingestion, query semantics, actions, cohorts, SQL, heatmaps, streaming funnels, replay, experiment statistics, surveys, owner API, screens, tests, limits and the Basin cold tier (stream, Iceberg sink, Basin SQL compiler, retention), usage limits, cost estimate, alerts, error tracking and symbolication; 0.6: HTML fallback, public demo, edge usage counters, error tracking 0.6 schema and algorithms, LLM analytics, cold Trends and cold-prune.py."
     },
     {
       "path": "tasks.md",
@@ -86,7 +87,7 @@
     },
     {
       "path": "research.md",
-      "about": "How the protocol was established with REA (0.1-0.3 captures, 0.4 Basin findings, 0.5 exception and quota captures, and conformance runs), evidence and obligation ledgers, unknowns, licensing and choices."
+      "about": "How the protocol was established with REA (0.1-0.3 captures, 0.4 Basin findings, 0.5 exception and quota captures, and conformance runs; 0.6 choices), evidence and obligation ledgers, unknowns, licensing and choices."
     }
   ],
   "needs": {
@@ -108,6 +109,11 @@
   },
   "lineage": {},
   "changelog": [
+    {
+      "version": "0.6.0",
+      "date": "2026-11-20",
+      "note": "LLM analytics: $ai_generation/$ai_trace/$ai_span/$ai_embedding events from the PostHog AI SDKs (standard capture plus /i/v0/ai/batch, multipart /i/v0/ai and /i/v1/ai/events) with an overview (generations, tokens, cost from the SDK or a built-in price table, p50/p95 latency, errors, models), a filtered traces list and a trace page with a span tree and latency waterfall. Error tracking gains releases ($release/$app_version) with per-release source maps and retroactive symbolication on upload, merge and split, assignment, custom grouping rules, suppression rules sent to posthog-js remote config and enforced at ingest, Python/Go/Rust stacks and index (sectioned) source maps. Trends can read the Basin cold tier (Hot/Cold source), and scripts/cold-prune.py physically prunes cold rows past retention with PyIceberg. Usage counts flags, config and API requests and events/requests dropped past a cap, and the cost estimate leads with list price. Optional PUBLIC_DEMO=1 read-only demo mode with redaction; deep links serve the app. Upgrade: apply D1 migration 0005_v06.sql (projects.public_demo); Durable Objects upgrade themselves."
+    },
     {
       "version": "0.5.0",
       "date": "2026-11-19",
@@ -152,17 +158,19 @@
   "demo": {
     "screenshots": [
       "shots/dashboard.png",
+      "shots06/llm-analytics.png",
+      "shots06/llm-trace.png",
+      "shots06/error-tracking.png",
+      "shots06/usage.png",
+      "shots06/public-demo.png",
       "shots/trends.png",
       "shots05/error-issue.png",
-      "shots05/usage.png",
       "shots/funnel.png",
       "shots/replay-player.png",
       "shots/experiment-results.png",
       "shots/survey-results.png",
       "shots03/heatmap-clicks.png",
-      "shots03/cohort-edit.png",
-      "shots04/sql-cold.png",
-      "shots03/replay-console-network.png"
+      "shots04/sql-cold.png"
     ]
   }
 }
