@@ -1,5 +1,7 @@
 # Product Analytics
 
+[![Built from a Spekkr spec](https://img.shields.io/badge/built%20from-Spekkr%20spec-f0442b)](https://spekkr.com/dwrtz/product-analytics/)
+
 Self-hosted product analytics on Cloudflare Workers that the PostHog SDKs
 send to unchanged. Point the usual posthog-js snippet (or posthog-node) at
 your instance and you get events, identified people, groups, trends,
